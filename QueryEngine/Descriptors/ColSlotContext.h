@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 OmniSci, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,7 +16,6 @@
 
 /**
  * @file    ColSlotContext.h
- * @author  Alex Baden <alex.baden@omnisci.com>
  * @brief   Provides column info and slot info for the output buffer and some metadata
  * helpers
  *
@@ -24,10 +23,11 @@
 
 #pragma once
 
-#include <glog/logging.h>
+#include "Logger/Logger.h"
 
 #include <algorithm>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 struct SlotSize {
@@ -48,7 +48,7 @@ class ColSlotContext {
   ColSlotContext() {}
 
   ColSlotContext(const std::vector<Analyzer::Expr*>& col_expr_list,
-                 const std::vector<ssize_t>& col_exprs_to_not_project);
+                 const std::vector<int64_t>& col_exprs_to_not_project);
 
   void setAllSlotsSize(const int8_t slot_width_size);
 
@@ -66,6 +66,11 @@ class ColSlotContext {
   const SlotSize& getSlotInfo(const size_t slot_idx) const {
     CHECK_LT(slot_idx, slot_sizes_.size());
     return slot_sizes_[slot_idx];
+  }
+
+  void setPaddedSlotWidthBytes(const size_t slot_idx, const int8_t bytes) {
+    CHECK_LT(slot_idx, slot_sizes_.size());
+    slot_sizes_[slot_idx].padded_size = bytes;
   }
 
   const std::vector<size_t>& getSlotsForCol(const size_t col_idx) const {
@@ -93,6 +98,9 @@ class ColSlotContext {
 
   void addColumn(const std::vector<std::tuple<int8_t, int8_t>>& slots_for_col);
 
+  void addColumnFlatBuffer(const int64_t flatbuffer_size);
+  int64_t getFlatBufferSize(const size_t slot_idx) const;
+
   bool operator==(const ColSlotContext& that) const {
     return std::equal(
                slot_sizes_.cbegin(), slot_sizes_.cend(), that.slot_sizes_.cbegin()) &&
@@ -101,9 +109,23 @@ class ColSlotContext {
                       that.col_to_slot_map_.cbegin());
   }
 
-  bool operator!=(const ColSlotContext& that) const { return !(*this == that); }
+  bool operator!=(const ColSlotContext& that) const {
+    return !(*this == that);
+  }
 
   void alignPaddedSlots(const bool sort_on_gpu);
+
+  int64_t varlenOutputElementSize(const size_t slot_idx) const;
+
+  bool hasVarlenOutput() const {
+    return !varlen_output_slot_map_.empty();
+  }
+
+  bool slotIsVarlen(const size_t slot_idx) const {
+    return varlen_output_slot_map_.count(slot_idx) > 0;
+  }
+
+  bool checkSlotUsesFlatBufferFormat(const size_t slot_idx) const;
 
   std::string toString() const {
     std::string str{"Col Slot Context State\n"};
@@ -117,6 +139,10 @@ class ColSlotContext {
       str += "\t" + std::to_string(i) + " | " + std::to_string(slot_size.padded_size) +
              " , " + std::to_string(slot_size.logical_size) + "\n";
     }
+#ifdef HAVE_TOSTRING
+    str += "\tcol_to_slot_map=" + ::toString(col_to_slot_map_) + "\n";
+    str += "\tvarlen_output_slot_map=" + ::toString(varlen_output_slot_map_) + "\n";
+#endif
     return str;
   }
 
@@ -129,4 +155,8 @@ class ColSlotContext {
 
   std::vector<SlotSize> slot_sizes_;
   std::vector<std::vector<size_t>> col_to_slot_map_;
+
+  using ArraySize = int64_t;
+  using SlotIndex = size_t;
+  std::unordered_map<SlotIndex, ArraySize> varlen_output_slot_map_;
 };

@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,11 +22,9 @@
 #include "../Analyzer/Analyzer.h"
 
 extern bool g_bigint_count;
-namespace {
 
-inline std::vector<int64_t> init_agg_val_vec(
-    const std::vector<TargetInfo>& targets,
-    const QueryMemoryDescriptor& query_mem_desc) {
+std::vector<int64_t> init_agg_val_vec(const std::vector<TargetInfo>& targets,
+                                      const QueryMemoryDescriptor& query_mem_desc) {
   std::vector<int64_t> agg_init_vals;
   agg_init_vals.reserve(query_mem_desc.getSlotCount());
   const bool is_group_by{query_mem_desc.isGroupBy()};
@@ -34,12 +32,13 @@ inline std::vector<int64_t> init_agg_val_vec(
        ++target_idx, ++agg_col_idx) {
     CHECK_LT(agg_col_idx, query_mem_desc.getSlotCount());
     const auto agg_info = targets[target_idx];
+    const auto& agg_ti = agg_info.sql_type;
     if (!agg_info.is_agg || agg_info.agg_kind == kSAMPLE) {
-      if (agg_info.agg_kind == kSAMPLE && agg_info.sql_type.is_string() &&
-          agg_info.sql_type.get_compression() != kENCODING_NONE) {
+      if (agg_info.agg_kind == kSAMPLE && agg_ti.is_string() &&
+          agg_ti.get_compression() != kENCODING_NONE) {
         agg_init_vals.push_back(
             get_agg_initial_val(agg_info.agg_kind,
-                                agg_info.sql_type,
+                                agg_ti,
                                 is_group_by,
                                 query_mem_desc.getCompactByteWidth()));
         continue;
@@ -47,14 +46,16 @@ inline std::vector<int64_t> init_agg_val_vec(
       if (query_mem_desc.getPaddedSlotWidthBytes(agg_col_idx) > 0) {
         agg_init_vals.push_back(0);
       }
-      if (agg_info.sql_type.is_array() ||
-          (agg_info.sql_type.is_string() &&
-           agg_info.sql_type.get_compression() == kENCODING_NONE)) {
+      if (agg_info.is_varlen_projection) {
+        continue;
+      }
+      if (agg_ti.is_array() ||
+          (agg_ti.is_string() && agg_ti.get_compression() == kENCODING_NONE)) {
         agg_init_vals.push_back(0);
       }
-      if (agg_info.sql_type.is_geometry()) {
+      if (agg_ti.is_geometry()) {
         agg_init_vals.push_back(0);
-        for (auto i = 1; i < agg_info.sql_type.get_physical_coord_cols(); ++i) {
+        for (auto i = 1; i < agg_ti.get_physical_coord_cols(); ++i) {
           agg_init_vals.push_back(0);
           agg_init_vals.push_back(0);
         }
@@ -63,7 +64,9 @@ inline std::vector<int64_t> init_agg_val_vec(
     }
     CHECK_GT(query_mem_desc.getPaddedSlotWidthBytes(agg_col_idx), 0);
     const bool float_argument_input = takes_float_argument(agg_info);
-    const auto chosen_bytes = query_mem_desc.getCompactByteWidth();
+    const auto chosen_bytes = query_mem_desc.isLogicalSizedColumnsAllowed()
+                                  ? query_mem_desc.getPaddedSlotWidthBytes(agg_col_idx)
+                                  : query_mem_desc.getCompactByteWidth();
     auto init_ti = get_compact_type(agg_info);
     if (!is_group_by) {
       init_ti.set_notnull(false);
@@ -80,8 +83,6 @@ inline std::vector<int64_t> init_agg_val_vec(
   }
   return agg_init_vals;
 }
-
-}  // namespace
 
 std::pair<int64_t, int64_t> inline_int_max_min(const size_t byte_width) {
   switch (byte_width) {
@@ -126,7 +127,7 @@ int64_t get_agg_initial_val(const SQLAgg agg,
                             const SQLTypeInfo& ti,
                             const bool enable_compaction,
                             const unsigned min_byte_width_to_compact) {
-  CHECK(!ti.is_string() || agg == kSAMPLE);
+  CHECK(!ti.is_string() || (shared::is_any<kSINGLE_VALUE, kSAMPLE, kMODE>(agg))) << agg;
   const auto byte_width =
       enable_compaction
           ? compact_byte_width(static_cast<unsigned>(get_bit_width(ti) >> 3),
@@ -135,8 +136,8 @@ int64_t get_agg_initial_val(const SQLAgg agg,
   CHECK(ti.get_logical_size() < 0 ||
         byte_width >= static_cast<unsigned>(ti.get_logical_size()));
   switch (agg) {
-    case kAVG:
-    case kSUM: {
+    case kSUM:
+    case kSUM_IF: {
       if (!ti.get_notnull()) {
         if (ti.is_fp()) {
           switch (byte_width) {
@@ -172,11 +173,26 @@ int64_t get_agg_initial_val(const SQLAgg agg,
           CHECK(false);
       }
     }
+    case kAVG:
     case kCOUNT:
+    case kCOUNT_IF:
     case kAPPROX_COUNT_DISTINCT:
       return 0;
+    case kAPPROX_QUANTILE:
+    case kMODE:
+      return {};  // Init value is a pointer set elsewhere.
     case kMIN: {
       switch (byte_width) {
+        case 1: {
+          CHECK(!ti.is_fp());
+          return ti.get_notnull() ? std::numeric_limits<int8_t>::max()
+                                  : inline_int_null_val(ti);
+        }
+        case 2: {
+          CHECK(!ti.is_fp());
+          return ti.get_notnull() ? std::numeric_limits<int16_t>::max()
+                                  : inline_int_null_val(ti);
+        }
         case 4: {
           const float max_float = std::numeric_limits<float>::max();
           const float null_float =
@@ -203,9 +219,20 @@ int64_t get_agg_initial_val(const SQLAgg agg,
           CHECK(false);
       }
     }
+    case kSINGLE_VALUE:
     case kSAMPLE:
     case kMAX: {
       switch (byte_width) {
+        case 1: {
+          CHECK(!ti.is_fp());
+          return ti.get_notnull() ? std::numeric_limits<int8_t>::min()
+                                  : inline_int_null_val(ti);
+        }
+        case 2: {
+          CHECK(!ti.is_fp());
+          return ti.get_notnull() ? std::numeric_limits<int16_t>::min()
+                                  : inline_int_null_val(ti);
+        }
         case 4: {
           const float min_float = -std::numeric_limits<float>::max();
           const float null_float =
@@ -254,8 +281,8 @@ std::vector<int64_t> init_agg_val_vec(
       if (query_mem_desc.getQueryDescriptionType() ==
               QueryDescriptionType::NonGroupedAggregate &&
           target.is_agg &&
-          (target.agg_kind == kMIN ||
-           target.agg_kind == kMAX)) {  // TODO(alex): fix SUM and AVG as well
+          shared::is_any<kMIN, kMAX, kSUM, kSUM_IF, kAVG, kAPPROX_QUANTILE, kMODE>(
+              target.agg_kind)) {
         set_notnull(target, false);
       } else if (constrained_not_null(arg_expr, quals)) {
         set_notnull(target, true);
@@ -273,7 +300,7 @@ const Analyzer::Expr* agg_arg(const Analyzer::Expr* expr) {
 
 bool constrained_not_null(const Analyzer::Expr* expr,
                           const std::list<std::shared_ptr<Analyzer::Expr>>& quals) {
-  for (const auto qual : quals) {
+  for (const auto& qual : quals) {
     auto uoper = std::dynamic_pointer_cast<Analyzer::UOper>(qual);
     if (!uoper) {
       continue;

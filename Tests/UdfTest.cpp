@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 OmniSci, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,33 +14,35 @@
  * limitations under the License.
  */
 
-#include <glog/logging.h>
 #include <gtest/gtest.h>
+#include <llvm/Support/Program.h>
 #include <boost/filesystem.hpp>
 #include <boost/filesystem/operations.hpp>
 #include <csignal>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <vector>
 #include "Catalog/Catalog.h"
 #include "Catalog/DBObject.h"
 #include "DataMgr/DataMgr.h"
+#include "Logger/Logger.h"
 #include "QueryEngine/Execute.h"
 #include "QueryEngine/ExtensionFunctionsWhitelist.h"
 #include "QueryEngine/ResultSet.h"
-#include "QueryEngine/UDFCompiler.h"
 #include "QueryRunner/QueryRunner.h"
-#include "Shared/MapDParameters.h"
+#include "UdfCompiler/UdfCompiler.h"
+
 #include "TestHelpers.h"
 
 #ifndef BASE_PATH
 #define BASE_PATH "./tmp"
 #endif
 
-constexpr size_t c_calcite_port = 36279;
-
 using namespace Catalog_Namespace;
 using namespace TestHelpers;
+
+using QR = QueryRunner::QueryRunner;
 
 #define SKIP_NO_GPU()                                        \
   if (skip_tests(dt)) {                                      \
@@ -50,56 +52,32 @@ using namespace TestHelpers;
   }
 
 namespace {
-std::unique_ptr<SessionInfo> g_session;
+
 std::shared_ptr<Calcite> g_calcite = nullptr;
 std::string udf_file_name_base("../../Tests/Udf/udf_sample");
-
-bool g_hoist_literals{true};
 
 std::shared_ptr<ResultSet> run_multiple_agg(const std::string& query_str,
                                             const ExecutorDeviceType device_type,
                                             const bool allow_loop_joins) {
-  return QueryRunner::run_multiple_agg(
-      query_str, g_session, device_type, g_hoist_literals, allow_loop_joins);
+  constexpr bool hoist_literals = true;
+  return QR::get()->runSQL(query_str, device_type, hoist_literals, allow_loop_joins);
 }
 
 std::shared_ptr<ResultSet> run_multiple_agg(const std::string& query_str,
                                             const ExecutorDeviceType device_type) {
-  return run_multiple_agg(query_str, device_type, true);
+  constexpr bool allow_loop_joins = true;
+  return run_multiple_agg(query_str, device_type, allow_loop_joins);
 }
 
 TargetValue run_simple_agg(const std::string& query_str,
                            const ExecutorDeviceType device_type,
                            const bool allow_loop_joins = true) {
   auto rows = run_multiple_agg(query_str, device_type, allow_loop_joins);
-  auto crt_row = rows->getNextRow(true, true);
+  constexpr bool translate_strings = true;
+  constexpr bool decimal_to_double = true;
+  auto crt_row = rows->getNextRow(translate_strings, decimal_to_double);
   CHECK_EQ(size_t(1), crt_row.size());
   return crt_row[0];
-}
-
-void calcite_shutdown_handler() {
-  if (g_calcite) {
-    g_calcite->close_calcite_server();
-  }
-}
-
-void mapd_signal_handler(int signal_number) {
-  LOG(ERROR) << "Interrupt signal (" << signal_number << ") received.";
-  calcite_shutdown_handler();
-  // shut down logging force a flush
-  google::ShutdownGoogleLogging();
-  // terminate program
-  if (signal_number == SIGTERM) {
-    std::exit(EXIT_SUCCESS);
-  } else {
-    std::exit(signal_number);
-  }
-}
-
-void register_signal_handler() {
-  std::signal(SIGTERM, mapd_signal_handler);
-  std::signal(SIGSEGV, mapd_signal_handler);
-  std::signal(SIGABRT, mapd_signal_handler);
 }
 
 std::string get_udf_filename() {
@@ -120,76 +98,47 @@ std::string get_udf_ast_filename() {
 
 bool skip_tests(const ExecutorDeviceType device_type) {
 #ifdef HAVE_CUDA
-  return device_type == ExecutorDeviceType::GPU &&
-         !g_session->getCatalog().getDataMgr().gpusPresent();
+  return device_type == ExecutorDeviceType::GPU && !QR::get()->gpusPresent();
 #else
   return device_type == ExecutorDeviceType::GPU;
 #endif
 }
 
 inline void run_ddl_statement(const std::string& query) {
-  QueryRunner::run_ddl_statement(query, g_session);
+  QR::get()->runDDLStatement(query);
 }
+
+CudaMgr_Namespace::NvidiaDeviceArch init_nvidia_device_arch() {
+#ifdef HAVE_CUDA
+  auto cuda_mgr = std::make_unique<CudaMgr_Namespace::CudaMgr>(/*num_gpus=*/0);
+  CHECK(cuda_mgr);
+  return cuda_mgr->getDeviceArch();
+#else
+  return CudaMgr_Namespace::NvidiaDeviceArch::Kepler;
+#endif
+}
+
+CudaMgr_Namespace::NvidiaDeviceArch g_device_arch = init_nvidia_device_arch();
 
 class SQLTestEnv : public ::testing::Environment {
  public:
   void SetUp() override {
-    boost::filesystem::path base_path{BASE_PATH};
-    CHECK(boost::filesystem::exists(base_path));
-    auto system_db_file = base_path / "mapd_catalogs" / OMNISCI_DEFAULT_DB;
-    auto data_dir = base_path / "mapd_data";
-    UserMetadata user;
-    DBMetadata db;
-
-    register_signal_handler();
-    google::InstallFailureFunction(&calcite_shutdown_handler);
-
     boost::filesystem::path udf_file((get_udf_filename()));
     if (!boost::filesystem::exists(udf_file)) {
       throw std::runtime_error("udf file: " + udf_file.string() + " does not exist");
     }
 
-    UdfCompiler compiler(udf_file.string());
-    auto compile_result = compiler.compileUdf();
-    EXPECT_EQ(compile_result, 0);
-
-    g_calcite = std::make_shared<Calcite>(
-        -1, c_calcite_port, base_path.string(), 1024, "", compiler.getAstFileName());
-    ExtensionFunctionsWhitelist::addUdfs(g_calcite->getUserDefinedFunctionWhitelist());
-
-    MapDParameters mapd_parms;
-    auto dataMgr = std::make_shared<Data_Namespace::DataMgr>(
-        data_dir.string(), mapd_parms, false, 0);
-    // if no catalog create one
-    auto& sys_cat = SysCatalog::instance();
-    sys_cat.init(base_path.string(),
-                 dataMgr,
-                 {},
-                 g_calcite,
-                 !boost::filesystem::exists(system_db_file),
-                 mapd_parms.aggregator,
-                 {});
-    CHECK(sys_cat.getMetadataForUser(OMNISCI_ROOT_USER, user));
-    // if no user create one
-    if (!sys_cat.getMetadataForUser("gtest", user)) {
-      sys_cat.createUser("gtest", "test!test!", false, "");
-      CHECK(sys_cat.getMetadataForUser("gtest", user));
-    }
-    // if no db create one
-    if (!sys_cat.getMetadataForDB("gtest_db", db)) {
-      sys_cat.createDatabase("gtest_db", user.userId);
-      CHECK(sys_cat.getMetadataForDB("gtest_db", db));
+    std::vector<std::string> udf_compiler_options{std::string("-D UDF_COMPILER_OPTION")};
+    UdfCompiler compiler(g_device_arch, std::string(""), udf_compiler_options);
+    auto compile_result = compiler.compileUdf(udf_file.string());
+    Executor::addUdfIrToModule(compile_result.first, /*is_cuda_ir=*/false);
+    if (!compile_result.second.empty()) {
+      Executor::addUdfIrToModule(compile_result.second, /*is_cuda_ir=*/true);
     }
 
-    g_session.reset(new SessionInfo(std::make_shared<Catalog>(base_path.string(),
-                                                              db,
-                                                              dataMgr,
-                                                              std::vector<LeafHostInfo>{},
-                                                              g_calcite,
-                                                              false),
-                                    user,
-                                    ExecutorDeviceType::GPU,
-                                    ""));
+    QR::init(BASE_PATH, compiler.getAstFileName(udf_file.string()));
+
+    g_calcite = QR::get()->getCalcite();
   }
 
   void TearDown() override {
@@ -207,6 +156,8 @@ class SQLTestEnv : public ::testing::Environment {
     if (boost::filesystem::exists(udf_ast_file)) {
       boost::filesystem::remove(udf_ast_file);
     }
+
+    QR::reset();
   }
 };
 }  // namespace
@@ -238,19 +189,53 @@ class UDFCompilerTest : public ::testing::Test {
 };
 
 TEST_F(UDFCompilerTest, CompileTest) {
-  UdfCompiler compiler(getUdfFileName());
-  auto compile_result = compiler.compileUdf();
+  UdfCompiler compiler(g_device_arch);
+  auto [cpu_ir_file, cuda_ir_file] = compiler.compileUdf(getUdfFileName());
 
-  EXPECT_EQ(compile_result, 0);
-  // TODO cannot test invalid file path because the compileUdf function uses
-  // LOG(FATAL) which stops the process and does not return
+  EXPECT_TRUE(!cpu_ir_file.empty());
+  if (QR::get()->gpusPresent()) {
+    if (cuda_ir_file.empty()) {
+      LOG(ERROR) << "Failed to compile UDF for CUDA. Skipping test due to Clang 9 / Cuda "
+                    "11 dependency issues.";
+    }
+    // TODO: re-enable after upgrading llvm/clang in main deps
+    // EXPECT_TRUE(!cuda_ir_file.empty());
+  } else {
+    EXPECT_TRUE(cuda_ir_file.empty());
+  }
+}
+
+TEST_F(UDFCompilerTest, InvalidPath) {
+  UdfCompiler compiler(g_device_arch);
+  EXPECT_ANY_THROW(compiler.compileUdf(getUdfFileName() + ".invalid"));
+}
+
+TEST_F(UDFCompilerTest, CompilerOptionTest) {
+  UdfCompiler compiler(g_device_arch);
+  EXPECT_NO_THROW(compiler.compileUdf(getUdfFileName()));
+
+  // This function signature is only visible via the -DUDF_COMPILER_OPTION
+  // definition. This definition was passed to the UdfCompiler is Setup.
+  // We had to do it there because Calcite only reads the ast definitions once
+  // at startup
+
+  auto signature = ExtensionFunctionsWhitelist::get_udf("udf_range_int2");
+  ASSERT_NE(signature, nullptr);
+}
+
+TEST_F(UDFCompilerTest, CompilerPathTest) {
+  UdfCompiler compiler(g_device_arch, llvm::sys::findProgramByName("clang++").get());
+  EXPECT_NO_THROW(compiler.compileUdf(getUdfFileName()));
+}
+
+TEST_F(UDFCompilerTest, BadClangPath) {
+  UdfCompiler compiler(g_device_arch, /*clang_path_override=*/get_udf_filename());
+  EXPECT_ANY_THROW(compiler.compileUdf(getUdfFileName()));
 }
 
 TEST_F(UDFCompilerTest, CalciteRegistration) {
-  UdfCompiler compiler(getUdfFileName());
-  auto compile_result = compiler.compileUdf();
-
-  ASSERT_EQ(compile_result, 0);
+  UdfCompiler compiler(g_device_arch);
+  EXPECT_NO_THROW(compiler.compileUdf(getUdfFileName()));
 
   ASSERT_TRUE(g_calcite != nullptr);
 
@@ -274,15 +259,34 @@ TEST_F(UDFCompilerTest, CalciteRegistration) {
 }
 
 TEST_F(UDFCompilerTest, UdfQuery) {
-  UdfCompiler compiler(getUdfFileName());
-  auto compile_result = compiler.compileUdf();
-
-  ASSERT_EQ(compile_result, 0);
+  UdfCompiler compiler(g_device_arch);
+  EXPECT_NO_THROW(compiler.compileUdf(getUdfFileName()));
 
   run_ddl_statement("DROP TABLE IF EXISTS stocks;");
+  run_ddl_statement("DROP TABLE IF EXISTS sal_emp;");
+  run_ddl_statement("DROP TABLE IF EXISTS geospatial_test;");
+  run_ddl_statement("DROP TABLE IF EXISTS geospatial_multipoint;");
+  run_ddl_statement("DROP TABLE IF EXISTS geospatial_linestring;");
+  run_ddl_statement("DROP TABLE IF EXISTS geospatial_multilinestring;");
+  run_ddl_statement("DROP TABLE IF EXISTS geo_poly;");
+  run_ddl_statement("DROP TABLE IF EXISTS geo_mpoly;");
+
   run_ddl_statement(
       "CREATE TABLE stocks(symbol text, open_p int, high_p int, "
       "low_p int, close_p int, entry_d DATE);");
+  run_ddl_statement(
+      "CREATE TABLE geospatial_test (id INT, p POINT, "
+      "gp4326 GEOMETRY(POINT,4326) ENCODING COMPRESSED(32), "
+      "gp4326none GEOMETRY(POINT,4326) ENCODING NONE) ;");
+
+  run_ddl_statement("CREATE TABLE sal_emp(name text, pay_by_quarter integer[]);");
+
+  run_ddl_statement("CREATE TABLE geospatial_multipoint (id INT, mp MULTIPOINT)");
+  run_ddl_statement("CREATE TABLE geospatial_linestring (id INT, l LINESTRING)");
+  run_ddl_statement(
+      "CREATE TABLE geospatial_multilinestring (id INT, ml MULTILINESTRING)");
+  run_ddl_statement("CREATE TABLE geo_poly (id INT, p POLYGON);");
+  run_ddl_statement("CREATE TABLE geo_mpoly (id INT, p MULTIPOLYGON);");
 
   std::string insert1(
       "INSERT into stocks VALUES ('NVDA', '178', '178', '171', '173', '2019-05-07');");
@@ -296,6 +300,69 @@ TEST_F(UDFCompilerTest, UdfQuery) {
       "INSERT into stocks VALUES ('NVDA', '183', '184', '181', '183', '2019-05-03');");
   EXPECT_NO_THROW(run_multiple_agg(insert3, ExecutorDeviceType::CPU));
 
+  std::string array_insert1(
+      "INSERT into sal_emp VALUES ('Sarah', ARRAY[5000, 6000, 7000, 8000]);");
+  EXPECT_NO_THROW(run_multiple_agg(array_insert1, ExecutorDeviceType::CPU));
+
+  std::string array_insert2(
+      "INSERT into sal_emp VALUES ('John', ARRAY[3000, 3500, 4000, 4300]);");
+
+  EXPECT_NO_THROW(run_multiple_agg(array_insert2, ExecutorDeviceType::CPU));
+
+  std::string array_insert3("INSERT into sal_emp VALUES ('Jim', NULL);");
+  EXPECT_NO_THROW(run_multiple_agg(array_insert3, ExecutorDeviceType::CPU));
+
+  std::string array_insert4(
+      "INSERT into sal_emp VALUES ('Carla', ARRAY[7000, NULL, NULL, 9000]);");
+
+  EXPECT_NO_THROW(run_multiple_agg(array_insert4, ExecutorDeviceType::CPU));
+
+  std::string point_insert1(
+      "INSERT into geospatial_test VALUES(0, 'POINT(55.8659449685365 "
+      "-4.25072511658072)', "
+      "'POINT(51.4618933852762 -0.926690306514502)', "
+      "'POINT(55.9523783996701 -3.20510306395594326)');");
+  EXPECT_NO_THROW(run_multiple_agg(point_insert1, ExecutorDeviceType::CPU));
+
+  std::string multipoint_insert1(
+      "INSERT into geospatial_multipoint VALUES(0, 'MULTIPOINT(1 0, 2 3, 3 4)');");
+  std::string multipoint_insert2(
+      "INSERT into geospatial_multipoint VALUES(1, 'MULTIPOINT(1 0, 0 1, -1 0, 0 -1, 1 "
+      "0)');");
+
+  EXPECT_NO_THROW(run_multiple_agg(multipoint_insert1, ExecutorDeviceType::CPU));
+  EXPECT_NO_THROW(run_multiple_agg(multipoint_insert2, ExecutorDeviceType::CPU));
+
+  std::string linestring_insert1(
+      "INSERT into geospatial_linestring VALUES(0, 'LINESTRING(1 0, 2 3, 3 4)');");
+  std::string linestring_insert2(
+      "INSERT into geospatial_linestring VALUES(1, 'LINESTRING(1 0, 0 1, -1 0, 0 -1, 1 "
+      "0)');");
+
+  EXPECT_NO_THROW(run_multiple_agg(linestring_insert1, ExecutorDeviceType::CPU));
+  EXPECT_NO_THROW(run_multiple_agg(linestring_insert2, ExecutorDeviceType::CPU));
+
+  std::string multilinestring_insert1(
+      "INSERT into geospatial_multilinestring "
+      "VALUES(0, 'MULTILINESTRING((1 0, 2 3, 3 4),(5 5,5 6))');");
+  std::string multilinestring_insert2(
+      "INSERT into geospatial_multilinestring "
+      "VALUES(1, 'MULTILINESTRING((1 0, 0 1, -1 0, 0 -1, 1 0),(2 2,2 3))');");
+
+  EXPECT_NO_THROW(run_multiple_agg(multilinestring_insert1, ExecutorDeviceType::CPU));
+  EXPECT_NO_THROW(run_multiple_agg(multilinestring_insert2, ExecutorDeviceType::CPU));
+
+  std::string polygon_insert1(
+      "INSERT into geo_poly VALUES(0, 'POLYGON((1 0, "
+      "0 1, -1 0, 0 -1, 1 0), (0.1 0, 0 0.1, -0.1 0, 0 -0.1, 0.1 0))');");
+  EXPECT_NO_THROW(run_multiple_agg(polygon_insert1, ExecutorDeviceType::CPU));
+
+  std::string multipolygon_insert1(
+      "INSERT into geo_mpoly VALUES(0, 'MULTIPOLYGON(((1 0, 0 1, -1 0, 0 -1, 1 0), "
+      "(0.1 0, 0 0.1, -0.1 0, 0 -0.1, 0.1 0)), ((2 0, 0 2, -2 0, 0 -2, 2 0), "
+      "(0.2 0, 0 0.2, -0.2 0, 0 -0.2, 0.2 0)))');");
+  EXPECT_NO_THROW(run_multiple_agg(multipolygon_insert1, ExecutorDeviceType::CPU));
+
   for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
     SKIP_NO_GPU();
     ASSERT_EQ(7,
@@ -306,6 +373,198 @@ TEST_F(UDFCompilerTest, UdfQuery) {
               v<int64_t>(run_simple_agg("SELECT udf_range_int(high_p, low_p) from stocks "
                                         "where entry_d = '2019-05-03';",
                                         dt)));
+    ASSERT_EQ(
+        5000,
+        v<int64_t>(run_simple_agg("select array_at_int32(pay_by_quarter, 0) from sal_emp "
+                                  "where name = 'Sarah';",
+                                  dt)));
+
+    ASSERT_EQ(
+        4300,
+        v<int64_t>(run_simple_agg("select array_at_int32(pay_by_quarter, 3) from sal_emp "
+                                  "where name = 'John';",
+                                  dt)));
+
+    ASSERT_EQ(
+        4,
+        v<int64_t>(run_simple_agg("select array_sz_int32(pay_by_quarter) from sal_emp "
+                                  "where name = 'John';",
+                                  dt)));
+
+    ASSERT_EQ(1,
+              v<int64_t>(run_simple_agg(
+                  "select array_is_null_int32(pay_by_quarter) from sal_emp "
+                  "where name = 'Jim';",
+                  dt)));
+
+    ASSERT_EQ(0,
+              v<int64_t>(run_simple_agg(
+                  "select array_is_null_int32(pay_by_quarter) from sal_emp "
+                  "where name = 'John';",
+                  dt)));
+
+    ASSERT_EQ(
+        std::numeric_limits<int32_t>::min(),
+        v<int64_t>(run_simple_agg("select array_at_int32(pay_by_quarter, 1) from sal_emp "
+                                  "where name = 'Carla';",
+                                  dt)));
+
+    ASSERT_EQ(0,
+              v<int64_t>(run_simple_agg(
+                  "select array_at_int32_is_null(pay_by_quarter, 0) from sal_emp "
+                  "where name = 'Carla';",
+                  dt)));
+
+    ASSERT_EQ(1,
+              v<int64_t>(run_simple_agg(
+                  "select array_at_int32_is_null(pay_by_quarter, 1) from sal_emp "
+                  "where name = 'Carla';",
+                  dt)));
+
+    ASSERT_DOUBLE_EQ(55.8659449685365,
+                     v<double>(run_simple_agg(
+                         "select point_x(p) from geospatial_test WHERE id = 0;", dt)));
+    ASSERT_DOUBLE_EQ(-4.25072511658072,
+                     v<double>(run_simple_agg(
+                         "select point_y(p) from geospatial_test WHERE id = 0;", dt)));
+
+    ASSERT_EQ(0,
+              v<int64_t>(run_simple_agg(
+                  "select point_compression(p) from geospatial_test WHERE id = 0;", dt)));
+
+    ASSERT_EQ(0,
+              v<int64_t>(run_simple_agg(
+                  "select point_input_srid(p) from geospatial_test WHERE id = 0;", dt)));
+
+    ASSERT_EQ(0,
+              v<int64_t>(run_simple_agg(
+                  "select point_output_srid(p) from geospatial_test WHERE id = 0;", dt)));
+
+    ASSERT_EQ(
+        1,
+        v<int64_t>(run_simple_agg(
+            "select point_compression(gp4326) from geospatial_test WHERE id = 0;", dt)));
+
+    ASSERT_EQ(
+        4326,
+        v<int64_t>(run_simple_agg(
+            "select point_input_srid(gp4326) from geospatial_test WHERE id = 0;", dt)));
+
+    ASSERT_EQ(
+        4326,
+        v<int64_t>(run_simple_agg(
+            "select point_output_srid(gp4326) from geospatial_test WHERE id = 0;", dt)));
+
+    ASSERT_EQ(
+        0,
+        v<int64_t>(run_simple_agg(
+            "select point_compression(gp4326none) from geospatial_test WHERE id = 0;",
+            dt)));
+
+    ASSERT_DOUBLE_EQ(
+        0.2,
+        v<double>(run_simple_agg(
+            "select multipoint_centroid(mp) from geospatial_multipoint WHERE id = 1;",
+            dt)));
+
+    ASSERT_DOUBLE_EQ(
+        0,
+        v<double>(run_simple_agg(
+            "select linestring_x_mod(l, 2) from geospatial_linestring WHERE id = 0;",
+            dt)));
+    ASSERT_DOUBLE_EQ(
+        1,
+        v<double>(run_simple_agg(
+            "select linestring_x_mod(l, 3) from geospatial_linestring WHERE id = 0;",
+            dt)));
+
+    ASSERT_DOUBLE_EQ(
+        1,
+        v<double>(run_simple_agg(
+            "select linestring_y_mod(l, 2) from geospatial_linestring WHERE id = 0;",
+            dt)));
+    ASSERT_DOUBLE_EQ(
+        0,
+        v<double>(run_simple_agg(
+            "select linestring_y_mod(l, 3) from geospatial_linestring WHERE id = 0;",
+            dt)));
+
+    ASSERT_DOUBLE_EQ(
+        5.656854249492381,
+        v<double>(run_simple_agg(
+            "select linestring_length(l) from geospatial_linestring WHERE id = 1;", dt)));
+
+    ASSERT_DOUBLE_EQ(6.656854249492381,
+                     v<double>(run_simple_agg("select multilinestring_length(ml) from "
+                                              "geospatial_multilinestring WHERE id = 1;",
+                                              dt)));
+
+    ASSERT_DOUBLE_EQ(1.98,
+                     v<double>(run_simple_agg(
+                         "select polygon_area(p) from geo_poly WHERE id = 0;", dt)));
+
+    ASSERT_EQ(0,
+              v<int64_t>(run_simple_agg(
+                  "select polygon_compression(p) from geo_poly WHERE id = 0;", dt)));
+
+    ASSERT_EQ(0,
+              v<int64_t>(run_simple_agg(
+                  "select polygon_input_srid(p) from geo_poly WHERE id = 0;", dt)));
+
+    ASSERT_EQ(0,
+              v<int64_t>(run_simple_agg(
+                  "select polygon_output_srid(p) from geo_poly WHERE id = 0;", dt)));
+
+    ASSERT_NEAR(static_cast<double>(2.0 - 0.02 + 8.0 - 0.08),
+                v<double>(run_simple_agg(
+                    "select multipolygon_area(p) from geo_mpoly WHERE id = 0;", dt)),
+                static_cast<double>(0.0001));
+
+    ASSERT_NEAR(static_cast<double>(4 * 1.41421 + 4 * 2.82842),
+                v<double>(run_simple_agg(
+                    "select multipolygon_perimeter(p) from geo_mpoly WHERE id = 0;", dt)),
+                static_cast<double>(0.0001));
+
+    ASSERT_EQ(
+        0,
+        v<int64_t>(run_simple_agg(
+            "select multipolygon_compression(p) from geo_mpoly WHERE id = 0;", dt)));
+
+    ASSERT_EQ(0,
+              v<int64_t>(run_simple_agg(
+                  "select multipolygon_input_srid(p) from geo_mpoly WHERE id = 0;", dt)));
+
+    ASSERT_EQ(
+        0,
+        v<int64_t>(run_simple_agg(
+            "select multipolygon_output_srid(p) from geo_mpoly WHERE id = 0;", dt)));
+
+    if constexpr (false)
+    // According to
+    // https://docs.heavy.ai/sql/data-manipulation-dml/functions-operators#user-defined-functions
+    // Array<T> types are not officially supported. It appears to cause problems with
+    // pass_manager.add(llvm::createDeadStoreEliminationPass()) in optimize_ir(). See
+    // QE-791 for more info. This code is left intact in case the problems seen on
+    // ubuntu18 and CentOS7 are later resolved.
+    {
+      auto check_row_result = [](const auto& crt_row, const auto& expected) {
+        compare_array(crt_row[0], expected);
+      };
+
+      const auto rows = run_multiple_agg(
+          "SELECT array_ret_udf(pay_by_quarter, CAST(1.2 AS DOUBLE)) FROM sal_emp;", dt);
+      ASSERT_EQ(rows->rowCount(), size_t(4));
+      check_row_result(rows->getNextRow(false, false),
+                       std::vector<double>{6000, 7200, 8400, 9600});
+      check_row_result(rows->getNextRow(false, false),
+                       std::vector<double>{3600, 4200, 4800, 5160});
+      check_row_result(rows->getNextRow(false, false), std::vector<double>{});
+      check_row_result(rows->getNextRow(false, false),
+                       std::vector<double>{8400,
+                                           inline_fp_null_value<double>(),
+                                           inline_fp_null_value<double>(),
+                                           10800});
+    }
   }
 
   EXPECT_THROW(run_simple_agg("SELECT udf_range_integer(high_p, low_p) from stocks where "
@@ -314,14 +573,19 @@ TEST_F(UDFCompilerTest, UdfQuery) {
                std::exception);
 
   run_ddl_statement("DROP TABLE stocks;");
+  run_ddl_statement("DROP TABLE sal_emp;");
+  run_ddl_statement("DROP TABLE geospatial_test;");
+  run_ddl_statement("DROP TABLE geospatial_multipoint;");
+  run_ddl_statement("DROP TABLE geospatial_linestring;");
+  run_ddl_statement("DROP TABLE geospatial_multilinestring;");
+  run_ddl_statement("DROP TABLE geo_poly;");
+  run_ddl_statement("DROP TABLE geo_mpoly;");
 }
 
 int main(int argc, char** argv) {
-  google::InitGoogleLogging(argv[0]);
+  TestHelpers::init_logger_stderr_only(argc, argv);
   ::testing::InitGoogleTest(&argc, argv);
   ::testing::AddGlobalTestEnvironment(new SQLTestEnv);
-
-  LOG(INFO) << "*** Finished setting up test environment ***";
 
   int err{0};
   try {

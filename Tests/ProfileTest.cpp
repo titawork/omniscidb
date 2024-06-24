@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,33 +16,34 @@
 
 /**
  * @file    ProfileTest.cpp
- * @author  Minggang Yu <miyu@mapd.com>
  * @brief   Unit tests for microbenchmark.
  *
- * Copyright (c) 2016 MapD Technologies, Inc.  All rights reserved.
  */
-#include "ProfileTest.h"
-#include "../QueryEngine/Descriptors/RowSetMemoryOwner.h"
-#include "../QueryEngine/ResultSet.h"
-#include "Shared/measure.h"
 
-#if defined(HAVE_CUDA) && CUDA_VERSION >= 8000
-#include <cuda_runtime.h>
-#include <thrust/system_error.h>
-#endif
+#include "Tests/ProfileTest.h"
 
 #include <gtest/gtest.h>
-#include <boost/make_unique.hpp>
-
 #include <algorithm>
 #include <future>
 #include <random>
 #include <unordered_map>
 #include <unordered_set>
 
+#include "DataMgr/Allocators/ArenaAllocator.h"
+#include "QueryEngine/Descriptors/RowSetMemoryOwner.h"
+#include "QueryEngine/ResultSet.h"
+#include "Shared/measure.h"
+#include "Shared/thread_count.h"
+#include "Tests/TestHelpers.h"
+
+#if defined(HAVE_CUDA) && CUDA_VERSION >= 8000
+#include <thrust/system_error.h>
+#endif
+
 bool g_gpus_present = false;
 
 const float c_space_usage = 2.0f;
+constexpr size_t g_arena_block_size = (1UL << 32) + kArenaBlockOverhead;
 
 namespace {
 #if defined(HAVE_CUDA) && CUDA_VERSION >= 8000
@@ -101,34 +102,39 @@ bool generate_numbers(int8_t* random_numbers,
         *reinterpret_cast<T*>(random_numbers + i * stride) =
             std::max<T>(min_number, std::min<T>(max_number, std::round(d(gen))));
       }
-    } break;
+      break;
+    }
     case EXP1: {
       std::exponential_distribution<> d(1);
       for (unsigned i = 0; i < num_random_numbers; ++i) {
         *reinterpret_cast<T*>(random_numbers + i * stride) =
             std::max<T>(min_number, std::min<T>(max_number, std::round(d(gen))));
       }
-    } break;
+      break;
+    }
     case EXP2: {
       std::exponential_distribution<> d(2);
       for (unsigned i = 0; i < num_random_numbers; ++i) {
         *reinterpret_cast<T*>(random_numbers + i * stride) =
             std::max<T>(min_number, std::min<T>(max_number, std::round(d(gen))));
       }
-    } break;
+      break;
+    }
     case UNI: {
       std::uniform_int_distribution<T> d(min_number, max_number);
       for (unsigned i = 0; i < num_random_numbers; ++i) {
         *reinterpret_cast<T*>(random_numbers + i * stride) = d(gen);
       }
-    } break;
+      break;
+    }
     case POI: {
       std::poisson_distribution<T> d(4);
       for (unsigned i = 0; i < num_random_numbers; ++i) {
         *reinterpret_cast<T*>(random_numbers + i * stride) =
             std::max<T>(min_number, std::min(max_number, d(gen)));
       }
-    } break;
+      break;
+    }
     default:
       CHECK(false);
   }
@@ -220,11 +226,13 @@ inline void init_groups_on_host(int8_t* groups,
                     std::fill(col_ptr,
                               col_ptr + group_count,
                               static_cast<uint32_t>(init_vals[j]));
-                  } break;
+                    break;
+                  }
                   case 8: {
                     auto col_ptr = reinterpret_cast<size_t*>(col_base);
                     std::fill(col_ptr, col_ptr + group_count, init_vals[j]);
-                  } break;
+                    break;
+                  }
                   default:
                     CHECK(false);
                 }
@@ -1280,7 +1288,7 @@ TEST(Reduction, Baseline) {
   std::reverse(target_infos.begin(), target_infos.end());
 
   const auto device_type = ExecutorDeviceType::CPU;
-  CHECK_GT(key_count, 1);
+  CHECK_GT(key_count, 1u);
   size_t row_size = key_count * sizeof(int64_t);
   std::vector<int8_t> group_col_widths(key_count, sizeof(int64_t));
   QueryMemoryDescriptor query_mem_desc(
@@ -1301,11 +1309,12 @@ TEST(Reduction, Baseline) {
 #else
   const bool has_multi_gpus = false;
 #endif  // HAVE_CUDA
-  const auto row_set_mem_owner = std::make_shared<RowSetMemoryOwner>();
+  const auto row_set_mem_owner = std::make_shared<RowSetMemoryOwner>(
+      g_arena_block_size, 0, /*num_worker_threads=*/1);
   std::vector<std::unique_ptr<ResultSet>> results;
   for (size_t i = 0; i < result_count; ++i) {
-    auto rs = boost::make_unique<ResultSet>(
-        target_infos, device_type, query_mem_desc, row_set_mem_owner, nullptr);
+    auto rs = std::make_unique<ResultSet>(
+        target_infos, device_type, query_mem_desc, row_set_mem_owner, 0, 0);
     rs->allocateStorage();
     results.push_back(std::move(rs));
   }
@@ -1566,11 +1575,12 @@ TEST(Reduction, PerfectHash) {
 #else
   const bool has_multi_gpus = false;
 #endif  // HAVE_CUDA
-  const auto row_set_mem_owner = std::make_shared<RowSetMemoryOwner>();
+  const auto row_set_mem_owner =
+      std::make_shared<RowSetMemoryOwner>(g_arena_block_size, 0, /*num_threads=*/1);
   std::vector<std::unique_ptr<ResultSet>> results;
   for (size_t i = 0; i < result_count; ++i) {
-    auto rs = boost::make_unique<ResultSet>(
-        target_infos, device_type, query_mem_desc, row_set_mem_owner, nullptr);
+    auto rs = std::make_unique<ResultSet>(
+        target_infos, device_type, query_mem_desc, row_set_mem_owner, 0, 0);
     rs->allocateStorage();
     results.push_back(std::move(rs));
   }
@@ -1832,7 +1842,7 @@ TEST(Reduction, PerfectHash) {
 }
 
 int main(int argc, char** argv) {
-  google::InitGoogleLogging(argv[0]);
+  TestHelpers::init_logger_stderr_only(argc, argv);
   testing::InitGoogleTest(&argc, argv);
   g_gpus_present = is_gpu_present();
 #ifndef HAVE_CUDA

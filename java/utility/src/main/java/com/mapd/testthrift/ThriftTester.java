@@ -15,19 +15,6 @@
  */
 package com.mapd.testthrift;
 
-import com.mapd.thrift.server.MapD;
-import com.mapd.thrift.server.TColumn;
-import com.mapd.thrift.server.TColumnData;
-import com.mapd.thrift.server.TColumnType;
-import com.mapd.thrift.server.TDBInfo;
-import com.mapd.thrift.server.TDatum;
-import com.mapd.thrift.server.TMapDException;
-import com.mapd.thrift.server.TQueryResult;
-import com.mapd.thrift.server.TRow;
-import com.mapd.thrift.server.TRowSet;
-import com.mapd.thrift.server.TTableDetails;
-import com.mapd.thrift.server.TTypeInfo;
-
 import org.apache.thrift.TException;
 import org.apache.thrift.protocol.TBinaryProtocol;
 import org.apache.thrift.protocol.TProtocol;
@@ -40,10 +27,19 @@ import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 
-/**
- *
- * @author michael
- */
+import ai.heavy.thrift.server.Heavy;
+import ai.heavy.thrift.server.TColumn;
+import ai.heavy.thrift.server.TColumnData;
+import ai.heavy.thrift.server.TColumnType;
+import ai.heavy.thrift.server.TDBException;
+import ai.heavy.thrift.server.TDBInfo;
+import ai.heavy.thrift.server.TDatum;
+import ai.heavy.thrift.server.TQueryResult;
+import ai.heavy.thrift.server.TRow;
+import ai.heavy.thrift.server.TRowSet;
+import ai.heavy.thrift.server.TTableDetails;
+import ai.heavy.thrift.server.TTypeInfo;
+
 public class ThriftTester {
   final static Logger logger = LoggerFactory.getLogger(ThriftTester.class);
 
@@ -68,7 +64,7 @@ public class ThriftTester {
       // TProtocol protocol = new TJSONProtocol(transport);
       // TProtocol protocol = new TProtocol(transport);
 
-      MapD.Client client = new MapD.Client(protocol);
+      Heavy.Client client = new Heavy.Client(protocol);
 
       String session = null;
 
@@ -173,8 +169,8 @@ public class ThriftTester {
       // Now disconnect
       logger.info("Trying to disconnect session " + session);
       client.disconnect(session);
-    } catch (TMapDException ex) {
-      logger.error(ex.toString());
+    } catch (TDBException ex) {
+      logger.error(ex.getError_msg());
       ex.printStackTrace();
     } catch (TException ex) {
       logger.error(ex.toString());

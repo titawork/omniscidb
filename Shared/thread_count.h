@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,17 +14,25 @@
  * limitations under the License.
  */
 
-#ifndef THREAD_COUNT_H
-#define THREAD_COUNT_H
+#pragma once
 
-#include <unistd.h>
 #include <algorithm>
+#include <thread>
+
+extern unsigned g_cpu_threads_override;
+extern size_t g_max_import_threads;
 
 inline int cpu_threads() {
-  // could use std::thread::hardware_concurrency(), but some
-  // slightly out-of-date compilers (gcc 4.7) implement it as always 0.
-  // Play it POSIX.1 safe instead.
-  return std::max(2 * sysconf(_SC_NPROCESSORS_CONF), 1L);
+  auto ov = g_cpu_threads_override;
+  return (ov <= 0) ? std::max(2 * std::thread::hardware_concurrency(), 1U) : ov;
 }
 
-#endif  // THREAD_COUNT_H
+namespace import_export {
+inline size_t num_import_threads(const int32_t copy_params_threads) {
+  if (copy_params_threads > 0) {
+    return static_cast<size_t>(copy_params_threads);
+  }
+  return std::min(static_cast<size_t>(std::thread::hardware_concurrency()),
+                  g_max_import_threads);
+}
+}  // namespace import_export

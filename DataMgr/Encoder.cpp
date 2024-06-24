@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,11 +15,11 @@
  */
 
 #include "Encoder.h"
-#include <glog/logging.h>
 #include "ArrayNoneEncoder.h"
 #include "DateDaysEncoder.h"
 #include "FixedLengthArrayNoneEncoder.h"
 #include "FixedLengthEncoder.h"
+#include "Logger/Logger.h"
 #include "NoneEncoder.h"
 #include "StringNoneEncoder.h"
 
@@ -73,7 +73,9 @@ Encoder* Encoder::Create(Data_Namespace::AbstractBuffer* buffer,
         case kDATE:
           return new NoneEncoder<int64_t>(buffer);
         case kPOINT:
+        case kMULTIPOINT:
         case kLINESTRING:
+        case kMULTILINESTRING:
         case kPOLYGON:
         case kMULTIPOLYGON:
           return new StringNoneEncoder(buffer);
@@ -135,7 +137,8 @@ Encoder* Encoder::Create(Data_Namespace::AbstractBuffer* buffer,
               return 0;
               break;
           }
-        } break;
+          break;
+        }
         case kBIGINT:
         case kNUMERIC:
         case kDECIMAL: {
@@ -199,7 +202,9 @@ Encoder* Encoder::Create(Data_Namespace::AbstractBuffer* buffer,
     case kENCODING_GEOINT: {
       switch (sqlType.get_type()) {
         case kPOINT:
+        case kMULTIPOINT:
         case kLINESTRING:
+        case kMULTILINESTRING:
         case kPOLYGON:
         case kMULTIPOLYGON:
           return new StringNoneEncoder(buffer);
@@ -220,12 +225,11 @@ Encoder* Encoder::Create(Data_Namespace::AbstractBuffer* buffer,
 Encoder::Encoder(Data_Namespace::AbstractBuffer* buffer)
     : num_elems_(0)
     , buffer_(buffer)
-    , decimal_overflow_validator_(buffer ? buffer->sqlType : SQLTypeInfo())
-    , date_days_overflow_validator_(buffer ? buffer->sqlType : SQLTypeInfo()){};
+    , decimal_overflow_validator_(buffer ? buffer->getSqlType() : SQLTypeInfo())
+    , date_days_overflow_validator_(buffer ? buffer->getSqlType() : SQLTypeInfo()){};
 
-void Encoder::getMetadata(ChunkMetadata& chunkMetadata) {
-  // chunkMetadata = metadataTemplate_; // invoke copy constructor
-  chunkMetadata.sqlType = buffer_->sqlType;
-  chunkMetadata.numBytes = buffer_->size();
-  chunkMetadata.numElements = num_elems_;
+void Encoder::getMetadata(const std::shared_ptr<ChunkMetadata>& chunkMetadata) {
+  chunkMetadata->sqlType = buffer_->getSqlType();
+  chunkMetadata->numBytes = buffer_->size();
+  chunkMetadata->numElements = num_elems_;
 }

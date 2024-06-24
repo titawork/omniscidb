@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,24 +16,28 @@
 
 /**
  * @file    AbstractFragmenter.h
- * @author  Todd Mostak <todd@map-d.com
+ * @brief
+ *
  */
 
-#ifndef _ABSTRACT_FRAGMENTER_H
-#define _ABSTRACT_FRAGMENTER_H
+#pragma once
+
+#include "Fragmenter/Fragmenter.h"
 
 #include <boost/variant.hpp>
 #include <string>
 #include <vector>
-#include "../QueryEngine/TargetMetaInfo.h"
-#include "../QueryEngine/TargetValue.h"
-#include "../Shared/UpdelRoll.h"
-#include "../Shared/sqltypes.h"
-#include "../StringDictionary/StringDictionaryProxy.h"
-#include "Fragmenter.h"
+
+#include "QueryEngine/TargetMetaInfo.h"
+#include "QueryEngine/TargetValue.h"
+#include "Shared/UpdelRoll.h"
+#include "Shared/sqltypes.h"
+#include "StringDictionary/StringDictionaryProxy.h"
 
 // Should the ColumnInfo and FragmentInfo structs be in
 // AbstractFragmenter?
+
+class Executor;
 
 namespace Chunk_NS {
 class Chunk;
@@ -42,11 +46,11 @@ class Chunk;
 namespace Data_Namespace {
 class AbstractBuffer;
 class AbstractDataMgr;
-};  // namespace Data_Namespace
+}  // namespace Data_Namespace
 
-namespace Importer_NS {
+namespace import_export {
 class TypedImportBuffer;
-};
+}
 
 namespace Catalog_Namespace {
 class Catalog;
@@ -61,10 +65,35 @@ namespace Fragmenter_Namespace {
  */
 class RowDataProvider {
  public:
-  virtual size_t count() const = 0;
+  virtual size_t const getRowCount() const = 0;
+  virtual size_t const getEntryCount() const = 0;
   virtual StringDictionaryProxy* getLiteralDictionary() const = 0;
   virtual std::vector<TargetValue> getEntryAt(const size_t index) const = 0;
   virtual std::vector<TargetValue> getTranslatedEntryAt(const size_t index) const = 0;
+};
+
+struct UpdateValuesStats {
+  bool has_null{false};
+  double max_double{std::numeric_limits<double>::lowest()};
+  double min_double{std::numeric_limits<double>::max()};
+  int64_t max_int64t{std::numeric_limits<int64_t>::min()};
+  int64_t min_int64t{std::numeric_limits<int64_t>::max()};
+};
+
+/*
+ * @type ChunkUpdateStats
+ * @brief struct containing stats from a column chunk update.
+ * `new_values_stats` represents aggregate stats for the new
+ * values that were put into the chunk. `old_values_stats`
+ * represents aggregate stats for chunk values that were
+ * replaced.
+ */
+struct ChunkUpdateStats {
+  UpdateValuesStats new_values_stats;
+  UpdateValuesStats old_values_stats;
+  int64_t updated_rows_count{0};
+  int64_t fragment_rows_count{0};
+  std::shared_ptr<Chunk_NS::Chunk> chunk;
 };
 
 /*
@@ -93,6 +122,12 @@ class AbstractFragmenter {
   // 0
 
   /**
+   * @brief returns the number of fragments in a table
+   */
+
+  virtual size_t getNumFragments() = 0;
+
+  /**
    * @brief Get all fragments for the current table.
    */
   virtual TableInfo getFragmentsForQuery() = 0;
@@ -102,14 +137,29 @@ class AbstractFragmenter {
    * inserts it into the correct partitions
    * with locks and checkpoints
    */
-  virtual void insertData(InsertData& insertDataStruct) = 0;
+  virtual void insertData(InsertData& insert_data_struct) = 0;
+
+  /**
+   * @brief Insert chunks into minimal number of fragments
+   *
+   * @param insert_chunk - the chunks to insert
+   */
+  virtual void insertChunks(const InsertChunks& insert_chunk) = 0;
 
   /**
    * @brief Given data wrapped in an InsertData struct,
    * inserts it into the correct partitions
    * No locks and checkpoints taken needs to be managed externally
    */
-  virtual void insertDataNoCheckpoint(InsertData& insertDataStruct) = 0;
+  virtual void insertDataNoCheckpoint(InsertData& insert_data_struct) = 0;
+
+  /**
+   * @brief Insert chunks into minimal number of fragments; no locks or
+   * checkpoints taken
+   *
+   * @param chunk - the chunks to insert
+   */
+  virtual void insertChunksNoCheckpoint(const InsertChunks& insert_chunk) = 0;
 
   /**
    * @brief Will truncate table to less than maxRows by dropping
@@ -122,7 +172,13 @@ class AbstractFragmenter {
    */
   virtual void updateChunkStats(
       const ColumnDescriptor* cd,
-      std::unordered_map</*fragment_id*/ int, ChunkStats>& stats_map) = 0;
+      std::unordered_map</*fragment_id*/ int, ChunkStats>& stats_map,
+      std::optional<Data_Namespace::MemoryLevel> memory_level) = 0;
+
+  /**
+   * @brief Retrieve the fragment info object for an individual fragment for editing.
+   */
+  virtual FragmentInfo* getFragmentInfo(const int fragment_id) const = 0;
 
   /**
    * @brief Gets the id of the partitioner
@@ -136,16 +192,18 @@ class AbstractFragmenter {
   virtual std::string getFragmenterType() = 0;
 
   virtual size_t getNumRows() = 0;
+  virtual void setNumRows(const size_t numTuples) = 0;
 
-  virtual void updateColumn(const Catalog_Namespace::Catalog* catalog,
-                            const TableDescriptor* td,
-                            const ColumnDescriptor* cd,
-                            const int fragment_id,
-                            const std::vector<uint64_t>& frag_offsets,
-                            const std::vector<ScalarTargetValue>& rhs_values,
-                            const SQLTypeInfo& rhs_type,
-                            const Data_Namespace::MemoryLevel memory_level,
-                            UpdelRoll& updel_roll) = 0;
+  virtual std::optional<ChunkUpdateStats> updateColumn(
+      const Catalog_Namespace::Catalog* catalog,
+      const TableDescriptor* td,
+      const ColumnDescriptor* cd,
+      const int fragment_id,
+      const std::vector<uint64_t>& frag_offsets,
+      const std::vector<ScalarTargetValue>& rhs_values,
+      const SQLTypeInfo& rhs_type,
+      const Data_Namespace::MemoryLevel memory_level,
+      UpdelRoll& updel_roll) = 0;
 
   virtual void updateColumns(const Catalog_Namespace::Catalog* catalog,
                              const TableDescriptor* td,
@@ -155,7 +213,8 @@ class AbstractFragmenter {
                              const RowDataProvider& sourceDataProvider,
                              const size_t indexOffFragmentOffsetColumn,
                              const Data_Namespace::MemoryLevel memoryLevel,
-                             UpdelRoll& updelRoll) = 0;
+                             UpdelRoll& updelRoll,
+                             Executor* executor) = 0;
 
   virtual void updateColumn(const Catalog_Namespace::Catalog* catalog,
                             const TableDescriptor* td,
@@ -170,11 +229,7 @@ class AbstractFragmenter {
   virtual void updateColumnMetadata(const ColumnDescriptor* cd,
                                     FragmentInfo& fragment,
                                     std::shared_ptr<Chunk_NS::Chunk> chunk,
-                                    const bool null,
-                                    const double dmax,
-                                    const double dmin,
-                                    const int64_t lmax,
-                                    const int64_t lmin,
+                                    const UpdateValuesStats& update_values_stats,
                                     const SQLTypeInfo& rhs_type,
                                     UpdelRoll& updel_roll) = 0;
 
@@ -191,8 +246,30 @@ class AbstractFragmenter {
 
   virtual const std::vector<uint64_t> getVacuumOffsets(
       const std::shared_ptr<Chunk_NS::Chunk>& chunk) = 0;
+
+  virtual void dropColumns(const std::vector<int>& columnIds) = 0;
+
+  //! Iterates through chunk metadata to return whether any rows have been deleted.
+  virtual bool hasDeletedRows(const int delete_column_id) = 0;
+
+  /**
+   * @brief Updates the metadata for a column chunk
+   *
+   * @param cd - ColumnDescriptor for the column
+   * @param fragment_id - Fragment id of the chunk within the column
+   * @param metadata -  shared_ptr  of the metadata to update column chunk with
+   */
+  virtual void updateColumnChunkMetadata(
+      const ColumnDescriptor* cd,
+      const int fragment_id,
+      const std::shared_ptr<ChunkMetadata> metadata) = 0;
+
+  /**
+   * Resets the fragmenter's size related metadata using the internal fragment info
+   * vector. This is typically done after operations, such as vacuuming, which can
+   * change fragment sizes.
+   */
+  virtual void resetSizesFromFragments() = 0;
 };
 
 }  // namespace Fragmenter_Namespace
-
-#endif  // _ABSTRACT_FRAGMENTER_H

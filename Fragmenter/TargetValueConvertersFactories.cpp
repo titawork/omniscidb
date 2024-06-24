@@ -1,5 +1,5 @@
 /*
- * Copyright 2018, OmniSci, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,18 +25,32 @@ struct NumericConverterFactory {
     SOURCE_TYPE source_null_value =
         static_cast<SOURCE_TYPE>(inline_int_null_value<SOURCE_TYPE>());
 
+    using CasterFunc = std::function<TARGET_TYPE(SOURCE_TYPE, bool, TARGET_TYPE)>;
+
+    CasterFunc caster = nullptr;
+
     switch (param.type.get_size()) {
       case 8:
         source_null_value = static_cast<SOURCE_TYPE>(inline_int_null_value<int64_t>());
+        caster = checked_cast<SOURCE_TYPE, TARGET_TYPE, int64_t>;
         break;
       case 4:
         source_null_value = static_cast<SOURCE_TYPE>(inline_int_null_value<int32_t>());
+        if (param.source.get_physical_type_info().get_size() > 4) {
+          caster = checked_cast<SOURCE_TYPE, TARGET_TYPE, int32_t>;
+        }
         break;
       case 2:
         source_null_value = static_cast<SOURCE_TYPE>(inline_int_null_value<int16_t>());
+        if (param.source.get_physical_type_info().get_size() > 2) {
+          caster = checked_cast<SOURCE_TYPE, TARGET_TYPE, int16_t>;
+        }
         break;
       case 1:
         source_null_value = static_cast<SOURCE_TYPE>(inline_int_null_value<int8_t>());
+        if (param.source.get_physical_type_info().get_size() > 1) {
+          caster = checked_cast<SOURCE_TYPE, TARGET_TYPE, int8_t>;
+        }
         break;
       default:
         CHECK(false);
@@ -45,12 +59,20 @@ struct NumericConverterFactory {
     TARGET_TYPE target_null_value =
         static_cast<TARGET_TYPE>(inline_int_null_value<TARGET_TYPE>());
 
-    return std::make_unique<NumericValueConverter<SOURCE_TYPE, TARGET_TYPE>>(
+    auto ret = std::make_unique<NumericValueConverter<SOURCE_TYPE, TARGET_TYPE>>(
         param.target,
         param.num_rows,
         source_null_value,
         target_null_value,
         param.can_be_null);
+
+    if (param.type.is_integer()) {
+      // only apply overflow checks for
+      // the types using the fixed encoder
+      ret->setValueCaster(std::move(caster));
+    }
+
+    return ret;
   }
 
   std::unique_ptr<TargetValueConverter> operator()(ConverterCreateParameter param) {
@@ -97,14 +119,15 @@ struct DictionaryConverterFactory {
     }
 
     return std::make_unique<DictionaryValueConverter<TARGET_TYPE>>(
-        param.cat,
-        param.source.get_type_info().get_comp_param(),
+        param.source.get_type_info().getStringDictKey(),
         param.target,
+        param.target_cat,
         param.num_rows,
         target_null_value,
         NULL_INT,
         param.can_be_null,
-        param.literals_dictionary);
+        param.literals_dictionary,
+        param.source_dictionary_proxy);
   }
 
   std::unique_ptr<TargetValueConverter> operator()(ConverterCreateParameter param) {
@@ -117,12 +140,14 @@ struct TextConverterFactory {
     if (param.target->columnType.get_compression() == kENCODING_NONE) {
       bool dictEncodedSource =
           param.source.get_type_info().get_compression() == kENCODING_DICT;
-      auto sourceDictId = param.source.get_type_info().get_comp_param();
-      return std::make_unique<StringValueConverter>(param.cat,
-                                                    param.target,
+      shared::StringDictKey source_dict_key;
+      if (dictEncodedSource) {
+        source_dict_key = param.source.get_type_info().getStringDictKey();
+      }
+      return std::make_unique<StringValueConverter>(param.target,
                                                     param.num_rows,
                                                     dictEncodedSource,
-                                                    sourceDictId,
+                                                    source_dict_key,
                                                     param.literals_dictionary);
     } else if (param.target->columnType.get_compression() == kENCODING_DICT) {
       auto size = param.target->columnType.get_size();
@@ -150,9 +175,9 @@ struct ArrayConverterFactory {
       ConverterCreateParameter param) {
     auto elem_type = param.target->columnType.get_elem_type();
     ConverterCreateParameter elementConverterFactoryParam{0,
-                                                          param.cat,
                                                           param.source,
                                                           param.target,
+                                                          param.target_cat,
                                                           elem_type,
                                                           true,
                                                           param.literals_dictionary};
@@ -216,10 +241,20 @@ struct ArraysConverterFactory {
   }
 };
 
-template <typename CONVERTER>
+template <typename CONVERTER, class Enable = void>
 struct GeoConverterFactory {
   std::unique_ptr<TargetValueConverter> operator()(ConverterCreateParameter param) {
-    return std::make_unique<CONVERTER>(param.cat, param.num_rows, param.target);
+    return std::make_unique<CONVERTER>(param.target_cat, param.num_rows, param.target);
+  }
+};
+
+template <typename CONVERTER>
+struct GeoConverterFactory<
+    CONVERTER,
+    typename std::enable_if_t<std::is_same_v<GeoPolygonValueConverter, CONVERTER> ||
+                              std::is_same_v<GeoMultiPolygonValueConverter, CONVERTER>>> {
+  std::unique_ptr<TargetValueConverter> operator()(ConverterCreateParameter param) {
+    return std::make_unique<CONVERTER>(param.target_cat, param.num_rows, param.target);
   }
 };
 
@@ -228,26 +263,29 @@ std::unique_ptr<TargetValueConverter> TargetValueConverterFactory::create(
   static const std::map<SQLTypes,
                         std::function<std::unique_ptr<TargetValueConverter>(
                             ConverterCreateParameter param)>>
-      factories{{kBIGINT, NumericConverterFactory<int64_t, int64_t>()},
-                {kINT, NumericConverterFactory<int64_t, int32_t>()},
-                {kSMALLINT, NumericConverterFactory<int64_t, int16_t>()},
-                {kTINYINT, NumericConverterFactory<int64_t, int8_t>()},
-                {kDECIMAL, NumericConverterFactory<int64_t, int64_t>()},
-                {kNUMERIC, NumericConverterFactory<int64_t, int64_t>()},
-                {kTIMESTAMP, NumericConverterFactory<int64_t, int64_t>()},
-                {kDATE, NumericConverterFactory<int64_t, int64_t>()},
-                {kTIME, NumericConverterFactory<int64_t, int64_t>()},
-                {kBOOLEAN, NumericConverterFactory<int64_t, int8_t>()},
-                {kDOUBLE, NumericConverterFactory<double, double>()},
-                {kFLOAT, NumericConverterFactory<float, float>()},
-                {kTEXT, TextConverterFactory()},
-                {kCHAR, TextConverterFactory()},
-                {kVARCHAR, TextConverterFactory()},
-                {kARRAY, ArraysConverterFactory()},
-                {kPOINT, GeoConverterFactory<GeoPointValueConverter>()},
-                {kLINESTRING, GeoConverterFactory<GeoLinestringValueConverter>()},
-                {kPOLYGON, GeoConverterFactory<GeoPolygonValueConverter>()},
-                {kMULTIPOLYGON, GeoConverterFactory<GeoMultiPolygonValueConverter>()}};
+      factories{
+          {kBIGINT, NumericConverterFactory<int64_t, int64_t>()},
+          {kINT, NumericConverterFactory<int64_t, int32_t>()},
+          {kSMALLINT, NumericConverterFactory<int64_t, int16_t>()},
+          {kTINYINT, NumericConverterFactory<int64_t, int8_t>()},
+          {kDECIMAL, NumericConverterFactory<int64_t, int64_t>()},
+          {kNUMERIC, NumericConverterFactory<int64_t, int64_t>()},
+          {kTIMESTAMP, NumericConverterFactory<int64_t, int64_t>()},
+          {kDATE, NumericConverterFactory<int64_t, int64_t>()},
+          {kTIME, NumericConverterFactory<int64_t, int64_t>()},
+          {kBOOLEAN, NumericConverterFactory<int64_t, int8_t>()},
+          {kDOUBLE, NumericConverterFactory<double, double>()},
+          {kFLOAT, NumericConverterFactory<float, float>()},
+          {kTEXT, TextConverterFactory()},
+          {kCHAR, TextConverterFactory()},
+          {kVARCHAR, TextConverterFactory()},
+          {kARRAY, ArraysConverterFactory()},
+          {kPOINT, GeoConverterFactory<GeoPointValueConverter>()},
+          {kMULTIPOINT, GeoConverterFactory<GeoMultiPointValueConverter>()},
+          {kLINESTRING, GeoConverterFactory<GeoLinestringValueConverter>()},
+          {kMULTILINESTRING, GeoConverterFactory<GeoMultiLinestringValueConverter>()},
+          {kPOLYGON, GeoConverterFactory<GeoPolygonValueConverter>()},
+          {kMULTIPOLYGON, GeoConverterFactory<GeoMultiPolygonValueConverter>()}};
 
   auto factory = factories.find(param.target->columnType.get_type());
 

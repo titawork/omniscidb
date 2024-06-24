@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,22 +19,27 @@
 
 #define BOOST_STACKTRACE_GNU_SOURCE_NOT_REQUIRED 1
 
-#include <glog/logging.h>
-#include <boost/stacktrace.hpp>
+#include "Shared/boost_stacktrace.hpp"
+
 #include <cstdlib>
 #include <ostream>
 #include <stdexcept>
 #include <string>
+#include "../Logger/Logger.h"
 #include "../Shared/types.h"
 
-class OutOfHostMemory : public std::runtime_error {
+class OutOfHostMemory : public std::bad_alloc {
  public:
   OutOfHostMemory(const size_t size)
-      : std::runtime_error("Failed to allocate " + std::to_string(size) +
-                           " bytes of memory") {
-    VLOG(1) << "Failed to allocate " << size << " bytes " << std::endl
+      : what_str_("Not enough CPU memory available to allocate " + std::to_string(size)) {
+    VLOG(1) << "Failed to allocate " << size << " bytes\n"
             << boost::stacktrace::stacktrace();
   }
+
+  const char* what() const noexcept final { return what_str_.c_str(); }
+
+ private:
+  const std::string what_str_;
 };
 
 inline void* checked_malloc(const size_t size) {

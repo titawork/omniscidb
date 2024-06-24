@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,29 +16,34 @@
 
 /**
  * @file        GlobalFileMgr.h
- * @author      Norair Khachiyan <norair@map-d.com>
- * @author      Todd Mostak <todd@map-d.com>
+ * @brief
  *
  * This file includes the class specification for the FILE manager (FileMgr), and related
  * data structures and types.
  */
 
-#ifndef DATAMGR_MEMORY_FILE_GLOBAL_FILEMGR_H
-#define DATAMGR_MEMORY_FILE_GLOBAL_FILEMGR_H
+#pragma once
 
 #include <iostream>
 #include <map>
 #include <mutex>
 #include <set>
-#include "../Shared/mapd_shared_mutex.h"
-
-#include "../AbstractBuffer.h"
-#include "../AbstractBufferMgr.h"
+#include "DataMgr/AbstractBuffer.h"
+#include "DataMgr/AbstractBufferMgr.h"
 #include "FileMgr.h"
+#include "Shared/heavyai_shared_mutex.h"
+
+class ForeignStorageInterface;
 
 using namespace Data_Namespace;
 
 namespace File_Namespace {
+
+struct FileMgrParams {
+  FileMgrParams() : epoch(-1), max_rollback_epochs(-1) {}
+  int32_t epoch;
+  int32_t max_rollback_epochs;
+};
 
 /**
  * @class   GlobalFileMgr
@@ -48,13 +53,14 @@ class GlobalFileMgr : public AbstractBufferMgr {  // implements
 
  public:
   /// Constructor
-  GlobalFileMgr(const int deviceId,
-                std::string basePath = ".",
+  GlobalFileMgr(const int32_t device_id,
+                std::shared_ptr<ForeignStorageInterface> fsi,
+                std::string base_path = ".",
                 const size_t num_reader_threads = 0,
-                const size_t defaultPageSize = 2097152);
+                const size_t page_size = DEFAULT_PAGE_SIZE,
+                const size_t metadata_page_size = DEFAULT_METADATA_PAGE_SIZE);
 
-  /// Destructor
-  ~GlobalFileMgr() override;
+  ~GlobalFileMgr() override {}
 
   /// Creates a chunk with the specified key and page size.
   AbstractBuffer* createBuffer(const ChunkKey& key,
@@ -104,6 +110,7 @@ class GlobalFileMgr : public AbstractBufferMgr {  // implements
   // Buffer API
   AbstractBuffer* alloc(const size_t numBytes) override {
     LOG(FATAL) << "Operation not supported";
+    return nullptr;  // satisfy return-type warning
   }
 
   void free(AbstractBuffer* buffer) override { LOG(FATAL) << "Operation not supported"; }
@@ -111,8 +118,6 @@ class GlobalFileMgr : public AbstractBufferMgr {  // implements
   inline MgrType getMgrType() override { return GLOBAL_FILE_MGR; };
   inline std::string getStringMgrType() override { return ToString(GLOBAL_FILE_MGR); }
   inline std::string printSlabs() override { return "Not Implemented"; }
-  inline void clearSlabs() override { /* noop */
-  }
   inline size_t getMaxSize() override { return 0; }
   inline size_t getInUseSize() override { return 0; }
   inline size_t getAllocated() override { return 0; }
@@ -120,11 +125,8 @@ class GlobalFileMgr : public AbstractBufferMgr {  // implements
 
   void init();
 
-  void getChunkMetadataVec(
-      std::vector<std::pair<ChunkKey, ChunkMetadata>>& chunkMetadataVec) override;
-  void getChunkMetadataVecForKeyPrefix(
-      std::vector<std::pair<ChunkKey, ChunkMetadata>>& chunkMetadataVec,
-      const ChunkKey& keyPrefix) override {
+  void getChunkMetadataVecForKeyPrefix(ChunkMetadataVector& chunkMetadataVec,
+                                       const ChunkKey& keyPrefix) override {
     return getFileMgr(keyPrefix)->getChunkMetadataVecForKeyPrefix(chunkMetadataVec,
                                                                   keyPrefix);
   }
@@ -134,7 +136,7 @@ class GlobalFileMgr : public AbstractBufferMgr {  // implements
    * fsyncs that
    */
   void checkpoint() override;
-  void checkpoint(const int db_id, const int tb_id) override;
+  void checkpoint(const int32_t db_id, const int32_t tb_id) override;
 
   /**
    * @brief Returns number of threads defined by parameter num-reader-threads
@@ -144,45 +146,75 @@ class GlobalFileMgr : public AbstractBufferMgr {  // implements
 
   size_t getNumChunks() override;
 
-  FileMgr* findFileMgr(const int db_id,
-                       const int tb_id,
-                       const bool removeFromMap = false);
-  FileMgr* getFileMgr(const int db_id, const int tb_id);
-  FileMgr* getFileMgr(const ChunkKey& key) { return getFileMgr(key[0], key[1]); }
+  void compactDataFiles(const int32_t db_id, const int32_t tb_id);
+
+  static constexpr int32_t db_version_{2};
+
+ private:
+  AbstractBufferMgr* findFileMgrUnlocked(const int32_t db_id, const int32_t tb_id);
+  void deleteFileMgr(const int32_t db_id, const int32_t tb_id);
+
+ public:
+  AbstractBufferMgr* findFileMgr(const int32_t db_id, const int32_t tb_id) {
+    heavyai::shared_lock<heavyai::shared_mutex> read_lock(fileMgrs_mutex_);
+    return findFileMgrUnlocked(db_id, tb_id);
+  }
+  void setFileMgrParams(const int32_t db_id,
+                        const int32_t tb_id,
+                        const FileMgrParams& file_mgr_params);
+  AbstractBufferMgr* getFileMgr(const int32_t db_id, const int32_t tb_id);
+  AbstractBufferMgr* getFileMgr(const ChunkKey& key) {
+    return getFileMgr(key[0], key[1]);
+  }
+
   std::string getBasePath() const { return basePath_; }
-  size_t getDefaultPageSize() const { return defaultPageSize_; }
+  size_t getPageSize() const { return page_size_; }
+  size_t getMetadataPageSize() const { return metadata_page_size_; }
 
   void writeFileMgrData(FileMgr* fileMgr = 0);
 
-  inline int getDBVersion() const { return mapd_db_version_; }
   inline bool getDBConvert() const { return dbConvert_; }
   inline void setDBConvert(bool val) { dbConvert_ = val; }
 
-  void removeTableRelatedDS(const int db_id, const int tb_id);
-  void setTableEpoch(const int db_id, const int tb_id, const int start_epoch);
-  size_t getTableEpoch(const int db_id, const int tb_id);
+  void removeTableRelatedDS(const int32_t db_id, const int32_t tb_id) override;
+  void setTableEpoch(const int32_t db_id, const int32_t tb_id, const int32_t start_epoch);
+  size_t getTableEpoch(const int32_t db_id, const int32_t tb_id);
+  void resetTableEpochFloor(const int32_t db_id, const int32_t tb_id);
+  StorageStats getStorageStats(const int32_t db_id, const int32_t tb_id);
+
+  // For testing purposes only
+  std::shared_ptr<FileMgr> getSharedFileMgr(const int db_id, const int table_id);
+
+  // For testing purposes only
+  void setFileMgr(const int db_id, const int table_id, std::shared_ptr<FileMgr> file_mgr);
+  void closeFileMgr(const int32_t db_id,
+                    const int32_t tb_id);  // A locked public wrapper for deleteFileMgr,
+                                           // for now for unit testing
+ protected:
+  std::shared_ptr<ForeignStorageInterface> fsi_;
 
  private:
+  bool existsDiffBetweenFileMgrParamsAndFileMgr(
+      FileMgr* file_mgr,
+      const FileMgrParams& file_mgr_params) const;
   std::string basePath_;       /// The OS file system path containing the files.
   size_t num_reader_threads_;  /// number of threads used when loading data
-  int epoch_; /* the current epoch (time of last checkpoint) will be used for all
+  int32_t
+      epoch_; /* the current epoch (time of last checkpoint) will be used for all
                * tables except of the one for which the value of the epoch has been reset
                * using --start-epoch option at start up to rollback this table's updates.
                */
-  size_t defaultPageSize_;  /// default page size, used to set FileMgr defaultPageSize_
-  // bool isDirty_;               /// true if metadata changed since last writeState()
-  int mapd_db_version_;  /// DB version for DataMgr DS and corresponding file buffer
-                         /// read/write code
-  /* In future mapd_db_version_ may be added to AbstractBufferMgr class.
-   * This will allow support of different dbVersions for different tables, so
-   * original tables can be generated by different versions of mapd software.
-   */
+  const size_t page_size_;           /// used to set FileMgr page_size_
+  const size_t metadata_page_size_;  /// used to set FileMgr metadta_page_size_
   bool dbConvert_;  /// true if conversion should be done between different
-                    /// "mapd_db_version_"
-  std::map<std::pair<int, int>, FileMgr*> fileMgrs_;
-  mapd_shared_mutex fileMgrs_mutex_;
+                    /// db_version
+
+  std::map<TablePair, std::shared_ptr<FileMgr>> ownedFileMgrs_;
+  std::map<TablePair, AbstractBufferMgr*> allFileMgrs_;
+  std::map<TablePair, int32_t> max_rollback_epochs_per_table_;
+  std::map<TablePair, StorageStats> lazy_initialized_stats_;
+
+  heavyai::shared_mutex fileMgrs_mutex_;
 };
 
 }  // namespace File_Namespace
-
-#endif  // DATAMGR_MEMORY_FILE_GLOBAL_FILEMGR_H

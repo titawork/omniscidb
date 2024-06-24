@@ -1,4 +1,5 @@
-/* copyright 2017 MapD Technologies, Inc.
+/*
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,13 +14,6 @@
  * limitations under the License.
  */
 
-/*
- * @file    TopKSort.cu
- * @author  Minggang Yu <miyu@mapd.com>
- * @brief   Top-k sorting on streaming top-k heaps on VRAM
- *
- * Copyright (c) 2017 MapD Technologies, Inc.  All rights reserved.
- */
 #include "BufferEntryUtils.h"
 #include "GpuMemUtils.h"
 #include "ResultSetBufferAccessors.h"
@@ -32,6 +26,11 @@
 #include <thrust/functional.h>
 #include <thrust/partition.h>
 #include <thrust/sort.h>
+
+#include <cuda.h>
+CUstream getQueryEngineCudaStreamForDevice(int device_num);
+
+#define checkCudaErrors(err) CHECK_EQ(err, CUDA_SUCCESS)
 
 #include <iostream>
 
@@ -48,7 +47,7 @@ struct is_taken_entry {
 
 template <class K, class I = int32_t>
 struct is_null_order_entry {
-  typedef I argument_type;
+  using argument_type = I;
   is_null_order_entry(const int8_t* base, const size_t stride, const int64_t nul)
       : oe_base(base), oe_stride(stride), null_val(nul) {}
   __host__ __device__ bool operator()(const I index) {
@@ -140,13 +139,18 @@ void collect_order_entry_column(thrust::device_ptr<K>& d_oe_col_buffer,
                                 const thrust::device_ptr<I>& d_idx_first,
                                 const size_t idx_count,
                                 const size_t oe_offset,
-                                const size_t oe_stride) {
-  thrust::for_each(thrust::make_counting_iterator(size_t(0)),
+                                const size_t oe_stride,
+                                ThrustAllocator& allocator,
+                                const int device_id) {
+  auto qe_cuda_stream = getQueryEngineCudaStreamForDevice(device_id);
+  thrust::for_each(thrust::cuda::par(allocator).on(qe_cuda_stream),
+                   thrust::make_counting_iterator(size_t(0)),
                    thrust::make_counting_iterator(idx_count),
                    KeyFetcher<K, I>(thrust::raw_pointer_cast(d_oe_col_buffer),
                                     d_src_buffer + oe_offset,
                                     oe_stride,
                                     thrust::raw_pointer_cast(d_idx_first)));
+  checkCudaErrors(cuStreamSynchronize(qe_cuda_stream));
 }
 
 template <class K, class I>
@@ -154,17 +158,22 @@ void sort_indices_by_key(thrust::device_ptr<I> d_idx_first,
                          const size_t idx_count,
                          const thrust::device_ptr<K>& d_key_buffer,
                          const bool desc,
-                         ThrustAllocator& allocator) {
+                         ThrustAllocator& allocator,
+                         const int device_id) {
+  auto qe_cuda_stream = getQueryEngineCudaStreamForDevice(device_id);
   if (desc) {
-    thrust::sort_by_key(thrust::device(allocator),
+    thrust::sort_by_key(thrust::cuda::par(allocator).on(qe_cuda_stream),
                         d_key_buffer,
                         d_key_buffer + idx_count,
                         d_idx_first,
                         thrust::greater<K>());
   } else {
-    thrust::sort_by_key(
-        thrust::device(allocator), d_key_buffer, d_key_buffer + idx_count, d_idx_first);
+    thrust::sort_by_key(thrust::cuda::par(allocator).on(qe_cuda_stream),
+                        d_key_buffer,
+                        d_key_buffer + idx_count,
+                        d_idx_first);
   }
+  checkCudaErrors(cuStreamSynchronize(qe_cuda_stream));
 }
 
 template <class I = int32_t>
@@ -173,7 +182,8 @@ void do_radix_sort(thrust::device_ptr<I> d_idx_first,
                    const int8_t* d_src_buffer,
                    const PodOrderEntry& oe,
                    const GroupByBufferLayoutInfo& layout,
-                   ThrustAllocator& allocator) {
+                   ThrustAllocator& allocator,
+                   const int device_id) {
   const auto& oe_type = layout.oe_target_info.sql_type;
   if (oe_type.is_fp()) {
     switch (layout.col_bytes) {
@@ -184,9 +194,13 @@ void do_radix_sort(thrust::device_ptr<I> d_idx_first,
                                    d_idx_first,
                                    idx_count,
                                    layout.col_off,
-                                   layout.row_bytes);
-        sort_indices_by_key(d_idx_first, idx_count, d_oe_buffer, oe.is_desc, allocator);
-      } break;
+                                   layout.row_bytes,
+                                   allocator,
+                                   device_id);
+        sort_indices_by_key(
+            d_idx_first, idx_count, d_oe_buffer, oe.is_desc, allocator, device_id);
+        break;
+      }
       case 8: {
         auto d_oe_buffer = get_device_ptr<double>(idx_count, allocator);
         collect_order_entry_column(d_oe_buffer,
@@ -194,9 +208,13 @@ void do_radix_sort(thrust::device_ptr<I> d_idx_first,
                                    d_idx_first,
                                    idx_count,
                                    layout.col_off,
-                                   layout.row_bytes);
-        sort_indices_by_key(d_idx_first, idx_count, d_oe_buffer, oe.is_desc, allocator);
-      } break;
+                                   layout.row_bytes,
+                                   allocator,
+                                   device_id);
+        sort_indices_by_key(
+            d_idx_first, idx_count, d_oe_buffer, oe.is_desc, allocator, device_id);
+        break;
+      }
       default:
         CHECK(false);
     }
@@ -211,9 +229,13 @@ void do_radix_sort(thrust::device_ptr<I> d_idx_first,
                                  d_idx_first,
                                  idx_count,
                                  layout.col_off,
-                                 layout.row_bytes);
-      sort_indices_by_key(d_idx_first, idx_count, d_oe_buffer, oe.is_desc, allocator);
-    } break;
+                                 layout.row_bytes,
+                                 allocator,
+                                 device_id);
+      sort_indices_by_key(
+          d_idx_first, idx_count, d_oe_buffer, oe.is_desc, allocator, device_id);
+      break;
+    }
     case 8: {
       auto d_oe_buffer = get_device_ptr<int64_t>(idx_count, allocator);
       collect_order_entry_column(d_oe_buffer,
@@ -221,9 +243,13 @@ void do_radix_sort(thrust::device_ptr<I> d_idx_first,
                                  d_idx_first,
                                  idx_count,
                                  layout.col_off,
-                                 layout.row_bytes);
-      sort_indices_by_key(d_idx_first, idx_count, d_oe_buffer, oe.is_desc, allocator);
-    } break;
+                                 layout.row_bytes,
+                                 allocator,
+                                 device_id);
+      sort_indices_by_key(
+          d_idx_first, idx_count, d_oe_buffer, oe.is_desc, allocator, device_id);
+      break;
+    }
     default:
       CHECK(false);
   }
@@ -291,14 +317,22 @@ std::vector<int8_t> pop_n_rows_from_merged_heaps_gpu(
   const auto total_entry_count = n * thread_count;
   ThrustAllocator thrust_allocator(data_mgr, device_id);
   auto d_indices = get_device_ptr<int32_t>(total_entry_count, thrust_allocator);
-  thrust::sequence(d_indices, d_indices + total_entry_count);
-  auto separator = (group_key_bytes == 4)
-                       ? thrust::partition(d_indices,
-                                           d_indices + total_entry_count,
-                                           is_taken_entry<int32_t>(rows_ptr, row_size))
-                       : thrust::partition(d_indices,
-                                           d_indices + total_entry_count,
-                                           is_taken_entry<int64_t>(rows_ptr, row_size));
+  auto qe_cuda_stream = getQueryEngineCudaStreamForDevice(device_id);
+  thrust::sequence(thrust::cuda::par(thrust_allocator).on(qe_cuda_stream),
+                   d_indices,
+                   d_indices + total_entry_count);
+  checkCudaErrors(cuStreamSynchronize(qe_cuda_stream));
+  auto separator =
+      (group_key_bytes == 4)
+          ? thrust::partition(thrust::cuda::par(thrust_allocator).on(qe_cuda_stream),
+                              d_indices,
+                              d_indices + total_entry_count,
+                              is_taken_entry<int32_t>(rows_ptr, row_size))
+          : thrust::partition(thrust::cuda::par(thrust_allocator).on(qe_cuda_stream),
+                              d_indices,
+                              d_indices + total_entry_count,
+                              is_taken_entry<int64_t>(rows_ptr, row_size));
+  checkCudaErrors(cuStreamSynchronize(qe_cuda_stream));
   const size_t actual_entry_count = separator - d_indices;
   if (!actual_entry_count) {
     std::vector<int8_t> top_rows(row_size * n);
@@ -309,7 +343,8 @@ std::vector<int8_t> pop_n_rows_from_merged_heaps_gpu(
 
   const auto& oe_type = layout.oe_target_info.sql_type;
   if (oe_type.get_notnull()) {
-    do_radix_sort(d_indices, actual_entry_count, rows_ptr, oe, layout, thrust_allocator);
+    do_radix_sort(
+        d_indices, actual_entry_count, rows_ptr, oe, layout, thrust_allocator, device_id);
   } else {
     auto separator = partition_by_null(d_indices,
                                        d_indices + actual_entry_count,
@@ -325,32 +360,37 @@ std::vector<int8_t> pop_n_rows_from_merged_heaps_gpu(
                       rows_ptr,
                       oe,
                       layout,
-                      thrust_allocator);
+                      thrust_allocator,
+                      device_id);
       }
     } else {
       const size_t nonnull_count = separator - d_indices;
       if (nonnull_count > 0) {
-        do_radix_sort(d_indices, nonnull_count, rows_ptr, oe, layout, thrust_allocator);
+        do_radix_sort(
+            d_indices, nonnull_count, rows_ptr, oe, layout, thrust_allocator, device_id);
       }
     }
   }
 
   const auto final_entry_count = std::min(n, actual_entry_count);
   auto d_top_rows = get_device_ptr<int8_t>(row_size * n, thrust_allocator);
-  thrust::for_each(thrust::make_counting_iterator(size_t(0)),
+  thrust::for_each(thrust::cuda::par(thrust_allocator).on(qe_cuda_stream),
+                   thrust::make_counting_iterator(size_t(0)),
                    thrust::make_counting_iterator(final_entry_count),
                    RowFetcher<int32_t>(thrust::raw_pointer_cast(d_top_rows),
                                        rows_ptr,
                                        thrust::raw_pointer_cast(d_indices),
                                        row_size));
+  checkCudaErrors(cuStreamSynchronize(qe_cuda_stream));
 
   if (final_entry_count < n) {
-    reset_keys_in_row_buffer(thrust::device,
+    reset_keys_in_row_buffer(thrust::cuda::par(thrust_allocator).on(qe_cuda_stream),
                              thrust::raw_pointer_cast(d_top_rows),
                              layout.col_bytes,
                              row_size,
                              final_entry_count,
                              n);
+    checkCudaErrors(cuStreamSynchronize(qe_cuda_stream));
   }
 
   std::vector<int8_t> top_rows(row_size * n);

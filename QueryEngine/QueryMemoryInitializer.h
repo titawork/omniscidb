@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 OmniSci, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,13 +16,13 @@
 
 #pragma once
 
-#include "Allocators/DeviceAllocator.h"
-
+#include "DataMgr/Allocators/DeviceAllocator.h"
 #include "Descriptors/QueryMemoryDescriptor.h"
 #include "GpuMemUtils.h"
+#include "Rendering/RenderAllocator.h"
 #include "ResultSet.h"
 
-#include "Rendering/RenderAllocator.h"
+#include "ThirdParty/robin_hood/robin_hood.h"
 
 #include <memory>
 
@@ -34,27 +34,64 @@
 
 class QueryMemoryInitializer {
  public:
+  using ModeIndexSet = robin_hood::unordered_set<size_t>;
+  using QuantileParam = std::optional<double>;
+  struct TargetAggOpsMetadata {
+    bool has_count_distinct{false};
+    bool has_mode{false};
+    bool has_tdigest{false};
+    std::vector<int64_t> count_distinct_buf_size;
+    ModeIndexSet mode_index_set;
+    std::vector<QuantileParam> qualtile_params;
+  };
+
+  // Row-based execution constructor
   QueryMemoryInitializer(const RelAlgExecutionUnit& ra_exe_unit,
                          const QueryMemoryDescriptor& query_mem_desc,
                          const int device_id,
                          const ExecutorDeviceType device_type,
+                         const ExecutorDispatchMode dispatch_mode,
                          const bool output_columnar,
                          const bool sort_on_gpu,
+                         const shared::TableKey& outer_table_key,
+                         const int64_t num_rows,
                          const std::vector<std::vector<const int8_t*>>& col_buffers,
                          const std::vector<std::vector<uint64_t>>& frag_offsets,
                          RenderAllocatorMap* render_allocator_map,
                          RenderInfo* render_info,
                          std::shared_ptr<RowSetMemoryOwner> row_set_mem_owner,
                          DeviceAllocator* gpu_allocator,
+                         const size_t thread_idx,
                          const Executor* executor);
 
-  const auto getCountDistinctBitmapPtr() const { return count_distinct_bitmap_mem_; }
+  // Table functions execution constructor
+  QueryMemoryInitializer(const TableFunctionExecutionUnit& exe_unit,
+                         const QueryMemoryDescriptor& query_mem_desc,
+                         const int device_id,
+                         const ExecutorDeviceType device_type,
+                         const int64_t num_rows,
+                         const std::vector<std::vector<const int8_t*>>& col_buffers,
+                         const std::vector<std::vector<uint64_t>>& frag_offsets,
+                         std::shared_ptr<RowSetMemoryOwner> row_set_mem_owner,
+                         DeviceAllocator* device_allocator,
+                         const Executor* executor);
 
-  const auto getCountDistinctHostPtr() const { return count_distinct_bitmap_host_mem_; }
+  const auto getCountDistinctBitmapDevicePtr() const {
+    return count_distinct_bitmap_device_mem_ptr_;
+  }
+
+  const auto getCountDistinctBitmapHostPtr() const {
+    return count_distinct_bitmap_host_mem_ptr_;
+  }
 
   const auto getCountDistinctBitmapBytes() const {
-    return count_distinct_bitmap_mem_bytes_;
+    return count_distinct_bitmap_mem_size_;
   }
+
+  // TODO: lazy init (maybe lazy init count distinct above, too?)
+  const auto getVarlenOutputHostPtr() const { return varlen_output_buffer_host_ptr_; }
+
+  const auto getVarlenOutputPtr() const { return varlen_output_buffer_; }
 
   ResultSet* getResultSet(const size_t index) const {
     CHECK_LT(index, result_sets_.size());
@@ -87,39 +124,88 @@ class QueryMemoryInitializer {
     return num_buffers_;
   }
 
+  GpuGroupByBuffers setupTableFunctionGpuBuffers(
+      const QueryMemoryDescriptor& query_mem_desc,
+      const int device_id,
+      const unsigned block_size_x,
+      const unsigned grid_size_x,
+      const bool zero_initialize_buffers);
+
+  void copyFromTableFunctionGpuBuffers(Data_Namespace::DataMgr* data_mgr,
+                                       const QueryMemoryDescriptor& query_mem_desc,
+                                       const size_t entry_count,
+                                       const GpuGroupByBuffers& gpu_group_by_buffers,
+                                       const int device_id,
+                                       const unsigned block_size_x,
+                                       const unsigned grid_size_x);
+
+  void copyGroupByBuffersFromGpu(DeviceAllocator& device_allocator,
+                                 const QueryMemoryDescriptor& query_mem_desc,
+                                 const size_t entry_count,
+                                 const GpuGroupByBuffers& gpu_group_by_buffers,
+                                 const RelAlgExecutionUnit* ra_exe_unit,
+                                 const unsigned block_size_x,
+                                 const unsigned grid_size_x,
+                                 const int device_id,
+                                 const bool prepend_index_buffer) const;
+
  private:
-  void initGroups(const QueryMemoryDescriptor& query_mem_desc,
-                  int64_t* groups_buffer,
-                  const std::vector<int64_t>& init_vals,
-                  const int32_t groups_buffer_entry_count,
-                  const size_t warp_size,
-                  const Executor* executor);
+  void initGroupByBuffer(int64_t* buffer,
+                         const RelAlgExecutionUnit& ra_exe_unit,
+                         const QueryMemoryDescriptor& query_mem_desc,
+                         TargetAggOpsMetadata& agg_expr_metadata,
+                         const ExecutorDeviceType device_type,
+                         const bool output_columnar,
+                         const Executor* executor);
+
+  void initRowGroups(const QueryMemoryDescriptor& query_mem_desc,
+                     int64_t* groups_buffer,
+                     const std::vector<int64_t>& init_vals,
+                     TargetAggOpsMetadata& agg_expr_metadata,
+                     const int32_t groups_buffer_entry_count,
+                     const size_t warp_size,
+                     const Executor* executor,
+                     const RelAlgExecutionUnit& ra_exe_unit);
 
   void initColumnarGroups(const QueryMemoryDescriptor& query_mem_desc,
                           int64_t* groups_buffer,
                           const std::vector<int64_t>& init_vals,
-                          const Executor* executor);
+                          const Executor* executor,
+                          const RelAlgExecutionUnit& ra_exe_unit);
 
-  void initColumnPerRow(const QueryMemoryDescriptor& query_mem_desc,
-                        int8_t* row_ptr,
-                        const size_t bin,
-                        const std::vector<int64_t>& init_vals,
-                        const std::vector<ssize_t>& bitmap_sizes);
+  void initColumnsPerRow(const QueryMemoryDescriptor& query_mem_desc,
+                         int8_t* row_ptr,
+                         const std::vector<int64_t>& init_vals,
+                         const TargetAggOpsMetadata& agg_op_metadata);
 
   void allocateCountDistinctGpuMem(const QueryMemoryDescriptor& query_mem_desc);
 
-  std::vector<ssize_t> allocateCountDistinctBuffers(
+  std::vector<int64_t> calculateCountDistinctBufferSize(
       const QueryMemoryDescriptor& query_mem_desc,
-      const bool deferred,
-      const Executor* executor);
+      const RelAlgExecutionUnit& ra_exe_unit) const;
+
+  void allocateCountDistinctBuffers(const QueryMemoryDescriptor& query_mem_desc,
+                                    const RelAlgExecutionUnit& ra_exe_unit);
 
   int64_t allocateCountDistinctBitmap(const size_t bitmap_byte_sz);
 
   int64_t allocateCountDistinctSet();
 
-#ifdef HAVE_CUDA
+  ModeIndexSet initializeModeIndexSet(const QueryMemoryDescriptor& query_mem_desc,
+                                      const RelAlgExecutionUnit& ra_exe_unit);
+
+  void allocateModeBuffer(const QueryMemoryDescriptor& query_mem_desc,
+                          const RelAlgExecutionUnit& ra_exe_unit);
+
+  std::vector<QuantileParam> initializeQuantileParams(
+      const QueryMemoryDescriptor& query_mem_desc,
+      const RelAlgExecutionUnit& ra_exe_unit);
+
+  void allocateTDigestsBuffer(const QueryMemoryDescriptor& query_mem_desc,
+                              const RelAlgExecutionUnit& ra_exe_unit);
+
   GpuGroupByBuffers prepareTopNHeapsDevBuffer(const QueryMemoryDescriptor& query_mem_desc,
-                                              const CUdeviceptr init_agg_vals_dev_ptr,
+                                              const int8_t* init_agg_vals_dev_ptr,
                                               const size_t n,
                                               const int device_id,
                                               const unsigned block_size_x,
@@ -128,15 +214,15 @@ class QueryMemoryInitializer {
   GpuGroupByBuffers createAndInitializeGroupByBufferGpu(
       const RelAlgExecutionUnit& ra_exe_unit,
       const QueryMemoryDescriptor& query_mem_desc,
-      const CUdeviceptr init_agg_vals_dev_ptr,
+      const int8_t* init_agg_vals_dev_ptr,
       const int device_id,
+      const ExecutorDispatchMode dispatch_mode,
       const unsigned block_size_x,
       const unsigned grid_size_x,
       const int8_t warp_size,
       const bool can_sort_on_gpu,
       const bool output_columnar,
       RenderAllocator* render_allocator);
-#endif
 
   size_t computeNumberOfBuffers(const QueryMemoryDescriptor& query_mem_desc,
                                 const ExecutorDeviceType device_type,
@@ -150,15 +236,6 @@ class QueryMemoryInitializer {
                                    const size_t projection_count,
                                    const int device_id);
 
-  void copyGroupByBuffersFromGpu(Data_Namespace::DataMgr* data_mgr,
-                                 const QueryMemoryDescriptor& query_mem_desc,
-                                 const GpuGroupByBuffers& gpu_group_by_buffers,
-                                 const RelAlgExecutionUnit& ra_exe_unit,
-                                 const unsigned block_size_x,
-                                 const unsigned grid_size_x,
-                                 const int device_id,
-                                 const bool prepend_index_buffer) const;
-
   void applyStreamingTopNOffsetCpu(const QueryMemoryDescriptor& query_mem_desc,
                                    const RelAlgExecutionUnit& ra_exe_unit);
 
@@ -169,20 +246,29 @@ class QueryMemoryInitializer {
                                    const unsigned total_thread_count,
                                    const int device_id);
 
+  std::shared_ptr<VarlenOutputInfo> getVarlenOutputInfo();
+
+  const int64_t num_rows_;
   std::shared_ptr<RowSetMemoryOwner> row_set_mem_owner_;
   std::vector<std::unique_ptr<ResultSet>> result_sets_;
 
   std::vector<int64_t> init_agg_vals_;
 
-  const size_t num_buffers_;
+  size_t num_buffers_;
   std::vector<int64_t*> group_by_buffers_;
+  std::shared_ptr<VarlenOutputInfo> varlen_output_info_;
+  CUdeviceptr varlen_output_buffer_;
+  int8_t* varlen_output_buffer_host_ptr_;
 
-  CUdeviceptr count_distinct_bitmap_mem_;
-  size_t count_distinct_bitmap_mem_bytes_;
-  int8_t* count_distinct_bitmap_crt_ptr_;
-  int8_t* count_distinct_bitmap_host_mem_;
+  CUdeviceptr count_distinct_bitmap_device_mem_ptr_;
+  size_t count_distinct_bitmap_mem_size_;
+  int8_t* count_distinct_bitmap_host_crt_ptr_;
+  int8_t* count_distinct_bitmap_host_mem_ptr_;
 
   DeviceAllocator* device_allocator_{nullptr};
+  std::vector<Data_Namespace::AbstractBuffer*> temporary_buffers_;
+
+  const size_t thread_idx_;
 
   friend class Executor;  // Accesses result_sets_
   friend class QueryExecutionContext;

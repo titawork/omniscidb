@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,10 +16,8 @@
 
 /**
  * @file    ProfileTest.h
- * @author  Minggang Yu <miyu@mapd.com>
  * @brief   Unit tests for microbenchmark.
  *
- * Copyright (c) 2016 MapD Technologies, Inc.  All rights reserved.
  */
 
 #ifndef PROFILETEST_H
@@ -27,11 +25,7 @@
 
 #include "../QueryEngine/GpuRtConstants.h"
 
-#ifndef __CUDACC__
-#include <glog/logging.h>
-#else
-#include "../Shared/always_assert.h"
-#endif  // __CUDACC__
+#include "../Logger/Logger.h"
 
 #ifdef HAVE_CUDA
 #include <cuda_runtime_api.h>
@@ -49,17 +43,6 @@
 #endif
 
 #include <vector>
-
-#ifndef __CUDACC__
-#include <unistd.h>  // sysconf
-#include <algorithm>
-inline long cpu_threads() {
-  // could use std::thread::hardware_concurrency(), but some
-  // slightly out-of-date compilers (gcc 4.7) implement it as always 0.
-  // Play it POSIX.1 safe instead.
-  return std::max(2 * sysconf(_SC_NPROCESSORS_CONF), 1L);
-}
-#endif
 
 enum DEV_KIND { CPU, GPU };
 

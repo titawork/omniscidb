@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,38 +16,53 @@
 
 /**
  * @file    File.h
- * @author  Steven Stewart <steve@map-d.com>
  * @brief   A selection of helper methods for File I/O.
  *
  */
-#ifndef DATAMGR_FILE_FILE_H
-#define DATAMGR_FILE_FILE_H
 
-#define MAPD_FILE_EXT ".mapd"
-#define MAX_FILE_N_PAGES 256
-#define MAX_FILE_N_METADATA_PAGES 4096
+#pragma once
 
+#define DATA_FILE_EXT ".data"
+
+#include <cstdint>
+#include <cstdio>
 #include <iostream>
 #include <string>
-#include "../../Shared/types.h"
+
+#include "Shared/types.h"
 
 namespace File_Namespace {
 
-FILE* create(const std::string& basePath,
-             const int fileId,
-             const size_t pageSize,
-             const size_t npages);
+constexpr auto kLegacyDataFileExtension{".mapd"};
 
-FILE* create(const std::string& fullPath, const size_t requestedFileSize);
+std::string get_data_file_path(const std::string& base_path,
+                               int file_id,
+                               size_t page_size);
+
+std::string get_legacy_data_file_path(const std::string& new_data_file_path);
+
+std::pair<FILE*, std::string> create(const std::string& basePath,
+                                     const int fileId,
+                                     const size_t pageSize,
+                                     const size_t npages);
 
 /**
- * @brief Opens/creates the file with the given id; returns NULL on error.
+ * @brief Opens/creates a file with the given path and file size.  Fatal crash if file can
+ * not be created to required size.
  *
- * @param fileId The id of the file to open.
- * @return FILE* A pointer to a FILE pointer, or NULL on error.
+ * @param full_path Full path to file.
+ ^ @param requested_file_size File size file must be created with.
+ * @return FILE* A pointer to a FILE pointer; cannot be null.
  */
-FILE* open(int fileId);
+FILE* create(const std::string& full_path, const size_t requested_file_size);
 
+/**
+ * @brief Opens the file with the given id; fatal crash on error.
+ *
+ * @param file_id The id of the file to open.
+ * @return FILE* A pointer to a FILE pointer; cannot be null.
+ */
+FILE* open(int file_id);
 FILE* open(const std::string& path);
 
 /**
@@ -64,19 +79,23 @@ void close(FILE* f);
  * @param f Pointer to the FILE.
  * @return mapd_err_t Returns an error code when unable to close the file properly.
  */
-bool removeFile(const std::string basePath, const std::string filename);
+bool removeFile(const std::string& basePath, const std::string& filename);
 
 /**
  * @brief Reads the specified number of bytes from the offset position in file f into buf.
  *
  * @param f Pointer to the FILE.
  * @param offset The location within the file from which to read.
- * @param n The number of bytes to be read.
+ * @param size The number of bytes to be read.
  * @param buf The destination buffer to where data is being read from the file.
- * @param err If not NULL, will hold an error code should an error occur.
+ * @param file_path Path of file to read from.
  * @return size_t The number of bytes read.
  */
-size_t read(FILE* f, const size_t offset, const size_t size, int8_t* buf);
+size_t read(FILE* f,
+            const size_t offset,
+            const size_t size,
+            int8_t* buf,
+            const std::string& file_path);
 
 /**
  * @brief Writes the specified number of bytes to the offset position in file f from buf.
@@ -88,7 +107,7 @@ size_t read(FILE* f, const size_t offset, const size_t size, int8_t* buf);
  * @param err If not NULL, will hold an error code should an error occur.
  * @return size_t The number of bytes written.
  */
-size_t write(FILE* f, const size_t offset, const size_t size, int8_t* buf);
+size_t write(FILE* f, const size_t offset, const size_t size, const int8_t* buf);
 
 /**
  * @brief Appends the specified number of bytes to the end of the file f from buf.
@@ -99,7 +118,7 @@ size_t write(FILE* f, const size_t offset, const size_t size, int8_t* buf);
  * @param err If not NULL, will hold an error code should an error occur.
  * @return size_t The number of bytes written.
  */
-size_t append(FILE* f, const size_t size, int8_t* buf);
+size_t append(FILE* f, const size_t size, const int8_t* buf);
 
 /**
  * @brief Reads the specified page from the file f into buf.
@@ -108,10 +127,14 @@ size_t append(FILE* f, const size_t size, int8_t* buf);
  * @param pageSize The logical page size of the file.
  * @param pageNum The page number from where data is being read.
  * @param buf The destination buffer to where data is being written.
- * @param err If not NULL, will hold an error code should an error occur.
+ * @param file_path Path of file to read from.
  * @return size_t The number of bytes read (should be equal to pageSize).
  */
-size_t readPage(FILE* f, const size_t pageSize, const size_t pageNum, int8_t* buf);
+size_t readPage(FILE* f,
+                const size_t pageSize,
+                const size_t pageNum,
+                int8_t* buf,
+                const std::string& file_path);
 
 /**
  * @brief Writes a page from buf to the file.
@@ -150,5 +173,3 @@ size_t fileSize(FILE* f);
 void renameForDelete(const std::string directoryName);
 
 }  // namespace File_Namespace
-
-#endif  // DATAMGR_FILE_FILE_H

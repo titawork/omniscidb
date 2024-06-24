@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,16 +15,18 @@
  */
 
 #include "ExpressionRange.h"
-#include <algorithm>
-#include <cfenv>
-#include <cmath>
 #include "DateTimeTranslator.h"
+#include "DateTimeUtils.h"
 #include "DateTruncate.h"
 #include "Descriptors/InputDescriptors.h"
 #include "Execute.h"
 #include "ExtractFromTime.h"
 #include "GroupByAndAggregate.h"
 #include "QueryPhysicalInputsCollector.h"
+
+#include <algorithm>
+#include <cfenv>
+#include <cmath>
 
 #define DEF_OPERATOR(fname, op)                                                    \
   ExpressionRange fname(const ExpressionRange& other) const {                      \
@@ -91,6 +93,7 @@ void apply_fp_qual(const Datum const_datum,
       break;
   }
 }
+
 void apply_int_qual(const Datum const_datum,
                     const SQLTypes const_type,
                     const SQLOps sql_op,
@@ -116,6 +119,26 @@ void apply_int_qual(const Datum const_datum,
     default:  // there may be other operators, but don't do anything with them
       break;
   }
+}
+
+void apply_hpt_qual(const Datum const_datum,
+                    const SQLTypes const_type,
+                    const int32_t const_dimen,
+                    const int32_t col_dimen,
+                    const SQLOps sql_op,
+                    ExpressionRange& qual_range) {
+  CHECK(const_dimen != col_dimen);
+  Datum datum{0};
+  if (const_dimen > col_dimen) {
+    datum.bigintval =
+        get_value_from_datum<int64_t>(const_datum, const_type) /
+        DateTimeUtils::get_timestamp_precision_scale(const_dimen - col_dimen);
+  } else {
+    datum.bigintval =
+        get_value_from_datum<int64_t>(const_datum, const_type) *
+        DateTimeUtils::get_timestamp_precision_scale(col_dimen - const_dimen);
+  }
+  apply_int_qual(datum, const_type, sql_op, qual_range);
 }
 
 ExpressionRange apply_simple_quals(
@@ -146,8 +169,7 @@ ExpressionRange apply_simple_quals(
         continue;
       }
     }
-    if (qual_col->get_table_id() != col_expr->get_table_id() ||
-        qual_col->get_column_id() != col_expr->get_column_id()) {
+    if (qual_col->getColumnKey() != col_expr->getColumnKey()) {
       continue;
     }
     const Analyzer::Expr* right_operand = qual_bin_oper->get_right_operand();
@@ -161,16 +183,21 @@ ExpressionRange apply_simple_quals(
                     qual_const->get_type_info().get_type(),
                     qual_bin_oper->get_optype(),
                     qual_range);
+    } else if ((qual_col->get_type_info().is_timestamp() ||
+                qual_const->get_type_info().is_timestamp()) &&
+               (qual_col->get_type_info().get_dimension() !=
+                qual_const->get_type_info().get_dimension())) {
+      apply_hpt_qual(qual_const->get_constval(),
+                     qual_const->get_type_info().get_type(),
+                     qual_const->get_type_info().get_dimension(),
+                     qual_col->get_type_info().get_dimension(),
+                     qual_bin_oper->get_optype(),
+                     qual_range);
     } else {
       apply_int_qual(qual_const->get_constval(),
                      qual_const->get_type_info().get_type(),
                      qual_bin_oper->get_optype(),
                      qual_range);
-    }
-  }
-  if (qual_range.getType() == ExpressionRangeType::Integer) {
-    if (qual_range.getIntMin() > qual_range.getIntMax()) {
-      return ExpressionRange::makeIntRange(0, -1, 0, qual_range.hasNulls());
     }
   }
   return qual_range;
@@ -248,6 +275,15 @@ bool ExpressionRange::operator==(const ExpressionRange& other) const {
   return false;
 }
 
+bool ExpressionRange::typeSupportsRange(const SQLTypeInfo& ti) {
+  if (ti.is_array()) {
+    return typeSupportsRange(ti.get_elem_type());
+  } else {
+    return (ti.is_number() || ti.is_boolean() || ti.is_time() ||
+            (ti.is_string() && ti.get_compression() == kENCODING_DICT));
+  }
+}
+
 ExpressionRange getExpressionRange(
     const Analyzer::BinOper* expr,
     const std::vector<InputTableInfo>& query_infos,
@@ -261,6 +297,9 @@ ExpressionRange getExpressionRange(
     const std::vector<InputTableInfo>& query_infos,
     const Executor* executor,
     boost::optional<std::list<std::shared_ptr<Analyzer::Expr>>> simple_quals);
+
+ExpressionRange getExpressionRange(const Analyzer::StringOper* string_oper_expr,
+                                   const Executor* executor);
 
 ExpressionRange getExpressionRange(const Analyzer::LikeExpr* like_expr);
 
@@ -287,41 +326,38 @@ ExpressionRange getExpressionRange(
     boost::optional<std::list<std::shared_ptr<Analyzer::Expr>>> simple_quals);
 
 ExpressionRange getExpressionRange(
+    const Analyzer::WidthBucketExpr* width_bucket_expr,
+    const std::vector<InputTableInfo>& query_infos,
+    const Executor* executor,
+    boost::optional<std::list<std::shared_ptr<Analyzer::Expr>>> simple_quals);
+
+ExpressionRange getExpressionRange(
     const Analyzer::Expr* expr,
     const std::vector<InputTableInfo>& query_infos,
     const Executor* executor,
     boost::optional<std::list<std::shared_ptr<Analyzer::Expr>>> simple_quals) {
-  auto bin_oper_expr = dynamic_cast<const Analyzer::BinOper*>(expr);
-  if (bin_oper_expr) {
+  if (!ExpressionRange::typeSupportsRange(expr->get_type_info())) {
+    return ExpressionRange::makeInvalidRange();
+  } else if (auto bin_oper_expr = dynamic_cast<const Analyzer::BinOper*>(expr)) {
     return getExpressionRange(bin_oper_expr, query_infos, executor, simple_quals);
-  }
-  auto constant_expr = dynamic_cast<const Analyzer::Constant*>(expr);
-  if (constant_expr) {
+  } else if (auto constant_expr = dynamic_cast<const Analyzer::Constant*>(expr)) {
     return getExpressionRange(constant_expr);
-  }
-  auto column_var_expr = dynamic_cast<const Analyzer::ColumnVar*>(expr);
-  if (column_var_expr) {
+  } else if (auto column_var_expr = dynamic_cast<const Analyzer::ColumnVar*>(expr)) {
     return getExpressionRange(column_var_expr, query_infos, executor, simple_quals);
-  }
-  auto like_expr = dynamic_cast<const Analyzer::LikeExpr*>(expr);
-  if (like_expr) {
+  } else if (auto string_oper_expr = dynamic_cast<const Analyzer::StringOper*>(expr)) {
+    return getExpressionRange(string_oper_expr, executor);
+  } else if (auto like_expr = dynamic_cast<const Analyzer::LikeExpr*>(expr)) {
     return getExpressionRange(like_expr);
-  }
-  auto case_expr = dynamic_cast<const Analyzer::CaseExpr*>(expr);
-  if (case_expr) {
+  } else if (auto case_expr = dynamic_cast<const Analyzer::CaseExpr*>(expr)) {
     return getExpressionRange(case_expr, query_infos, executor);
-  }
-  auto u_expr = dynamic_cast<const Analyzer::UOper*>(expr);
-  if (u_expr) {
+  } else if (auto u_expr = dynamic_cast<const Analyzer::UOper*>(expr)) {
     return getExpressionRange(u_expr, query_infos, executor, simple_quals);
-  }
-  auto extract_expr = dynamic_cast<const Analyzer::ExtractExpr*>(expr);
-  if (extract_expr) {
+  } else if (auto extract_expr = dynamic_cast<const Analyzer::ExtractExpr*>(expr)) {
     return getExpressionRange(extract_expr, query_infos, executor, simple_quals);
-  }
-  auto datetrunc_expr = dynamic_cast<const Analyzer::DatetruncExpr*>(expr);
-  if (datetrunc_expr) {
+  } else if (auto datetrunc_expr = dynamic_cast<const Analyzer::DatetruncExpr*>(expr)) {
     return getExpressionRange(datetrunc_expr, query_infos, executor, simple_quals);
+  } else if (auto width_expr = dynamic_cast<const Analyzer::WidthBucketExpr*>(expr)) {
+    return getExpressionRange(width_expr, query_infos, executor, simple_quals);
   }
   return ExpressionRange::makeInvalidRange();
 }
@@ -412,46 +448,40 @@ ExpressionRange getExpressionRange(const Analyzer::Constant* constant_expr) {
   return ExpressionRange::makeInvalidRange();
 }
 
-#define FIND_STAT_FRAG(stat_name)                                                   \
-  const auto stat_name##_frag_index = std::stat_name##_element(                     \
-      nonempty_fragment_indices.begin(),                                            \
-      nonempty_fragment_indices.end(),                                              \
-      [&fragments, &has_nulls, col_id, col_ti](const size_t lhs_idx,                \
-                                               const size_t rhs_idx) {              \
-        const auto& lhs = fragments[lhs_idx];                                       \
-        const auto& rhs = fragments[rhs_idx];                                       \
-        auto lhs_meta_it = lhs.getChunkMetadataMap().find(col_id);                  \
-        if (lhs_meta_it == lhs.getChunkMetadataMap().end()) {                       \
-          return false;                                                             \
-        }                                                                           \
-        auto rhs_meta_it = rhs.getChunkMetadataMap().find(col_id);                  \
-        CHECK(rhs_meta_it != rhs.getChunkMetadataMap().end());                      \
-        if (lhs_meta_it->second.chunkStats.has_nulls ||                             \
-            rhs_meta_it->second.chunkStats.has_nulls) {                             \
-          has_nulls = true;                                                         \
-        }                                                                           \
-        if (col_ti.is_fp()) {                                                       \
-          return extract_##stat_name##_stat_double(lhs_meta_it->second.chunkStats,  \
-                                                   col_ti) <                        \
-                 extract_##stat_name##_stat_double(rhs_meta_it->second.chunkStats,  \
-                                                   col_ti);                         \
-        }                                                                           \
-        return extract_##stat_name##_stat(lhs_meta_it->second.chunkStats, col_ti) < \
-               extract_##stat_name##_stat(rhs_meta_it->second.chunkStats, col_ti);  \
-      });                                                                           \
-  if (stat_name##_frag_index == nonempty_fragment_indices.end()) {                  \
-    return ExpressionRange::makeInvalidRange();                                     \
+#define FIND_STAT_FRAG(stat_name)                                                    \
+  const auto stat_name##_frag_index = std::stat_name##_element(                      \
+      nonempty_fragment_indices.begin(),                                             \
+      nonempty_fragment_indices.end(),                                               \
+      [&fragments, &has_nulls, col_id, col_ti](const size_t lhs_idx,                 \
+                                               const size_t rhs_idx) {               \
+        const auto& lhs = fragments[lhs_idx];                                        \
+        const auto& rhs = fragments[rhs_idx];                                        \
+        auto lhs_meta_it = lhs.getChunkMetadataMap().find(col_id);                   \
+        if (lhs_meta_it == lhs.getChunkMetadataMap().end()) {                        \
+          return false;                                                              \
+        }                                                                            \
+        auto rhs_meta_it = rhs.getChunkMetadataMap().find(col_id);                   \
+        CHECK(rhs_meta_it != rhs.getChunkMetadataMap().end());                       \
+        if (lhs_meta_it->second->chunkStats.has_nulls ||                             \
+            rhs_meta_it->second->chunkStats.has_nulls) {                             \
+          has_nulls = true;                                                          \
+        }                                                                            \
+        if (col_ti.is_fp()) {                                                        \
+          return extract_##stat_name##_stat_fp_type(lhs_meta_it->second->chunkStats, \
+                                                    col_ti) <                        \
+                 extract_##stat_name##_stat_fp_type(rhs_meta_it->second->chunkStats, \
+                                                    col_ti);                         \
+        }                                                                            \
+        return extract_##stat_name##_stat_int_type(lhs_meta_it->second->chunkStats,  \
+                                                   col_ti) <                         \
+               extract_##stat_name##_stat_int_type(rhs_meta_it->second->chunkStats,  \
+                                                   col_ti);                          \
+      });                                                                            \
+  if (stat_name##_frag_index == nonempty_fragment_indices.end()) {                   \
+    return ExpressionRange::makeInvalidRange();                                      \
   }
 
 namespace {
-
-double extract_min_stat_double(const ChunkStats& stats, const SQLTypeInfo& col_ti) {
-  return col_ti.get_type() == kDOUBLE ? stats.min.doubleval : stats.min.floatval;
-}
-
-double extract_max_stat_double(const ChunkStats& stats, const SQLTypeInfo& col_ti) {
-  return col_ti.get_type() == kDOUBLE ? stats.max.doubleval : stats.max.floatval;
-}
 
 int64_t get_conservative_datetrunc_bucket(const DatetruncField datetrunc_field) {
   const int64_t day_seconds{24 * 3600};
@@ -476,6 +506,8 @@ int64_t get_conservative_datetrunc_bucket(const DatetruncField datetrunc_field) 
     case dtDECADE:
       return 10 * year_days * day_seconds;
     case dtWEEK:
+    case dtWEEK_SUNDAY:
+    case dtWEEK_SATURDAY:
       return 7 * day_seconds;
     case dtQUARTERDAY:
       return 4 * 60 * 50;
@@ -491,7 +523,7 @@ ExpressionRange getLeafColumnRange(const Analyzer::ColumnVar* col_expr,
                                    const Executor* executor,
                                    const bool is_outer_join_proj) {
   bool has_nulls = is_outer_join_proj;
-  int col_id = col_expr->get_column_id();
+  int col_id = col_expr->getColumnKey().column_id;
   const auto& col_phys_ti = col_expr->get_type_info().is_array()
                                 ? col_expr->get_type_info().get_elem_type()
                                 : col_expr->get_type_info();
@@ -513,15 +545,15 @@ ExpressionRange getLeafColumnRange(const Analyzer::ColumnVar* col_expr,
     case kTIME:
     case kFLOAT:
     case kDOUBLE: {
-      ssize_t ti_idx = -1;
+      std::optional<size_t> ti_idx;
       for (size_t i = 0; i < query_infos.size(); ++i) {
-        if (col_expr->get_table_id() == query_infos[i].table_id) {
+        if (col_expr->getTableKey() == query_infos[i].table_key) {
           ti_idx = i;
           break;
         }
       }
-      CHECK_NE(ssize_t(-1), ti_idx);
-      const auto& query_info = query_infos[ti_idx].info;
+      CHECK(ti_idx);
+      const auto& query_info = query_infos[*ti_idx].info;
       const auto& fragments = query_info.fragments;
       const auto cd = executor->getColumnDescriptor(col_expr);
       if (cd && cd->isVirtualCol) {
@@ -560,21 +592,28 @@ ExpressionRange getLeafColumnRange(const Analyzer::ColumnVar* col_expr,
       for (const auto& fragment : fragments) {
         const auto it = fragment.getChunkMetadataMap().find(col_id);
         if (it != fragment.getChunkMetadataMap().end()) {
-          if (it->second.chunkStats.has_nulls) {
+          if (it->second->chunkStats.has_nulls) {
             has_nulls = true;
             break;
           }
         }
       }
+
+      // Detect FSI placeholder metadata.  If we let this through it will be treated as an
+      // empty range, when it really implies an unknown range.
+      if (min_it->second->isPlaceholder() || max_it->second->isPlaceholder()) {
+        return ExpressionRange::makeInvalidRange();
+      }
+
       if (col_ti.is_fp()) {
-        const auto min_val = extract_min_stat_double(min_it->second.chunkStats, col_ti);
-        const auto max_val = extract_max_stat_double(max_it->second.chunkStats, col_ti);
+        const auto min_val = extract_min_stat_fp_type(min_it->second->chunkStats, col_ti);
+        const auto max_val = extract_max_stat_fp_type(max_it->second->chunkStats, col_ti);
         return col_ti.get_type() == kFLOAT
                    ? ExpressionRange::makeFloatRange(min_val, max_val, has_nulls)
                    : ExpressionRange::makeDoubleRange(min_val, max_val, has_nulls);
       }
-      const auto min_val = extract_min_stat(min_it->second.chunkStats, col_ti);
-      const auto max_val = extract_max_stat(max_it->second.chunkStats, col_ti);
+      const auto min_val = extract_min_stat_int_type(min_it->second->chunkStats, col_ti);
+      const auto max_val = extract_max_stat_int_type(max_it->second->chunkStats, col_ti);
       if (max_val < min_val) {
         // The column doesn't contain any non-null values, synthesize an empty range.
         CHECK_GT(min_val, 0);
@@ -601,15 +640,67 @@ ExpressionRange getExpressionRange(
   CHECK_GE(rte_idx, 0);
   CHECK_LT(static_cast<size_t>(rte_idx), query_infos.size());
   bool is_outer_join_proj = rte_idx > 0 && executor->containsLeftDeepOuterJoin();
-  if (col_expr->get_table_id() > 0) {
+  const auto& column_key = col_expr->getColumnKey();
+  if (column_key.table_id > 0) {
     auto col_range = executor->getColRange(
-        PhysicalInput{col_expr->get_column_id(), col_expr->get_table_id()});
+        PhysicalInput{column_key.column_id, column_key.table_id, column_key.db_id});
     if (is_outer_join_proj) {
       col_range.setHasNulls();
     }
     return apply_simple_quals(col_expr, col_range, simple_quals);
   }
   return getLeafColumnRange(col_expr, query_infos, executor, is_outer_join_proj);
+}
+
+ExpressionRange getExpressionRange(const Analyzer::StringOper* string_oper_expr,
+                                   const Executor* executor) {
+  auto chained_string_op_exprs = string_oper_expr->getChainedStringOpExprs();
+  if (chained_string_op_exprs.empty()) {
+    throw std::runtime_error(
+        "StringOper getExpressionRange() Expected folded string operator but found "
+        "operator unfolded.");
+  }
+  // Consider encapsulating below in an Analyzer::StringOper method to dedup
+  std::vector<StringOps_Namespace::StringOpInfo> string_op_infos;
+  for (const auto& chained_string_op_expr : chained_string_op_exprs) {
+    auto chained_string_op =
+        dynamic_cast<const Analyzer::StringOper*>(chained_string_op_expr.get());
+    CHECK(chained_string_op);
+    StringOps_Namespace::StringOpInfo string_op_info(chained_string_op->get_kind(),
+                                                     chained_string_op->get_type_info(),
+                                                     chained_string_op->getLiteralArgs());
+    string_op_infos.emplace_back(string_op_info);
+  }
+
+  const auto expr_ti = string_oper_expr->get_type_info();
+  if (expr_ti.is_string() && !string_oper_expr->requiresPerRowTranslation()) {
+    // We can only statically know the range if dictionary translation occured (which
+    // means the output type is a dictionary-encoded text col and is not transient, as
+    // transient dictionaries are used as targets for on-the-fly translation
+    CHECK(expr_ti.is_dict_encoded_string());
+
+    const auto& dict_key = expr_ti.getStringDictKey();
+    CHECK_NE(dict_key.dict_id, TRANSIENT_DICT_ID);
+    const auto translation_map = executor->getStringProxyTranslationMap(
+        dict_key,
+        dict_key,
+        RowSetMemoryOwner::StringTranslationType::SOURCE_UNION,
+        string_op_infos,
+        executor->getRowSetMemoryOwner(),
+        true);
+
+    // Todo(todd): Track null presence in StringDictionaryProxy::IdMap
+    return ExpressionRange::makeIntRange(translation_map->rangeStart(),
+                                         translation_map->rangeEnd() - 1,
+                                         0 /* bucket */,
+                                         true /* assume has nulls */);
+
+  } else {
+    // Todo(todd): Get min/max range stats
+    // Below works fine, we just can't take advantage of low-cardinality
+    // group by optimizations
+    return ExpressionRange::makeInvalidRange();
+  }
 }
 
 ExpressionRange getExpressionRange(const Analyzer::LikeExpr* like_expr) {
@@ -692,19 +783,33 @@ ExpressionRange getDateTimePrecisionCastRange(const ExpressionRange& arg_range,
     return ExpressionRange::makeIntRange(min_ts, max_ts, bucket, arg_range.hasNulls());
   }
 
+  if (oper_ti.is_timestamp() && target_ti.is_any<kTIME>()) {
+    // The min and max TS wouldn't make sense here, so return a range covering the whole
+    // day
+    return ExpressionRange::makeIntRange(0, kSecsPerDay, 0, arg_range.hasNulls());
+  }
+
   const int32_t ti_dimen = target_ti.get_dimension();
   const int32_t oper_dimen = oper_ti.get_dimension();
   CHECK(oper_dimen != ti_dimen);
-  const int64_t scale =
-      DateTimeUtils::get_timestamp_precision_scale(abs(oper_dimen - ti_dimen));
   const int64_t min_ts =
       ti_dimen > oper_dimen
-          ? DateTruncateAlterPrecisionScaleUp(arg_range.getIntMin(), scale)
-          : DateTruncateAlterPrecisionScaleDown(arg_range.getIntMin(), scale);
+          ? DateTimeUtils::get_datetime_scaled_epoch(DateTimeUtils::ScalingType::ScaleUp,
+                                                     arg_range.getIntMin(),
+                                                     abs(oper_dimen - ti_dimen))
+          : DateTimeUtils::get_datetime_scaled_epoch(
+                DateTimeUtils::ScalingType::ScaleDown,
+                arg_range.getIntMin(),
+                abs(oper_dimen - ti_dimen));
   const int64_t max_ts =
       ti_dimen > oper_dimen
-          ? DateTruncateAlterPrecisionScaleUp(arg_range.getIntMax(), scale)
-          : DateTruncateAlterPrecisionScaleDown(arg_range.getIntMax(), scale);
+          ? DateTimeUtils::get_datetime_scaled_epoch(DateTimeUtils::ScalingType::ScaleUp,
+                                                     arg_range.getIntMax(),
+                                                     abs(oper_dimen - ti_dimen))
+          : DateTimeUtils::get_datetime_scaled_epoch(
+                DateTimeUtils::ScalingType::ScaleDown,
+                arg_range.getIntMax(),
+                abs(oper_dimen - ti_dimen));
 
   return ExpressionRange::makeIntRange(min_ts, max_ts, 0, arg_range.hasNulls());
 }
@@ -725,11 +830,42 @@ ExpressionRange getExpressionRange(
   const auto& ti = u_expr->get_type_info();
   if (ti.is_string() && ti.get_compression() == kENCODING_DICT) {
     const auto sdp = executor->getStringDictionaryProxy(
-        ti.get_comp_param(), executor->getRowSetMemoryOwner(), true);
+        ti.getStringDictKey(), executor->getRowSetMemoryOwner(), true);
     CHECK(sdp);
+    const auto colvar_operand =
+        dynamic_cast<const Analyzer::ColumnVar*>(u_expr->get_operand());
+    if (colvar_operand) {
+      const auto& colvar_ti = colvar_operand->get_type_info();
+      if (!(colvar_ti.is_none_encoded_string() &&
+            ti.getStringDictKey().isTransientDict())) {
+        VLOG(1)
+            << "Unable to determine expression range for dictionary encoded expression "
+            << u_expr->get_operand()->toString() << ", proceeding with invalid range.";
+        return ExpressionRange::makeInvalidRange();
+      }
+      CHECK_EQ(ti.getStringDictKey().dict_id, TRANSIENT_DICT_ID);
+      CHECK_EQ(sdp->storageEntryCount(), 0UL);
+      const int64_t transient_entries = static_cast<int64_t>(sdp->transientEntryCount());
+      int64_t const tuples_upper_bound = static_cast<int64_t>(
+          std::accumulate(query_infos.cbegin(),
+                          query_infos.cend(),
+                          size_t(0),
+                          [](auto max, auto const& query_info) {
+                            return std::max(max, query_info.info.getNumTuples());
+                          }));
+      const int64_t conservative_range_min = -1L - transient_entries - tuples_upper_bound;
+      return ExpressionRange::makeIntRange(conservative_range_min, -2L, 0, true);
+    }
     const auto const_operand =
         dynamic_cast<const Analyzer::Constant*>(u_expr->get_operand());
-    CHECK(const_operand);
+    if (!const_operand) {
+      // casted subquery result. return invalid for now, but we could attempt to pull the
+      // range from the subquery result in the future
+      CHECK(u_expr->get_operand());
+      VLOG(1) << "Unable to determine expression range for dictionary encoded expression "
+              << u_expr->get_operand()->toString() << ", proceeding with invalid range.";
+      return ExpressionRange::makeInvalidRange();
+    }
 
     if (const_operand->get_is_null()) {
       return ExpressionRange::makeNullRange();
@@ -743,7 +879,7 @@ ExpressionRange getExpressionRange(
   const auto& arg_ti = u_expr->get_operand()->get_type_info();
   // Timestamp to Date OR Date/Timestamp casts with different precision
   if ((ti.is_timestamp() && (arg_ti.get_dimension() != ti.get_dimension())) ||
-      ((arg_ti.is_timestamp() && ti.is_date()))) {
+      ((arg_ti.is_timestamp() && ti.is_any<kDATE, kTIME>()))) {
     return getDateTimePrecisionCastRange(arg_range, arg_ti, ti);
   }
   switch (arg_range.getType()) {
@@ -758,8 +894,10 @@ ExpressionRange getExpressionRange(
                                                      arg_range.hasNulls());
       }
       if (ti.is_integer()) {
-        return ExpressionRange::makeIntRange(
-            arg_range.getFpMin(), arg_range.getFpMax(), 0, arg_range.hasNulls());
+        return ExpressionRange::makeIntRange(std::floor(arg_range.getFpMin()),
+                                             std::ceil(arg_range.getFpMax()),
+                                             0,
+                                             arg_range.hasNulls());
       }
       break;
     }
@@ -840,6 +978,7 @@ ExpressionRange getExpressionRange(
           year_range_min, year_range_max, 0, arg_range.hasNulls());
     }
     case kEPOCH:
+    case kDATEEPOCH:
       return arg_range;
     case kQUARTERDAY:
     case kQUARTER:
@@ -867,6 +1006,8 @@ ExpressionRange getExpressionRange(
     case kDOY:
       return ExpressionRange::makeIntRange(1, 366, 0, has_nulls);
     case kWEEK:
+    case kWEEK_SUNDAY:
+    case kWEEK_SATURDAY:
       return ExpressionRange::makeIntRange(1, 53, 0, has_nulls);
     default:
       CHECK(false);
@@ -897,4 +1038,75 @@ ExpressionRange getExpressionRange(
           : get_conservative_datetrunc_bucket(datetrunc_expr->get_field());
 
   return ExpressionRange::makeIntRange(min_ts, max_ts, bucket, arg_range.hasNulls());
+}
+
+ExpressionRange getExpressionRange(
+    const Analyzer::WidthBucketExpr* width_bucket_expr,
+    const std::vector<InputTableInfo>& query_infos,
+    const Executor* executor,
+    boost::optional<std::list<std::shared_ptr<Analyzer::Expr>>> simple_quals) {
+  auto target_value_expr = width_bucket_expr->get_target_value();
+  auto target_value_range = getExpressionRange(target_value_expr, query_infos, executor);
+  auto target_ti = target_value_expr->get_type_info();
+  if (width_bucket_expr->is_constant_expr() &&
+      target_value_range.getType() != ExpressionRangeType::Invalid) {
+    auto const_target_value = dynamic_cast<const Analyzer::Constant*>(target_value_expr);
+    if (const_target_value) {
+      if (const_target_value->get_is_null()) {
+        // null constant, return default width_bucket range
+        return ExpressionRange::makeIntRange(
+            0, width_bucket_expr->get_partition_count_val(), 0, true);
+      } else {
+        CHECK(target_value_range.getFpMax() == target_value_range.getFpMin());
+        auto target_value_bucket =
+            width_bucket_expr->compute_bucket(target_value_range.getFpMax());
+        return ExpressionRange::makeIntRange(
+            target_value_bucket, target_value_bucket, 0, target_value_range.hasNulls());
+      }
+    }
+    // compute possible bucket range based on lower and upper bound constants
+    // to elucidate a target bucket range
+    const auto target_value_range_with_qual =
+        getExpressionRange(target_value_expr, query_infos, executor, simple_quals);
+    auto compute_bucket_range = [&width_bucket_expr](const ExpressionRange& target_range,
+                                                     SQLTypeInfo ti) {
+      // we casted bucket bound exprs to double
+      auto lower_bound_bucket =
+          width_bucket_expr->compute_bucket(target_range.getFpMin());
+      auto upper_bound_bucket =
+          width_bucket_expr->compute_bucket(target_range.getFpMax());
+      return ExpressionRange::makeIntRange(
+          lower_bound_bucket, upper_bound_bucket, 0, target_range.hasNulls());
+    };
+    auto res_range = compute_bucket_range(target_value_range_with_qual, target_ti);
+    // check target_value expression's col range to be not nullable iff it has its filter
+    // expression i.e., in simple_quals
+    // todo (yoonmin) : need to search simple_quals to cover more cases?
+    if (target_value_range.getFpMin() < target_value_range_with_qual.getFpMin() ||
+        target_value_range.getFpMax() > target_value_range_with_qual.getFpMax()) {
+      res_range.setNulls(false);
+    }
+    return res_range;
+  } else {
+    // we cannot determine a possibility of skipping oob check safely
+    const bool has_nulls = target_value_range.getType() == ExpressionRangeType::Invalid ||
+                           target_value_range.hasNulls();
+    auto partition_expr_range = getExpressionRange(
+        width_bucket_expr->get_partition_count(), query_infos, executor, simple_quals);
+    auto res = ExpressionRange::makeIntRange(0, INT32_MAX, 0, has_nulls);
+    switch (partition_expr_range.getType()) {
+      case ExpressionRangeType::Integer: {
+        res.setIntMax(partition_expr_range.getIntMax() + 1);
+        break;
+      }
+      case ExpressionRangeType::Float:
+      case ExpressionRangeType::Double: {
+        res.setIntMax(static_cast<int64_t>(partition_expr_range.getFpMax()) + 1);
+        break;
+      }
+      default:
+        break;
+    }
+    return res;
+  }
 }

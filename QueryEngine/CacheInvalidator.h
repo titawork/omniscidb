@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 OmniSci, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,25 +20,15 @@
 template <typename... CACHE_HOLDING_TYPES>
 class CacheInvalidator {
  public:
-  static void invalidateCaches() { internalInvalidateCache<CACHE_HOLDING_TYPES...>(); }
+  static void invalidateCaches() { (..., CACHE_HOLDING_TYPES::invalidateCache()); }
+  static void invalidateCachesByTable(size_t table_key) {
+    // input: a hashed table chunk key: {db_id, table_id}
+    (..., CACHE_HOLDING_TYPES::markCachedItemAsDirty(table_key));
+  }
 
  private:
   CacheInvalidator() = delete;
   ~CacheInvalidator() = delete;
-
-  template <typename CACHE_HOLDING_TYPE>
-  static void internalInvalidateCache() {
-    CACHE_HOLDING_TYPE::yieldCacheInvalidator()();
-  }
-
-  template <typename FIRST_CACHE_HOLDING_TYPE,
-            typename SECOND_CACHE_HOLDING_TYPE,
-            typename... REMAINING_CACHE_HOLDING_TYPES>
-  static void internalInvalidateCache() {
-    FIRST_CACHE_HOLDING_TYPE::yieldCacheInvalidator()();
-    internalInvalidateCache<SECOND_CACHE_HOLDING_TYPE,
-                            REMAINING_CACHE_HOLDING_TYPES...>();
-  }
 };
 
 #endif

@@ -1,26 +1,29 @@
 package com.mapd.utility.db_vendors;
 
-import org.postgis.Geometry;
 import org.postgis.PGgeometry;
 import org.postgresql.geometric.PGlseg;
 import org.postgresql.geometric.PGpoint;
 import org.postgresql.geometric.PGpolygon;
 
 import java.sql.*;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Hashtable;
 
 abstract public class Db_vendor_types {
   protected Db_vendor_types() {}
-  static protected HashSet<Integer> valid_srid = new HashSet() {
-    {
-      add(4326);
-      add(900913);
-    }
+  static protected HashSet<Integer> valid_srid =
+          new HashSet<>(Arrays.asList(4326, 900913));
+
+  public static class GisType {
+    public String subtype;
+    public String type;
+    public int srid;
   };
 
-  public abstract String find_gis_type(
-          Connection conn, String source_column_name, String source_column_type_name)
+  public abstract boolean isAutoCommitDisabledRequired();
+  public abstract GisType find_gis_type(
+          Connection conn, ResultSetMetaData metadata, int column_number)
           throws SQLException;
   public abstract String get_wkt(ResultSet rs, int column_number, String gis_type_name)
           throws SQLException;
@@ -28,21 +31,103 @@ abstract public class Db_vendor_types {
           String connection_str) {
     if (connection_str.toLowerCase().contains("postgres"))
       return new com.mapd.utility.db_vendors.PostGis_types();
-    return null;
+    else if (connection_str.toLowerCase().contains("omnisci"))
+      return new com.mapd.utility.db_vendors.HeavyDBGeo_types();
+    return new com.mapd.utility.db_vendors.Other_types();
+  }
+  public static String gis_type_to_str(GisType type) {
+    StringBuffer column_sql_definition = new StringBuffer();
+    if (!type.subtype.isEmpty()) {
+      column_sql_definition.append(type.subtype + "(");
+    }
+    column_sql_definition.append(type.type);
+    if (type.srid != 0) {
+      column_sql_definition.append("," + type.srid);
+    }
+    if (!type.subtype.isEmpty()) {
+      column_sql_definition.append(")");
+    }
+    return column_sql_definition.toString();
+  }
+}
+
+class Other_types extends com.mapd.utility.db_vendors.Db_vendor_types {
+  protected Other_types() {}
+  public boolean isAutoCommitDisabledRequired() {
+    return false;
+  }
+  public GisType find_gis_type(
+          Connection conn, ResultSetMetaData metadata, int column_number)
+          throws SQLException {
+    throw new SQLException("GEO types not supported");
+  }
+  public String get_wkt(ResultSet rs, int column_number, String gis_type_name)
+          throws SQLException {
+    throw new SQLException("GEO types not supported");
+  }
+}
+
+class HeavyDBGeo_types extends com.mapd.utility.db_vendors.Db_vendor_types {
+  protected HeavyDBGeo_types() {}
+
+  public boolean isAutoCommitDisabledRequired() {
+    return false;
+  }
+  private static final HashSet<String> geo_types =
+          new HashSet<>(Arrays.asList("point", "linestring", "polygon", "multipolygon"));
+
+  // values from SqlTypes.h
+  // there seems to be no other way to access those, but IDs are expected NOT to change
+  static private Hashtable<Integer, String> subtypes = new Hashtable() {
+    {
+      put(23, "GEOMETRY");
+      put(24, "GEOGRAPHY");
+    }
+  };
+
+  public String get_wkt(ResultSet rs, int column_number, String gis_type_name)
+          throws SQLException {
+    return rs.getString(column_number);
+  }
+
+  public GisType find_gis_type(
+          Connection conn, ResultSetMetaData metadata, int column_number)
+          throws SQLException {
+    String column_name = metadata.getColumnName(column_number);
+    String column_type_name = metadata.getColumnTypeName(column_number);
+    if (!geo_types.contains(column_type_name.toLowerCase()))
+      throw new SQLException(
+              "type not supported: " + column_type_name + " for column " + column_name);
+    int srid = metadata.getScale(column_number);
+    if (!valid_srid.contains(srid) && srid != 0)
+      throw new SQLException(
+              "srid is not supported: " + srid + " for column " + column_name);
+    int subtype = metadata.getPrecision(column_number);
+    if (!subtypes.containsKey(subtype))
+      throw new SQLException(
+              "Subtype is not supported: " + subtype + " for column " + column_name);
+    GisType result = new GisType();
+    result.srid = srid;
+    result.subtype = subtypes.get(subtype);
+    result.type = column_type_name.toUpperCase();
+    return result;
   }
 }
 
 class PostGis_types extends com.mapd.utility.db_vendors.Db_vendor_types {
   protected PostGis_types() {}
+  public boolean isAutoCommitDisabledRequired() {
+    return true;
+  }
 
-  // Map postgis geom types to OmniSci geom types
+  // Map postgis geom types to HeavyAI geom types
   static private Hashtable<String, String> extra_types = new Hashtable() {
     {
       put("point", "POINT");
       put("lseg", "linestring");
       put("linestring", "linestring");
       put("polygon", "polygon");
-      put("multipolygon", "multipolyon");
+      put("multipolygon", "multipolygon");
     }
   };
   private String wkt_point(PGpoint point) {
@@ -88,57 +173,65 @@ class PostGis_types extends com.mapd.utility.db_vendors.Db_vendor_types {
     return WKT_string.toString();
   }
 
-  public String find_gis_type(
-          Connection conn, String column_name, String column_type_name)
+  public GisType find_gis_type(
+          Connection conn, ResultSetMetaData metadata, int column_number)
           throws SQLException {
+    String column_name = metadata.getColumnName(column_number);
+    String table_name = metadata.getTableName(column_number);
+    String column_type_name = metadata.getColumnTypeName(column_number);
     if (column_type_name.equalsIgnoreCase("geography"))
       return find_type_detail(
-              conn, "geography_columns", "f_geography_column", column_name);
+              conn, "geography_columns", "f_geography_column", column_name, table_name);
     else if (column_type_name.equalsIgnoreCase("geometry"))
-      return find_type_detail(conn, "geometry_columns", "f_geometry_column", column_name);
+      return find_type_detail(
+              conn, "geometry_columns", "f_geometry_column", column_name, table_name);
     if (!extra_types.containsKey(column_type_name))
-      throw new SQLException("type not supported");
-    return extra_types.get(column_type_name);
+      throw new SQLException(
+              "type not supported: " + column_type_name + " for column " + column_name);
+    GisType result = new GisType();
+    result.type = extra_types.get(column_type_name);
+    return result;
   }
 
-  private String find_type_detail(Connection conn,
+  private GisType find_type_detail(Connection conn,
           String ref_table_name,
           String ref_column_name,
-          String column_name) throws SQLException {
-    String omnisci_type = null;
+          String column_name,
+          String table_name) throws SQLException {
     Statement detail_st = conn.createStatement();
     // Select for a specific column name from the ref table.
-    String select = "select type, srid from " + ref_table_name + "  where "
+    String select = "select type, srid from " + ref_table_name + " where "
             + ref_column_name + " = '" + column_name + "'";
+    if (table_name.length() > 0) {
+      select += " and f_table_name"
+              + " = '" + table_name + "'";
+    }
     ResultSet rs = detail_st.executeQuery(select);
-    String ps_column_type = null;
-    int ps_srid = 0;
-    // The select statment above, can return multiple values qualified by schema/table.
-    // Unfortunately at this stage only the original postgres column name is known.  If
-    // get mulitple returns with the same column name, but different types we will not be
-    // able to separate which specific column is which type.  This loop checks for this
-    // condition and thows when detected.
+    GisType result = new GisType();
+    result.subtype = "GEOMETRY";
+    result.type = null;
+    result.srid = 0;
+    // The select statment above, can return multiple values qualified by schema/table
+    // If an outdated driver is used, the utility jar is positioned befor the driver in
+    // the classpath or for whatever reason the table_name isn't returned by the driver
     while (rs.next()) {
       String type = rs.getString(1);
       int srid = rs.getInt(2);
-      // If multiple rows are returned with different geo types for a single coulmn name
-      // then throw.
-      if (ps_column_type != null
-              && (ps_column_type.equalsIgnoreCase(type) || srid != ps_srid)) {
-        throw new SQLException("multiple column definitions [" + ps_column_type + ":"
-                + type + "] found for column_name [" + column_name + "]");
+      if (result.type == null) {
+        result.type = type;
+        result.srid = srid;
+      } else {
+        if (!result.type.equalsIgnoreCase(type) || srid != result.srid) {
+          throw new SQLException("multiple column definitions [" + result.type + ":"
+                  + type + "] found for column_name [" + column_name + "].\n"
+                  + "You can try to switch the jar positions in the classpath "
+                  + "or use a more recent postgreSQL driver.");
+        }
       }
-      ps_column_type = type;
-      ps_srid = srid;
     }
-    if (!extra_types.containsKey(ps_column_type.toLowerCase()))
+    if (!extra_types.containsKey(result.type.toLowerCase()))
       throw new SQLException("type not supported");
-    omnisci_type = extra_types.get(ps_column_type.toLowerCase());
-    if (ps_srid != 0) {
-      if (!valid_srid.contains(new Integer(ps_srid)))
-        throw new SQLException("type not supported");
-      omnisci_type = omnisci_type + "," + ps_srid;
-    }
-    return new String("geometry(" + omnisci_type + ")");
+    result.type = extra_types.get(result.type.toLowerCase()).toUpperCase();
+    return result;
   }
 }

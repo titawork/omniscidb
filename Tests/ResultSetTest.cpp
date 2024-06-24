@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,24 +16,48 @@
 
 /**
  * @file    ResultSetTest.cpp
- * @author  Alex Suhan <alex@mapd.com>
  * @brief   Unit tests for the result set interface.
  *
- * Copyright (c) 2014 MapD Technologies, Inc.  All rights reserved.
  */
-#include "ResultSetTestUtils.h"
 
-#include "../QueryEngine/Descriptors/RowSetMemoryOwner.h"
-#include "../QueryEngine/ResultSet.h"
-#include "../QueryEngine/RuntimeFunctions.h"
-#include "../StringDictionary/StringDictionary.h"
+#include "Tests/ResultSetTestUtils.h"
 
-#include <glog/logging.h>
+#include "QueryEngine/Descriptors/RowSetMemoryOwner.h"
+#include "QueryEngine/Execute.h"
+#include "QueryEngine/ResultSet.h"
+#include "QueryEngine/ResultSetReductionJIT.h"
+#include "QueryEngine/RuntimeFunctions.h"
+#include "QueryRunner/QueryRunner.h"
+#include "StringDictionary/StringDictionary.h"
+#include "Tests/TestHelpers.h"
+
 #include <gtest/gtest.h>
-
 #include <algorithm>
 #include <queue>
 #include <random>
+
+#ifndef BASE_PATH
+#define BASE_PATH "./tmp"
+#endif
+
+using QR = QueryRunner::QueryRunner;
+
+extern bool g_is_test_env;
+
+bool skip_tests(const ExecutorDeviceType device_type) {
+#ifdef HAVE_CUDA
+  return device_type == ExecutorDeviceType::GPU && !(QR::get()->gpusPresent());
+#else
+  return device_type == ExecutorDeviceType::GPU;
+#endif
+}
+
+#define SKIP_NO_GPU()                                        \
+  if (skip_tests(dt)) {                                      \
+    CHECK(dt == ExecutorDeviceType::GPU);                    \
+    LOG(WARNING) << "GPU not available, skipping GPU tests"; \
+    continue;                                                \
+  }
 
 TEST(Construct, Allocate) {
   std::vector<TargetInfo> target_infos;
@@ -41,579 +65,14 @@ TEST(Construct, Allocate) {
   ResultSet result_set(target_infos,
                        ExecutorDeviceType::CPU,
                        query_mem_desc,
-                       std::make_shared<RowSetMemoryOwner>(),
-                       nullptr);
+                       std::make_shared<RowSetMemoryOwner>(Executor::getArenaBlockSize(),
+                                                           Executor::UNITARY_EXECUTOR_ID),
+                       0,
+                       0);
   result_set.allocateStorage();
 }
 
 namespace {
-
-class NumberGenerator {
- public:
-  virtual int64_t getNextValue() = 0;
-
-  virtual void reset() = 0;
-};
-
-class EvenNumberGenerator : public NumberGenerator {
- public:
-  EvenNumberGenerator() : crt_(0) {}
-
-  int64_t getNextValue() override {
-    const auto crt = crt_;
-    crt_ += 2;
-    return crt;
-  }
-
-  void reset() override { crt_ = 0; }
-
- private:
-  int64_t crt_;
-};
-
-class ReverseOddOrEvenNumberGenerator : public NumberGenerator {
- public:
-  ReverseOddOrEvenNumberGenerator(const int64_t init) : crt_(init), init_(init) {}
-
-  int64_t getNextValue() override {
-    const auto crt = crt_;
-    crt_ -= 2;
-    return crt;
-  }
-
-  void reset() override { crt_ = init_; }
-
- private:
-  int64_t crt_;
-  int64_t init_;
-};
-
-void write_int(int8_t* slot_ptr, const int64_t v, const size_t slot_bytes) {
-  switch (slot_bytes) {
-    case 4:
-      *reinterpret_cast<int32_t*>(slot_ptr) = v;
-      break;
-    case 8:
-      *reinterpret_cast<int64_t*>(slot_ptr) = v;
-      break;
-    default:
-      CHECK(false);
-  }
-}
-
-void write_fp(int8_t* slot_ptr, const int64_t v, const size_t slot_bytes) {
-  switch (slot_bytes) {
-    case 4: {
-      float fi = v;
-      *reinterpret_cast<int32_t*>(slot_ptr) =
-          *reinterpret_cast<const int32_t*>(may_alias_ptr(&fi));
-      break;
-    }
-    case 8: {
-      double di = v;
-      *reinterpret_cast<int64_t*>(slot_ptr) =
-          *reinterpret_cast<const int64_t*>(may_alias_ptr(&di));
-      break;
-    }
-    default:
-      CHECK(false);
-  }
-}
-
-int8_t* fill_one_entry_no_collisions(int8_t* buff,
-                                     const QueryMemoryDescriptor& query_mem_desc,
-                                     const int64_t v,
-                                     const std::vector<TargetInfo>& target_infos,
-                                     const bool empty,
-                                     const bool null_val = false) {
-  size_t target_idx = 0;
-  int8_t* slot_ptr = buff;
-  int64_t vv = 0;
-  for (const auto& target_info : target_infos) {
-    const auto slot_bytes = query_mem_desc.getLogicalSlotWidthBytes(target_idx);
-    CHECK_LE(target_info.sql_type.get_size(), slot_bytes);
-    bool isNullable = !target_info.sql_type.get_notnull();
-    if (target_info.agg_kind == kCOUNT) {
-      if (empty || null_val) {
-        vv = 0;
-      } else {
-        vv = v;
-      }
-    } else {
-      if (isNullable && target_info.skip_null_val && null_val) {
-        vv = inline_int_null_val(target_info.sql_type);
-      } else {
-        vv = v;
-      }
-    }
-    if (empty) {
-      write_int(slot_ptr, query_mem_desc.hasKeylessHash() ? 0 : vv, slot_bytes);
-    } else {
-      if (target_info.sql_type.is_integer()) {
-        write_int(slot_ptr, vv, slot_bytes);
-      } else if (target_info.sql_type.is_string()) {
-        write_int(slot_ptr, -(vv + 2), slot_bytes);
-      } else {
-        CHECK(target_info.sql_type.is_fp());
-        write_fp(slot_ptr, vv, slot_bytes);
-      }
-    }
-    slot_ptr += slot_bytes;
-    if (target_info.agg_kind == kAVG) {
-      const auto count_slot_bytes =
-          query_mem_desc.getLogicalSlotWidthBytes(target_idx + 1);
-      if (empty) {
-        write_int(slot_ptr, query_mem_desc.hasKeylessHash() ? 0 : 0, count_slot_bytes);
-      } else {
-        if (isNullable && target_info.skip_null_val && null_val) {
-          write_int(slot_ptr, 0, count_slot_bytes);  // count of elements should be set to
-                                                     // 0 for elements with null_val
-        } else {
-          write_int(slot_ptr, 1, count_slot_bytes);  // count of elements in the group is
-                                                     // 1 - good enough for testing
-        }
-      }
-      slot_ptr += count_slot_bytes;
-    }
-    target_idx = advance_slot(target_idx, target_info, false);
-  }
-  return slot_ptr;
-}
-
-void fill_one_entry_one_col(int8_t* ptr1,
-                            const int8_t compact_sz1,
-                            int8_t* ptr2,
-                            const int8_t compact_sz2,
-                            int64_t v,
-                            const TargetInfo& target_info,
-                            const bool empty_entry,
-                            const bool null_val = false) {
-  int64_t vv = 0;
-  if (target_info.agg_kind == kCOUNT) {
-    if (empty_entry || null_val) {
-      vv = 0;
-    } else {
-      vv = v;
-    }
-  } else {
-    bool isNullable = !target_info.sql_type.get_notnull();
-    if (isNullable && target_info.skip_null_val && null_val) {
-      vv = inline_int_null_val(target_info.sql_type);
-    } else {
-      if (empty_entry && (target_info.agg_kind == kAVG)) {
-        vv = 0;
-      } else {
-        vv = v;
-      }
-    }
-  }
-  CHECK(ptr1);
-  switch (compact_sz1) {
-    case 8:
-      if (target_info.sql_type.is_fp()) {
-        double di = vv;
-        *reinterpret_cast<int64_t*>(ptr1) =
-            *reinterpret_cast<const int64_t*>(may_alias_ptr(&di));
-      } else {
-        *reinterpret_cast<int64_t*>(ptr1) = vv;
-      }
-      break;
-    case 4:
-      CHECK(!target_info.sql_type.is_fp());
-      *reinterpret_cast<int32_t*>(ptr1) = vv;
-      break;
-    default:
-      CHECK(false);
-  }
-  if (target_info.is_agg && target_info.agg_kind == kAVG) {
-    CHECK(ptr2);
-    switch (compact_sz2) {
-      case 8:
-        *reinterpret_cast<int64_t*>(ptr2) = (empty_entry ? *ptr1 : 1);
-        break;
-      case 4:
-        *reinterpret_cast<int32_t*>(ptr2) = (empty_entry ? *ptr1 : 1);
-        break;
-      default:
-        CHECK(false);
-    }
-  }
-}
-
-void fill_one_entry_one_col(int64_t* value_slot,
-                            const int64_t v,
-                            const TargetInfo& target_info,
-                            const size_t entry_count,
-                            const bool empty_entry = false,
-                            const bool null_val = false) {
-  auto ptr1 = reinterpret_cast<int8_t*>(value_slot);
-  int8_t* ptr2{nullptr};
-  if (target_info.agg_kind == kAVG) {
-    ptr2 = reinterpret_cast<int8_t*>(&value_slot[entry_count]);
-  }
-  fill_one_entry_one_col(ptr1, 8, ptr2, 8, v, target_info, empty_entry, null_val);
-}
-
-int8_t* advance_to_next_columnar_key_buff(int8_t* key_ptr,
-                                          const QueryMemoryDescriptor& query_mem_desc,
-                                          const size_t key_idx) {
-  CHECK(!query_mem_desc.hasKeylessHash());
-  CHECK_LT(key_idx, query_mem_desc.groupColWidthsSize());
-  auto new_key_ptr =
-      key_ptr + query_mem_desc.getEntryCount() * query_mem_desc.groupColWidth(key_idx);
-  return new_key_ptr;
-}
-
-void write_key(const int64_t k, int8_t* ptr, const int8_t key_bytes) {
-  switch (key_bytes) {
-    case 8: {
-      *reinterpret_cast<int64_t*>(ptr) = k;
-      break;
-    }
-    case 4: {
-      *reinterpret_cast<int32_t*>(ptr) = k;
-      break;
-    }
-    default:
-      CHECK(false);
-  }
-}
-
-void fill_storage_buffer_perfect_hash_colwise(int8_t* buff,
-                                              const std::vector<TargetInfo>& target_infos,
-                                              const QueryMemoryDescriptor& query_mem_desc,
-                                              NumberGenerator& generator) {
-  const auto key_component_count = query_mem_desc.getKeyCount();
-  CHECK(query_mem_desc.didOutputColumnar());
-  // initialize the key buffer(s)
-  auto col_ptr = buff;
-  for (size_t key_idx = 0; key_idx < key_component_count; ++key_idx) {
-    auto key_entry_ptr = col_ptr;
-    const auto key_bytes = query_mem_desc.groupColWidth(key_idx);
-    CHECK_EQ(8, key_bytes);
-    for (size_t i = 0; i < query_mem_desc.getEntryCount(); ++i) {
-      if (i % 2 == 0) {
-        const auto v = generator.getNextValue();
-        write_key(v, key_entry_ptr, key_bytes);
-      } else {
-        write_key(EMPTY_KEY_64, key_entry_ptr, key_bytes);
-      }
-      key_entry_ptr += key_bytes;
-    }
-    col_ptr = advance_to_next_columnar_key_buff(col_ptr, query_mem_desc, key_idx);
-    generator.reset();
-  }
-  // initialize the value buffer(s)
-  size_t slot_idx = 0;
-  for (const auto& target_info : target_infos) {
-    auto col_entry_ptr = col_ptr;
-    const auto col_bytes = query_mem_desc.getPaddedSlotWidthBytes(slot_idx);
-    for (size_t i = 0; i < query_mem_desc.getEntryCount(); ++i) {
-      int8_t* ptr2{nullptr};
-      const bool read_secondary_buffer{target_info.is_agg &&
-                                       target_info.agg_kind == kAVG};
-      if (read_secondary_buffer) {
-        ptr2 = col_entry_ptr + query_mem_desc.getEntryCount() * col_bytes;
-      }
-      if (i % 2 == 0) {
-        const auto gen_val = generator.getNextValue();
-        const auto val = target_info.sql_type.is_string() ? -(gen_val + 2) : gen_val;
-        fill_one_entry_one_col(col_entry_ptr,
-                               col_bytes,
-                               ptr2,
-                               read_secondary_buffer
-                                   ? query_mem_desc.getPaddedSlotWidthBytes(slot_idx + 1)
-                                   : -1,
-                               val,
-                               target_info,
-                               false);
-      } else {
-        fill_one_entry_one_col(col_entry_ptr,
-                               col_bytes,
-                               ptr2,
-                               read_secondary_buffer
-                                   ? query_mem_desc.getPaddedSlotWidthBytes(slot_idx + 1)
-                                   : -1,
-                               query_mem_desc.hasKeylessHash() ? 0 : 0xdeadbeef,
-                               target_info,
-                               true);
-      }
-      col_entry_ptr += col_bytes;
-    }
-    col_ptr = advance_to_next_columnar_target_buff(col_ptr, query_mem_desc, slot_idx);
-    if (target_info.is_agg && target_info.agg_kind == kAVG) {
-      col_ptr =
-          advance_to_next_columnar_target_buff(col_ptr, query_mem_desc, slot_idx + 1);
-    }
-    slot_idx = advance_slot(slot_idx, target_info, false);
-    generator.reset();
-  }
-}
-
-void fill_storage_buffer_perfect_hash_rowwise(int8_t* buff,
-                                              const std::vector<TargetInfo>& target_infos,
-                                              const QueryMemoryDescriptor& query_mem_desc,
-                                              NumberGenerator& generator) {
-  const auto key_component_count = query_mem_desc.getKeyCount();
-  CHECK(!query_mem_desc.didOutputColumnar());
-  auto key_buff = buff;
-  for (size_t i = 0; i < query_mem_desc.getEntryCount(); ++i) {
-    if (i % 2 == 0) {
-      const auto v = generator.getNextValue();
-      auto key_buff_i64 = reinterpret_cast<int64_t*>(key_buff);
-      for (size_t key_comp_idx = 0; key_comp_idx < key_component_count; ++key_comp_idx) {
-        *key_buff_i64++ = v;
-      }
-      auto entries_buff = reinterpret_cast<int8_t*>(key_buff_i64);
-      key_buff = fill_one_entry_no_collisions(
-          entries_buff, query_mem_desc, v, target_infos, false);
-    } else {
-      auto key_buff_i64 = reinterpret_cast<int64_t*>(key_buff);
-      for (size_t key_comp_idx = 0; key_comp_idx < key_component_count; ++key_comp_idx) {
-        *key_buff_i64++ = EMPTY_KEY_64;
-      }
-      auto entries_buff = reinterpret_cast<int8_t*>(key_buff_i64);
-      key_buff = fill_one_entry_no_collisions(
-          entries_buff, query_mem_desc, 0xdeadbeef, target_infos, true);
-    }
-  }
-}
-
-void fill_storage_buffer_baseline_colwise(int8_t* buff,
-                                          const std::vector<TargetInfo>& target_infos,
-                                          const QueryMemoryDescriptor& query_mem_desc,
-                                          NumberGenerator& generator,
-                                          const size_t step) {
-  CHECK(query_mem_desc.didOutputColumnar());
-  const auto key_component_count = query_mem_desc.getKeyCount();
-  const auto i64_buff = reinterpret_cast<int64_t*>(buff);
-  const auto target_slot_count = get_slot_count(target_infos);
-  const auto slot_to_target = get_slot_to_target_mapping(target_infos);
-  for (size_t i = 0; i < query_mem_desc.getEntryCount(); ++i) {
-    for (size_t key_comp_idx = 0; key_comp_idx < key_component_count; ++key_comp_idx) {
-      i64_buff[key_offset_colwise(i, key_comp_idx, query_mem_desc.getEntryCount())] =
-          EMPTY_KEY_64;
-    }
-    for (size_t target_slot = 0; target_slot < target_slot_count; ++target_slot) {
-      auto target_it = slot_to_target.find(target_slot);
-      CHECK(target_it != slot_to_target.end());
-      const auto& target_info = target_infos[target_it->second];
-      i64_buff[slot_offset_colwise(
-          i, target_slot, key_component_count, query_mem_desc.getEntryCount())] =
-          (target_info.agg_kind == kCOUNT ? 0 : 0xdeadbeef);
-    }
-  }
-  for (size_t i = 0; i < query_mem_desc.getEntryCount(); i += step) {
-    const auto gen_val = generator.getNextValue();
-    std::vector<int64_t> key(key_component_count, gen_val);
-    auto value_slots = get_group_value_columnar(
-        i64_buff, query_mem_desc.getEntryCount(), &key[0], key.size());
-    CHECK(value_slots);
-    for (const auto& target_info : target_infos) {
-      const auto val = target_info.sql_type.is_string() ? -(gen_val + step) : gen_val;
-      fill_one_entry_one_col(
-          value_slots, val, target_info, query_mem_desc.getEntryCount());
-      value_slots += query_mem_desc.getEntryCount();
-      if (target_info.agg_kind == kAVG) {
-        value_slots += query_mem_desc.getEntryCount();
-      }
-    }
-  }
-}
-
-void fill_storage_buffer_baseline_rowwise(int8_t* buff,
-                                          const std::vector<TargetInfo>& target_infos,
-                                          const QueryMemoryDescriptor& query_mem_desc,
-                                          NumberGenerator& generator,
-                                          const size_t step) {
-  const auto key_component_count = query_mem_desc.getKeyCount();
-  const auto i64_buff = reinterpret_cast<int64_t*>(buff);
-  const auto target_slot_count = get_slot_count(target_infos);
-  const auto slot_to_target = get_slot_to_target_mapping(target_infos);
-  for (size_t i = 0; i < query_mem_desc.getEntryCount(); ++i) {
-    const auto first_key_comp_offset =
-        key_offset_rowwise(i, key_component_count, target_slot_count);
-    for (size_t key_comp_idx = 0; key_comp_idx < key_component_count; ++key_comp_idx) {
-      i64_buff[first_key_comp_offset + key_comp_idx] = EMPTY_KEY_64;
-    }
-    for (size_t target_slot = 0; target_slot < target_slot_count; ++target_slot) {
-      auto target_it = slot_to_target.find(target_slot);
-      CHECK(target_it != slot_to_target.end());
-      const auto& target_info = target_infos[target_it->second];
-      i64_buff[slot_offset_rowwise(
-          i, target_slot, key_component_count, target_slot_count)] =
-          (target_info.agg_kind == kCOUNT ? 0 : 0xdeadbeef);
-    }
-  }
-  for (size_t i = 0; i < query_mem_desc.getEntryCount(); i += step) {
-    const auto v = generator.getNextValue();
-    std::vector<int64_t> key(key_component_count, v);
-    auto value_slots = get_group_value(i64_buff,
-                                       query_mem_desc.getEntryCount(),
-                                       &key[0],
-                                       key.size(),
-                                       sizeof(int64_t),
-                                       key_component_count + target_slot_count,
-                                       nullptr);
-    CHECK(value_slots);
-    fill_one_entry_baseline(value_slots, v, target_infos);
-  }
-}
-
-void fill_storage_buffer(int8_t* buff,
-                         const std::vector<TargetInfo>& target_infos,
-                         const QueryMemoryDescriptor& query_mem_desc,
-                         NumberGenerator& generator,
-                         const size_t step) {
-  switch (query_mem_desc.getQueryDescriptionType()) {
-    case QueryDescriptionType::GroupByPerfectHash: {
-      if (query_mem_desc.didOutputColumnar()) {
-        fill_storage_buffer_perfect_hash_colwise(
-            buff, target_infos, query_mem_desc, generator);
-      } else {
-        fill_storage_buffer_perfect_hash_rowwise(
-            buff, target_infos, query_mem_desc, generator);
-      }
-      break;
-    }
-    case QueryDescriptionType::GroupByBaselineHash: {
-      if (query_mem_desc.didOutputColumnar()) {
-        fill_storage_buffer_baseline_colwise(
-            buff, target_infos, query_mem_desc, generator, step);
-      } else {
-        fill_storage_buffer_baseline_rowwise(
-            buff, target_infos, query_mem_desc, generator, step);
-      }
-      break;
-    }
-    default:
-      CHECK(false);
-  }
-  CHECK(buff);
-}
-
-// TODO(alex): allow 4 byte keys
-
-/* descriptor with small entry_count to simplify testing and debugging */
-QueryMemoryDescriptor perfect_hash_one_col_desc_small(
-    const std::vector<TargetInfo>& target_infos,
-    const int8_t num_bytes) {
-  QueryMemoryDescriptor query_mem_desc(
-      QueryDescriptionType::GroupByPerfectHash, 0, 19, false, {8});
-  for (const auto& target_info : target_infos) {
-    const auto slot_bytes =
-        std::max(num_bytes, static_cast<int8_t>(target_info.sql_type.get_size()));
-    std::vector<std::tuple<int8_t, int8_t>> slots_for_target;
-    if (target_info.agg_kind == kAVG) {
-      CHECK(target_info.is_agg);
-      slots_for_target.emplace_back(std::make_tuple(slot_bytes, slot_bytes));
-    }
-    slots_for_target.emplace_back(std::make_tuple(slot_bytes, slot_bytes));
-    query_mem_desc.addColSlotInfo(slots_for_target);
-  }
-  query_mem_desc.setEntryCount(query_mem_desc.getMaxVal() - query_mem_desc.getMinVal() +
-                               1);
-  return query_mem_desc;
-}
-
-QueryMemoryDescriptor perfect_hash_one_col_desc(
-    const std::vector<TargetInfo>& target_infos,
-    const int8_t num_bytes,
-    const size_t min_val,
-    const size_t max_val) {
-  QueryMemoryDescriptor query_mem_desc(
-      QueryDescriptionType::GroupByPerfectHash, min_val, max_val, false, {8});
-  for (const auto& target_info : target_infos) {
-    const auto slot_bytes =
-        std::max(num_bytes, static_cast<int8_t>(target_info.sql_type.get_size()));
-    std::vector<std::tuple<int8_t, int8_t>> slots_for_target;
-    if (target_info.agg_kind == kAVG) {
-      CHECK(target_info.is_agg);
-      slots_for_target.emplace_back(std::make_tuple(slot_bytes, slot_bytes));
-    }
-    slots_for_target.emplace_back(std::make_tuple(slot_bytes, slot_bytes));
-    if (target_info.sql_type.is_geometry()) {
-      for (int i = 1; i < 2 * target_info.sql_type.get_physical_coord_cols(); i++) {
-        slots_for_target.emplace_back(std::make_tuple(slot_bytes, slot_bytes));
-      }
-    } else if (target_info.sql_type.is_varlen()) {
-      slots_for_target.emplace_back(std::make_tuple(slot_bytes, slot_bytes));
-    }
-    query_mem_desc.addColSlotInfo(slots_for_target);
-  }
-  query_mem_desc.setEntryCount(query_mem_desc.getMaxVal() - query_mem_desc.getMinVal() +
-                               1);
-  return query_mem_desc;
-}
-
-QueryMemoryDescriptor perfect_hash_two_col_desc(
-    const std::vector<TargetInfo>& target_infos,
-    const int8_t num_bytes) {
-  QueryMemoryDescriptor query_mem_desc(
-      QueryDescriptionType::GroupByPerfectHash, 0, 36, false, {8, 8});
-  for (const auto& target_info : target_infos) {
-    const auto slot_bytes =
-        std::max(num_bytes, static_cast<int8_t>(target_info.sql_type.get_size()));
-    std::vector<std::tuple<int8_t, int8_t>> slots_for_target;
-    if (target_info.agg_kind == kAVG) {
-      CHECK(target_info.is_agg);
-      slots_for_target.emplace_back(std::make_tuple(slot_bytes, slot_bytes));
-    }
-    slots_for_target.emplace_back(std::make_tuple(slot_bytes, slot_bytes));
-    query_mem_desc.addColSlotInfo(slots_for_target);
-  }
-  query_mem_desc.setEntryCount(query_mem_desc.getMaxVal());
-  return query_mem_desc;
-}
-
-QueryMemoryDescriptor baseline_hash_two_col_desc_large(
-    const std::vector<TargetInfo>& target_infos,
-    const int8_t num_bytes) {
-  QueryMemoryDescriptor query_mem_desc(
-      QueryDescriptionType::GroupByBaselineHash, 0, 19, false, {8, 8});
-  for (const auto& target_info : target_infos) {
-    const auto slot_bytes =
-        std::max(num_bytes, static_cast<int8_t>(target_info.sql_type.get_size()));
-    std::vector<std::tuple<int8_t, int8_t>> slots_for_target;
-    if (target_info.agg_kind == kAVG) {
-      CHECK(target_info.is_agg);
-      slots_for_target.emplace_back(std::make_tuple(slot_bytes, slot_bytes));
-    }
-    slots_for_target.emplace_back(std::make_tuple(slot_bytes, slot_bytes));
-    query_mem_desc.addColSlotInfo(slots_for_target);
-  }
-  query_mem_desc.setEntryCount(query_mem_desc.getMaxVal() - query_mem_desc.getMinVal() +
-                               1);
-  return query_mem_desc;
-}
-
-QueryMemoryDescriptor baseline_hash_two_col_desc(
-    const std::vector<TargetInfo>& target_infos,
-    const int8_t num_bytes) {
-  QueryMemoryDescriptor query_mem_desc(
-      QueryDescriptionType::GroupByBaselineHash, 0, 3, false, {8, 8});
-  for (const auto& target_info : target_infos) {
-    const auto slot_bytes =
-        std::max(num_bytes, static_cast<int8_t>(target_info.sql_type.get_size()));
-    std::vector<std::tuple<int8_t, int8_t>> slots_for_target;
-    if (target_info.agg_kind == kAVG) {
-      CHECK(target_info.is_agg);
-      slots_for_target.emplace_back(std::make_tuple(slot_bytes, slot_bytes));
-    }
-    slots_for_target.emplace_back(std::make_tuple(slot_bytes, slot_bytes));
-    query_mem_desc.addColSlotInfo(slots_for_target);
-  }
-  query_mem_desc.setEntryCount(query_mem_desc.getMaxVal() - query_mem_desc.getMinVal() +
-                               1);
-  return query_mem_desc;
-}
-
-template <class T>
-const T* vptr(const TargetValue& r) {
-  auto scalar_r = boost::get<ScalarTargetValue>(&r);
-  CHECK(scalar_r);
-  return boost::get<T>(scalar_r);
-}
 
 using OneRow = std::vector<TargetValue>;
 
@@ -886,30 +345,18 @@ void ResultSetEmulator::rse_fill_storage_buffer_perfect_hash_colwise(
       if (rs_groups[i]) {
         // const auto v = generator.getNextValue();
         rs_values[i] = v;
-        if (rs_flow == 2) {               // null_val test-cases
-          if (i >= rs_entry_count - 4) {  // only the last four rows of RS #1 and RS #2
-                                          // exersized for null_val test
-            rs_values[i] = -1;
-            fill_one_entry_one_col(
-                col_entry_ptr,
-                col_bytes,
-                ptr2,
-                rs_query_mem_desc.getPaddedSlotWidthBytes(slot_idx + 1),
-                v,
-                target_info,
-                false,
-                true);
-          } else {
-            fill_one_entry_one_col(
-                col_entry_ptr,
-                col_bytes,
-                ptr2,
-                rs_query_mem_desc.getPaddedSlotWidthBytes(slot_idx + 1),
-                v,
-                target_info,
-                false,
-                false);
-          }
+        if (rs_flow == 2 &&             // null_val test-cases
+            i >= rs_entry_count - 4) {  // only the last four rows of RS #1 and RS #2
+                                        // exersized for null_val test
+          rs_values[i] = -1;
+          fill_one_entry_one_col(col_entry_ptr,
+                                 col_bytes,
+                                 ptr2,
+                                 rs_query_mem_desc.getPaddedSlotWidthBytes(slot_idx + 1),
+                                 v,
+                                 target_info,
+                                 false,
+                                 true);
         } else {
           fill_one_entry_one_col(col_entry_ptr,
                                  col_bytes,
@@ -1118,8 +565,7 @@ void ResultSetEmulator::rse_fill_storage_buffer_baseline_rowwise(
                                          &key[0],
                                          key.size(),
                                          sizeof(int64_t),
-                                         key_component_count + target_slot_count,
-                                         nullptr);
+                                         key_component_count + target_slot_count);
       CHECK(value_slots);
       if ((rs_flow == 2) &&
           (i >= rs_entry_count - 4)) {  // null_val test-cases: last four rows
@@ -1322,15 +768,14 @@ int64_t ResultSetEmulator::rseAggregateKMAX(size_t i) {
 }
 
 int64_t ResultSetEmulator::rseAggregateKAVG(size_t i) {
-  int64_t result = 0;
+  double result = 0;
   int n1 = 1,
       n2 = 1;  // for test purposes count of elements in each group is 1 (see proc
                // "fill_one_entry_no_collisions")
 
   if (rs1_groups[i] && rs2_groups[i]) {
     if ((rs1_values[i] == -1) && (rs2_values[i] == -1)) {
-      // return rse_get_null_val();
-      return result;
+      return shared::reinterpret_bits<int64_t>(NULL_DOUBLE);
     }
     int n = 0;
     if (rs1_values[i] != -1) {
@@ -1345,7 +790,7 @@ int64_t ResultSetEmulator::rseAggregateKAVG(size_t i) {
       result /= n;
     }
   } else {
-    // result = rse_get_null_val();
+    result = NULL_DOUBLE;
     if (rs1_groups[i]) {
       if (rs1_values[i] != -1) {
         result = rs1_values[i] / n1;
@@ -1359,7 +804,7 @@ int64_t ResultSetEmulator::rseAggregateKAVG(size_t i) {
     }
   }
 
-  return result;
+  return shared::reinterpret_bits<int64_t>(result);
 }
 
 int64_t ResultSetEmulator::rseAggregateKSUM(size_t i) {
@@ -1423,21 +868,25 @@ int64_t ResultSetEmulator::rseAggregateKCOUNT(size_t i) {
   return result;
 }
 
-bool approx_eq(const double v, const double target, const double eps = 0.01) {
+constexpr double EPS = 0.01;
+
+bool approx_eq(const double v, const double target, const double eps = EPS) {
   return target - eps < v && v < target + eps;
 }
 
+DictRef invalid_dict_ref{DictRef::InvalidDictRef()};
 std::shared_ptr<StringDictionary> g_sd =
-    std::make_shared<StringDictionary>("", false, true);
+    std::make_shared<StringDictionary>(invalid_dict_ref, "", false, true);
 
 void test_iterate(const std::vector<TargetInfo>& target_infos,
                   const QueryMemoryDescriptor& query_mem_desc) {
   SQLTypeInfo double_ti(kDOUBLE, false);
-  auto row_set_mem_owner = std::make_shared<RowSetMemoryOwner>();
+  auto row_set_mem_owner = std::make_shared<RowSetMemoryOwner>(
+      Executor::getArenaBlockSize(), Executor::UNITARY_EXECUTOR_ID);
   StringDictionaryProxy* sdp =
-      row_set_mem_owner->addStringDict(g_sd, 1, g_sd->storageEntryCount());
+      row_set_mem_owner->addStringDict(g_sd, {0, 1}, g_sd->storageEntryCount());
   ResultSet result_set(
-      target_infos, ExecutorDeviceType::CPU, query_mem_desc, row_set_mem_owner, nullptr);
+      target_infos, ExecutorDeviceType::CPU, query_mem_desc, row_set_mem_owner, 0, 0);
   for (size_t i = 0; i < query_mem_desc.getEntryCount(); ++i) {
     sdp->getOrAddTransient(std::to_string(i));
   }
@@ -1456,6 +905,7 @@ void test_iterate(const std::vector<TargetInfo>& target_infos,
       const auto& target_info = target_infos[i];
       const auto& ti = target_info.agg_kind == kAVG ? double_ti : target_info.sql_type;
       switch (ti.get_type()) {
+        case kTINYINT:
         case kSMALLINT:
         case kINT:
         case kBIGINT: {
@@ -1465,7 +915,7 @@ void test_iterate(const std::vector<TargetInfo>& target_infos,
         }
         case kDOUBLE: {
           const auto dval = v<double>(row[i]);
-          ASSERT_TRUE(approx_eq(static_cast<double>(ref_val), dval));
+          ASSERT_NEAR(ref_val, dval, EPS);
           break;
         }
         case kTEXT: {
@@ -1494,6 +944,7 @@ std::vector<TargetInfo> generate_test_target_infos() {
     SQLTypeInfo dict_string_ti(kTEXT, false);
     dict_string_ti.set_compression(kENCODING_DICT);
     dict_string_ti.set_comp_param(1);
+    dict_string_ti.setStringDictKey({0, 1});
     target_infos.push_back(TargetInfo{false, kMIN, dict_string_ti, null_ti, true, false});
   }
   return target_infos;
@@ -1515,7 +966,6 @@ std::vector<TargetInfo> generate_random_groups_target_infos() {
 std::vector<TargetInfo> generate_random_groups_nullable_target_infos() {
   std::vector<TargetInfo> target_infos;
   SQLTypeInfo int_ti(kINT, false);
-  // SQLTypeInfo null_ti(kNULLT, false);
   SQLTypeInfo double_ti(kDOUBLE, false);
   target_infos.push_back(TargetInfo{true, kMIN, int_ti, int_ti, true, false});
   target_infos.push_back(TargetInfo{true, kMAX, int_ti, int_ti, true, false});
@@ -1528,7 +978,7 @@ std::vector<TargetInfo> generate_random_groups_nullable_target_infos() {
 std::vector<OneRow> get_rows_sorted_by_col(ResultSet& rs, const size_t col_idx) {
   std::list<Analyzer::OrderEntry> order_entries;
   order_entries.emplace_back(1, false, false);
-  rs.sort(order_entries, 0);
+  rs.sort(order_entries, 0, ExecutorDeviceType::CPU, nullptr);
   std::vector<OneRow> result;
 
   while (true) {
@@ -1541,69 +991,118 @@ std::vector<OneRow> get_rows_sorted_by_col(ResultSet& rs, const size_t col_idx) 
   return result;
 }
 
-void test_reduce(const std::vector<TargetInfo>& target_infos,
-                 const QueryMemoryDescriptor& query_mem_desc,
-                 NumberGenerator& generator1,
-                 NumberGenerator& generator2,
-                 const int step) {
-  SQLTypeInfo double_ti(kDOUBLE, false);
+#ifndef HAVE_TSAN
+void run_reduction(const std::vector<TargetInfo>& target_infos,
+                   const QueryMemoryDescriptor& query_mem_desc,
+                   NumberGenerator& generator1,
+                   NumberGenerator& generator2,
+                   const int step) {
   const ResultSetStorage* storage1{nullptr};
   const ResultSetStorage* storage2{nullptr};
-  const auto row_set_mem_owner = std::make_shared<RowSetMemoryOwner>();
-  row_set_mem_owner->addStringDict(g_sd, 1, g_sd->storageEntryCount());
+  const auto row_set_mem_owner = std::make_shared<RowSetMemoryOwner>(
+      Executor::getArenaBlockSize(), Executor::UNITARY_EXECUTOR_ID);
+  row_set_mem_owner->addStringDict(g_sd, {1, 1}, g_sd->storageEntryCount());
   const auto rs1 = std::make_unique<ResultSet>(
-      target_infos, ExecutorDeviceType::CPU, query_mem_desc, row_set_mem_owner, nullptr);
+      target_infos, ExecutorDeviceType::CPU, query_mem_desc, row_set_mem_owner, 0, 0);
   storage1 = rs1->allocateStorage();
   fill_storage_buffer(
       storage1->getUnderlyingBuffer(), target_infos, query_mem_desc, generator1, step);
   const auto rs2 = std::make_unique<ResultSet>(
-      target_infos, ExecutorDeviceType::CPU, query_mem_desc, row_set_mem_owner, nullptr);
+      target_infos, ExecutorDeviceType::CPU, query_mem_desc, row_set_mem_owner, 0, 0);
   storage2 = rs2->allocateStorage();
   fill_storage_buffer(
       storage2->getUnderlyingBuffer(), target_infos, query_mem_desc, generator2, step);
   ResultSetManager rs_manager;
   std::vector<ResultSet*> storage_set{rs1.get(), rs2.get()};
-  auto result_rs = rs_manager.reduce(storage_set);
-  int64_t ref_val{0};
-  std::list<Analyzer::OrderEntry> order_entries;
-  order_entries.emplace_back(1, false, false);
-  result_rs->sort(order_entries, 0);
-  while (true) {
-    const auto row = result_rs->getNextRow(false, false);
-    if (row.empty()) {
-      break;
-    }
-    CHECK_EQ(target_infos.size(), row.size());
-    for (size_t i = 0; i < target_infos.size(); ++i) {
-      const auto& target_info = target_infos[i];
-      const auto& ti = target_info.agg_kind == kAVG ? double_ti : target_info.sql_type;
-      switch (ti.get_type()) {
-        case kSMALLINT:
-        case kINT:
-        case kBIGINT: {
-          const auto ival = v<int64_t>(row[i]);
-          ASSERT_EQ((target_info.agg_kind == kSUM || target_info.agg_kind == kCOUNT)
-                        ? step * ref_val
-                        : ref_val,
-                    ival);
-          break;
-        }
-        case kDOUBLE: {
-          const auto dval = v<double>(row[i]);
-          ASSERT_TRUE(approx_eq(static_cast<double>((target_info.agg_kind == kSUM ||
-                                                     target_info.agg_kind == kCOUNT)
-                                                        ? step * ref_val
-                                                        : ref_val),
-                                dval));
-          break;
-        }
-        case kTEXT:
-          break;
-        default:
-          CHECK(false);
-      }
-    }
-    ref_val += step;
+  rs_manager.reduce(storage_set, Executor::UNITARY_EXECUTOR_ID);
+}
+#endif
+
+void test_reduce(const std::vector<TargetInfo>& target_infos,
+                 const QueryMemoryDescriptor& query_mem_desc,
+                 NumberGenerator& generator1,
+                 NumberGenerator& generator2,
+                 const int step,
+                 const bool sort) {
+  const ResultSetStorage* storage1{nullptr};
+  const ResultSetStorage* storage2{nullptr};
+  const auto row_set_mem_owner = std::make_shared<RowSetMemoryOwner>(
+      Executor::getArenaBlockSize(), Executor::UNITARY_EXECUTOR_ID);
+  row_set_mem_owner->addStringDict(g_sd, {1, 1}, g_sd->storageEntryCount());
+  const auto rs1 = std::make_unique<ResultSet>(
+      target_infos, ExecutorDeviceType::CPU, query_mem_desc, row_set_mem_owner, 0, 0);
+  storage1 = rs1->allocateStorage();
+  fill_storage_buffer(
+      storage1->getUnderlyingBuffer(), target_infos, query_mem_desc, generator1, step);
+  const auto rs2 = std::make_unique<ResultSet>(
+      target_infos, ExecutorDeviceType::CPU, query_mem_desc, row_set_mem_owner, 0, 0);
+  storage2 = rs2->allocateStorage();
+  fill_storage_buffer(
+      storage2->getUnderlyingBuffer(), target_infos, query_mem_desc, generator2, step);
+  ResultSetManager rs_manager;
+  std::vector<ResultSet*> storage_set{rs1.get(), rs2.get()};
+  auto result_rs = rs_manager.reduce(storage_set, Executor::UNITARY_EXECUTOR_ID);
+
+  if (sort) {
+    std::list<Analyzer::OrderEntry> order_entries;
+    order_entries.emplace_back(1, false, false);
+    result_rs->sort(order_entries, 0, ExecutorDeviceType::CPU, nullptr);
+  }
+  const size_t thread_count = cpu_threads();
+  const auto row_count = result_rs->rowCount();
+  std::vector<std::future<void>> reduction_threads;
+  for (size_t thread_idx = 0; thread_idx < thread_count; ++thread_idx) {
+    const auto thread_row_count = (row_count + thread_count - 1) / thread_count;
+    const auto start_index = thread_idx * thread_row_count;
+    const auto end_index = std::min(start_index + thread_row_count, row_count);
+    reduction_threads.emplace_back(std::async(
+        std::launch::async, [start_index, end_index, result_rs, &target_infos, step] {
+          SQLTypeInfo double_ti(kDOUBLE, false);
+
+          for (size_t row_idx = start_index; row_idx < end_index; ++row_idx) {
+            const auto row = result_rs->getRowAtNoTranslations(row_idx);
+            if (row.empty()) {
+              continue;
+            }
+            ASSERT_EQ(target_infos.size(), row.size());
+
+            for (size_t i = 0; i < target_infos.size(); ++i) {
+              const auto& target_info = target_infos[i];
+              const auto& ti =
+                  target_info.agg_kind == kAVG ? double_ti : target_info.sql_type;
+              switch (ti.get_type()) {
+                case kTINYINT:
+                case kSMALLINT:
+                case kINT:
+                case kBIGINT: {
+                  const auto ival = v<int64_t>(row[i]);
+                  const int64_t ref =
+                      (target_info.agg_kind == kSUM || target_info.agg_kind == kCOUNT)
+                          ? step * row_idx
+                          : row_idx;
+                  ASSERT_EQ(ref, ival);
+                  break;
+                }
+                case kDOUBLE: {
+                  const auto dval = v<double>(row[i]);
+                  ASSERT_DOUBLE_EQ(static_cast<double>((target_info.agg_kind == kSUM ||
+                                                        target_info.agg_kind == kCOUNT)
+                                                           ? step * row_idx
+                                                           : row_idx),
+                                   dval);
+                  break;
+                }
+                case kTEXT:
+                  break;
+                default:
+                  CHECK(false);
+              }
+            }
+          }
+        }));
+  }
+  for (auto& t : reduction_threads) {
+    t.get();
   }
 }
 
@@ -1620,20 +1119,23 @@ void test_reduce_random_groups(const std::vector<TargetInfo>& target_infos,
   const ResultSetStorage* storage2{nullptr};
   std::unique_ptr<ResultSet> rs1;
   std::unique_ptr<ResultSet> rs2;
-  const auto row_set_mem_owner = std::make_shared<RowSetMemoryOwner>();
+  const auto row_set_mem_owner = std::make_shared<RowSetMemoryOwner>(
+      Executor::getArenaBlockSize(), Executor::UNITARY_EXECUTOR_ID);
   switch (query_mem_desc.getQueryDescriptionType()) {
     case QueryDescriptionType::GroupByPerfectHash: {
       rs1.reset(new ResultSet(target_infos,
                               ExecutorDeviceType::CPU,
                               query_mem_desc,
                               row_set_mem_owner,
-                              nullptr));
+                              0,
+                              0));
       storage1 = rs1->allocateStorage();
       rs2.reset(new ResultSet(target_infos,
                               ExecutorDeviceType::CPU,
                               query_mem_desc,
                               row_set_mem_owner,
-                              nullptr));
+                              0,
+                              0));
       storage2 = rs2->allocateStorage();
       break;
     }
@@ -1642,13 +1144,15 @@ void test_reduce_random_groups(const std::vector<TargetInfo>& target_infos,
                               ExecutorDeviceType::CPU,
                               query_mem_desc,
                               row_set_mem_owner,
-                              nullptr));
+                              0,
+                              0));
       storage1 = rs1->allocateStorage();
       rs2.reset(new ResultSet(target_infos,
                               ExecutorDeviceType::CPU,
                               query_mem_desc,
                               row_set_mem_owner,
-                              nullptr));
+                              0,
+                              0));
       storage2 = rs2->allocateStorage();
       break;
     }
@@ -1672,7 +1176,7 @@ void test_reduce_random_groups(const std::vector<TargetInfo>& target_infos,
 
   ResultSetManager rs_manager;
   std::vector<ResultSet*> storage_set{rs1.get(), rs2.get()};
-  auto result_rs = rs_manager.reduce(storage_set);
+  auto result_rs = rs_manager.reduce(storage_set, Executor::UNITARY_EXECUTOR_ID);
   std::queue<std::vector<int64_t>> ref_table = rse->getReferenceTable();
   std::vector<bool> ref_group_map = rse->getReferenceGroupMap();
   const auto result = get_rows_sorted_by_col(*result_rs, 0);
@@ -1796,7 +1300,7 @@ void test_reduce_random_groups(const std::vector<TargetInfo>& target_infos,
             case kMIN: {
               if (!silent) {
                 p_tag += "KMIN_D";
-                printf("\nKMIN_D row_idx = %i, ref_val = %f, dval = %f",
+                printf("\nKMIN_D row_idx = %i, ref_val = %e, dval = %e",
                        static_cast<int>(row_idx),
                        static_cast<double>(ref_val),
                        dval);
@@ -1806,14 +1310,14 @@ void test_reduce_random_groups(const std::vector<TargetInfo>& target_infos,
                   printf("%5s%s%s", "", p_tag.c_str(), " TEST PASSED!\n");
                 }
               } else {
-                ASSERT_TRUE(approx_eq(static_cast<double>(ref_val), dval));
+                ASSERT_NEAR(ref_val, dval, EPS) << p_tag << ' ' << row_idx;
               }
               break;
             }
             case kMAX: {
               if (!silent) {
                 p_tag += "KMAX_D";
-                printf("\n%s row_idx = %i, ref_val = %f, dval = %f",
+                printf("\n%s row_idx = %i, ref_val = %e, dval = %e",
                        p_tag.c_str(),
                        static_cast<int>(row_idx),
                        static_cast<double>(ref_val),
@@ -1824,25 +1328,30 @@ void test_reduce_random_groups(const std::vector<TargetInfo>& target_infos,
                   printf("%5s%s%s", "", p_tag.c_str(), " TEST PASSED!\n");
                 }
               } else {
-                ASSERT_TRUE(approx_eq(static_cast<double>(ref_val), dval));
+                ASSERT_NEAR(ref_val, dval, EPS) << p_tag << ' ' << row_idx;
               }
               break;
             }
             case kAVG: {
               if (!silent) {
                 p_tag += "KAVG_D";
-                printf("\n%s row_idx = %i, ref_val = %f, dval = %f",
+                printf("\n%s row_idx = %i, ref_val = %e, dval = %e",
                        p_tag.c_str(),
                        static_cast<int>(row_idx),
-                       static_cast<double>(ref_val),
+                       shared::reinterpret_bits<double>(ref_val),
                        dval);
-                if (!approx_eq(static_cast<double>(ref_val), dval)) {
+                if (!approx_eq(shared::reinterpret_bits<double>(ref_val), dval)) {
                   printf("%5s%s%s", "", p_tag.c_str(), " TEST FAILED!\n");
                 } else {
                   printf("%5s%s%s", "", p_tag.c_str(), " TEST PASSED!\n");
                 }
               } else {
-                ASSERT_TRUE(approx_eq(static_cast<double>(ref_val), dval));
+                ASSERT_NEAR(shared::reinterpret_bits<double>(ref_val), dval, EPS)
+                    << p_tag << ' ' << row_idx;
+                if (dval == NULL_DOUBLE) {
+                  ASSERT_EQ(shared::reinterpret_bits<double>(ref_val), dval)
+                      << p_tag << ' ' << row_idx;
+                }
               }
               break;
             }
@@ -1850,7 +1359,7 @@ void test_reduce_random_groups(const std::vector<TargetInfo>& target_infos,
             case kCOUNT: {
               if (!silent) {
                 p_tag += "KSUM_D";
-                printf("\n%s row_idx = %i, ref_val = %f, dval = %f",
+                printf("\n%s row_idx = %i, ref_val = %e, dval = %e",
                        p_tag.c_str(),
                        (int)row_idx,
                        (double)ref_val,
@@ -1861,7 +1370,7 @@ void test_reduce_random_groups(const std::vector<TargetInfo>& target_infos,
                   printf("%5s%s%s", "", p_tag.c_str(), " TEST PASSED!\n");
                 }
               } else {
-                ASSERT_TRUE(approx_eq(static_cast<double>(ref_val), dval));
+                ASSERT_NEAR(ref_val, dval, EPS) << p_tag << ' ' << row_idx;
               }
               break;
             }
@@ -1907,6 +1416,34 @@ TEST(Iterate, PerfectHashOneColColumnar32) {
   test_iterate(target_infos, query_mem_desc);
 }
 
+TEST(Iterate, PerfectHashOneColColumnar16) {
+  std::vector<int8_t> group_column_widths{8};
+  const int8_t suggested_agg_width = 2;
+  const auto target_infos = generate_custom_agg_target_infos(
+      group_column_widths,
+      {kMAX, kMIN, kCOUNT, kSUM, kAVG},
+      {kSMALLINT, kSMALLINT, kINT, kINT, kDOUBLE},
+      {kSMALLINT, kSMALLINT, kSMALLINT, kSMALLINT, kSMALLINT});
+  auto query_mem_desc = perfect_hash_one_col_desc(
+      target_infos, suggested_agg_width, 0, 99, group_column_widths);
+  query_mem_desc.setOutputColumnar(true);
+  test_iterate(target_infos, query_mem_desc);
+}
+
+TEST(Iterate, PerfectHashOneColColumnar8) {
+  std::vector<int8_t> group_column_widths{8};
+  const int8_t suggested_agg_width = 1;
+  const auto target_infos = generate_custom_agg_target_infos(
+      group_column_widths,
+      {kMAX, kMIN, kCOUNT, kSUM, kAVG},
+      {kTINYINT, kTINYINT, kINT, kINT, kDOUBLE},
+      {kTINYINT, kTINYINT, kTINYINT, kTINYINT, kTINYINT});
+  auto query_mem_desc = perfect_hash_one_col_desc(
+      target_infos, suggested_agg_width, 0, 99, group_column_widths);
+  query_mem_desc.setOutputColumnar(true);
+  test_iterate(target_infos, query_mem_desc);
+}
+
 TEST(Iterate, PerfectHashOneColKeyless) {
   const auto target_infos = generate_test_target_infos();
   auto query_mem_desc = perfect_hash_one_col_desc(target_infos, 8, 0, 99);
@@ -1935,6 +1472,38 @@ TEST(Iterate, PerfectHashOneColColumnarKeyless) {
 TEST(Iterate, PerfectHashOneColColumnarKeyless32) {
   const auto target_infos = generate_test_target_infos();
   auto query_mem_desc = perfect_hash_one_col_desc(target_infos, 4, 0, 99);
+  query_mem_desc.setOutputColumnar(true);
+  query_mem_desc.setHasKeylessHash(true);
+  query_mem_desc.setTargetIdxForKey(2);
+  test_iterate(target_infos, query_mem_desc);
+}
+
+TEST(Iterate, PerfectHashOneColColumnarKeyless16) {
+  std::vector<int8_t> group_column_widths{8};
+  const int8_t suggested_agg_width = 2;
+  const auto target_infos = generate_custom_agg_target_infos(
+      group_column_widths,
+      {kAVG, kSUM, kMIN, kCOUNT, kMAX},
+      {kDOUBLE, kINT, kSMALLINT, kINT, kSMALLINT},
+      {kSMALLINT, kSMALLINT, kSMALLINT, kSMALLINT, kSMALLINT});
+  auto query_mem_desc =
+      perfect_hash_one_col_desc(target_infos, suggested_agg_width, 0, 99);
+  query_mem_desc.setOutputColumnar(true);
+  query_mem_desc.setHasKeylessHash(true);
+  query_mem_desc.setTargetIdxForKey(2);
+  test_iterate(target_infos, query_mem_desc);
+}
+
+TEST(Iterate, PerfectHashOneColColumnarKeyless8) {
+  std::vector<int8_t> group_column_widths{8};
+  const int8_t suggested_agg_width = 1;
+  const auto target_infos = generate_custom_agg_target_infos(
+      group_column_widths,
+      {kAVG, kSUM, kMIN, kCOUNT, kMAX},
+      {kDOUBLE, kINT, kTINYINT, kINT, kTINYINT},
+      {kTINYINT, kTINYINT, kTINYINT, kTINYINT, kTINYINT});
+  auto query_mem_desc =
+      perfect_hash_one_col_desc(target_infos, suggested_agg_width, 0, 99);
   query_mem_desc.setOutputColumnar(true);
   query_mem_desc.setHasKeylessHash(true);
   query_mem_desc.setTargetIdxForKey(2);
@@ -2019,7 +1588,7 @@ TEST(Reduce, PerfectHashOneCol) {
   const auto query_mem_desc = perfect_hash_one_col_desc(target_infos, 8, 0, 99);
   EvenNumberGenerator generator1;
   EvenNumberGenerator generator2;
-  test_reduce(target_infos, query_mem_desc, generator1, generator2, 2);
+  test_reduce(target_infos, query_mem_desc, generator1, generator2, 2, false);
 }
 
 TEST(Reduce, PerfectHashOneCol32) {
@@ -2027,7 +1596,7 @@ TEST(Reduce, PerfectHashOneCol32) {
   const auto query_mem_desc = perfect_hash_one_col_desc(target_infos, 4, 0, 99);
   EvenNumberGenerator generator1;
   EvenNumberGenerator generator2;
-  test_reduce(target_infos, query_mem_desc, generator1, generator2, 2);
+  test_reduce(target_infos, query_mem_desc, generator1, generator2, 2, false);
 }
 
 TEST(Reduce, PerfectHashOneColColumnar) {
@@ -2036,7 +1605,7 @@ TEST(Reduce, PerfectHashOneColColumnar) {
   query_mem_desc.setOutputColumnar(true);
   EvenNumberGenerator generator1;
   EvenNumberGenerator generator2;
-  test_reduce(target_infos, query_mem_desc, generator1, generator2, 2);
+  test_reduce(target_infos, query_mem_desc, generator1, generator2, 2, false);
 }
 
 TEST(Reduce, PerfectHashOneColColumnar32) {
@@ -2045,7 +1614,39 @@ TEST(Reduce, PerfectHashOneColColumnar32) {
   query_mem_desc.setOutputColumnar(true);
   EvenNumberGenerator generator1;
   EvenNumberGenerator generator2;
-  test_reduce(target_infos, query_mem_desc, generator1, generator2, 2);
+  test_reduce(target_infos, query_mem_desc, generator1, generator2, 2, false);
+}
+
+TEST(Reduce, PerfectHashOneColColumnar16) {
+  std::vector<int8_t> group_column_widths{8};
+  const int8_t suggested_agg_width = 2;
+  const auto target_infos = generate_custom_agg_target_infos(
+      group_column_widths,
+      {kMAX, kMIN, kCOUNT, kSUM, kAVG},
+      {kSMALLINT, kSMALLINT, kINT, kBIGINT, kDOUBLE},
+      {kSMALLINT, kSMALLINT, kSMALLINT, kSMALLINT, kSMALLINT});
+  auto query_mem_desc = perfect_hash_one_col_desc(
+      target_infos, suggested_agg_width, 0, 99, group_column_widths);
+  query_mem_desc.setOutputColumnar(true);
+  EvenNumberGenerator generator1;
+  EvenNumberGenerator generator2;
+  test_reduce(target_infos, query_mem_desc, generator1, generator2, 2, false);
+}
+
+TEST(Reduce, PerfectHashOneColColumnar8) {
+  std::vector<int8_t> group_column_widths{8};
+  const int8_t suggested_agg_width = 1;
+  const auto target_infos = generate_custom_agg_target_infos(
+      group_column_widths,
+      {kMAX, kMIN, kCOUNT, kSUM, kAVG},
+      {kTINYINT, kTINYINT, kINT, kBIGINT, kDOUBLE},
+      {kTINYINT, kTINYINT, kTINYINT, kTINYINT, kTINYINT});
+  auto query_mem_desc = perfect_hash_one_col_desc(
+      target_infos, suggested_agg_width, 0, 99, group_column_widths);
+  query_mem_desc.setOutputColumnar(true);
+  EvenNumberGenerator generator1;
+  EvenNumberGenerator generator2;
+  test_reduce(target_infos, query_mem_desc, generator1, generator2, 2, false);
 }
 
 TEST(Reduce, PerfectHashOneColKeyless) {
@@ -2055,7 +1656,7 @@ TEST(Reduce, PerfectHashOneColKeyless) {
   query_mem_desc.setTargetIdxForKey(2);
   EvenNumberGenerator generator1;
   EvenNumberGenerator generator2;
-  test_reduce(target_infos, query_mem_desc, generator1, generator2, 2);
+  test_reduce(target_infos, query_mem_desc, generator1, generator2, 2, false);
 }
 
 TEST(Reduce, PerfectHashOneColKeyless32) {
@@ -2065,7 +1666,7 @@ TEST(Reduce, PerfectHashOneColKeyless32) {
   query_mem_desc.setTargetIdxForKey(2);
   EvenNumberGenerator generator1;
   EvenNumberGenerator generator2;
-  test_reduce(target_infos, query_mem_desc, generator1, generator2, 2);
+  test_reduce(target_infos, query_mem_desc, generator1, generator2, 2, false);
 }
 
 TEST(Reduce, PerfectHashOneColColumnarKeyless) {
@@ -2076,7 +1677,7 @@ TEST(Reduce, PerfectHashOneColColumnarKeyless) {
   query_mem_desc.setTargetIdxForKey(2);
   EvenNumberGenerator generator1;
   EvenNumberGenerator generator2;
-  test_reduce(target_infos, query_mem_desc, generator1, generator2, 2);
+  test_reduce(target_infos, query_mem_desc, generator1, generator2, 2, false);
 }
 
 TEST(Reduce, PerfectHashOneColColumnarKeyless32) {
@@ -2087,7 +1688,43 @@ TEST(Reduce, PerfectHashOneColColumnarKeyless32) {
   query_mem_desc.setTargetIdxForKey(2);
   EvenNumberGenerator generator1;
   EvenNumberGenerator generator2;
-  test_reduce(target_infos, query_mem_desc, generator1, generator2, 2);
+  test_reduce(target_infos, query_mem_desc, generator1, generator2, 2, false);
+}
+
+TEST(Reduce, PerfectHashOneColColumnarKeyless16) {
+  std::vector<int8_t> group_column_widths{8};
+  const int8_t suggested_agg_width = 2;
+  const auto target_infos = generate_custom_agg_target_infos(
+      group_column_widths,
+      {kAVG, kSUM, kMIN, kCOUNT, kMAX},
+      {kDOUBLE, kINT, kSMALLINT, kINT, kSMALLINT},
+      {kSMALLINT, kSMALLINT, kSMALLINT, kSMALLINT, kSMALLINT});
+  auto query_mem_desc =
+      perfect_hash_one_col_desc(target_infos, suggested_agg_width, 0, 99);
+  query_mem_desc.setOutputColumnar(true);
+  query_mem_desc.setHasKeylessHash(true);
+  query_mem_desc.setTargetIdxForKey(2);
+  EvenNumberGenerator generator1;
+  EvenNumberGenerator generator2;
+  test_reduce(target_infos, query_mem_desc, generator1, generator2, 2, false);
+}
+
+TEST(Reduce, PerfectHashOneColColumnarKeyless8) {
+  std::vector<int8_t> group_column_widths{8};
+  const int8_t suggested_agg_width = 1;
+  const auto target_infos = generate_custom_agg_target_infos(
+      group_column_widths,
+      {kAVG, kSUM, kMIN, kCOUNT, kMAX},
+      {kDOUBLE, kINT, kTINYINT, kINT, kTINYINT},
+      {kTINYINT, kTINYINT, kTINYINT, kTINYINT, kTINYINT});
+  auto query_mem_desc =
+      perfect_hash_one_col_desc(target_infos, suggested_agg_width, 0, 99);
+  query_mem_desc.setOutputColumnar(true);
+  query_mem_desc.setHasKeylessHash(true);
+  query_mem_desc.setTargetIdxForKey(2);
+  EvenNumberGenerator generator1;
+  EvenNumberGenerator generator2;
+  test_reduce(target_infos, query_mem_desc, generator1, generator2, 2, false);
 }
 
 TEST(Reduce, PerfectHashTwoCol) {
@@ -2095,7 +1732,7 @@ TEST(Reduce, PerfectHashTwoCol) {
   const auto query_mem_desc = perfect_hash_two_col_desc(target_infos, 8);
   EvenNumberGenerator generator1;
   EvenNumberGenerator generator2;
-  test_reduce(target_infos, query_mem_desc, generator1, generator2, 2);
+  test_reduce(target_infos, query_mem_desc, generator1, generator2, 2, false);
 }
 
 TEST(Reduce, PerfectHashTwoCol32) {
@@ -2103,7 +1740,7 @@ TEST(Reduce, PerfectHashTwoCol32) {
   const auto query_mem_desc = perfect_hash_two_col_desc(target_infos, 4);
   EvenNumberGenerator generator1;
   EvenNumberGenerator generator2;
-  test_reduce(target_infos, query_mem_desc, generator1, generator2, 2);
+  test_reduce(target_infos, query_mem_desc, generator1, generator2, 2, false);
 }
 
 TEST(Reduce, PerfectHashTwoColColumnar) {
@@ -2112,7 +1749,7 @@ TEST(Reduce, PerfectHashTwoColColumnar) {
   query_mem_desc.setOutputColumnar(true);
   EvenNumberGenerator generator1;
   EvenNumberGenerator generator2;
-  test_reduce(target_infos, query_mem_desc, generator1, generator2, 2);
+  test_reduce(target_infos, query_mem_desc, generator1, generator2, 2, false);
 }
 
 TEST(Reduce, PerfectHashTwoColColumnar32) {
@@ -2121,7 +1758,7 @@ TEST(Reduce, PerfectHashTwoColColumnar32) {
   query_mem_desc.setOutputColumnar(true);
   EvenNumberGenerator generator1;
   EvenNumberGenerator generator2;
-  test_reduce(target_infos, query_mem_desc, generator1, generator2, 2);
+  test_reduce(target_infos, query_mem_desc, generator1, generator2, 2, false);
 }
 
 TEST(Reduce, PerfectHashTwoColKeyless) {
@@ -2131,7 +1768,7 @@ TEST(Reduce, PerfectHashTwoColKeyless) {
   query_mem_desc.setTargetIdxForKey(2);
   EvenNumberGenerator generator1;
   EvenNumberGenerator generator2;
-  test_reduce(target_infos, query_mem_desc, generator1, generator2, 2);
+  test_reduce(target_infos, query_mem_desc, generator1, generator2, 2, false);
 }
 
 TEST(Reduce, PerfectHashTwoColKeyless32) {
@@ -2141,7 +1778,7 @@ TEST(Reduce, PerfectHashTwoColKeyless32) {
   query_mem_desc.setTargetIdxForKey(2);
   EvenNumberGenerator generator1;
   EvenNumberGenerator generator2;
-  test_reduce(target_infos, query_mem_desc, generator1, generator2, 2);
+  test_reduce(target_infos, query_mem_desc, generator1, generator2, 2, false);
 }
 
 TEST(Reduce, PerfectHashTwoColColumnarKeyless) {
@@ -2152,7 +1789,7 @@ TEST(Reduce, PerfectHashTwoColColumnarKeyless) {
   query_mem_desc.setTargetIdxForKey(2);
   EvenNumberGenerator generator1;
   EvenNumberGenerator generator2;
-  test_reduce(target_infos, query_mem_desc, generator1, generator2, 2);
+  test_reduce(target_infos, query_mem_desc, generator1, generator2, 2, false);
 }
 
 TEST(Reduce, PerfectHashTwoColColumnarKeyless32) {
@@ -2163,7 +1800,7 @@ TEST(Reduce, PerfectHashTwoColColumnarKeyless32) {
   query_mem_desc.setTargetIdxForKey(2);
   EvenNumberGenerator generator1;
   EvenNumberGenerator generator2;
-  test_reduce(target_infos, query_mem_desc, generator1, generator2, 2);
+  test_reduce(target_infos, query_mem_desc, generator1, generator2, 2, false);
 }
 
 TEST(Reduce, BaselineHash) {
@@ -2171,7 +1808,7 @@ TEST(Reduce, BaselineHash) {
   const auto query_mem_desc = baseline_hash_two_col_desc(target_infos, 8);
   EvenNumberGenerator generator1;
   ReverseOddOrEvenNumberGenerator generator2(2 * query_mem_desc.getEntryCount() - 1);
-  test_reduce(target_infos, query_mem_desc, generator1, generator2, 1);
+  test_reduce(target_infos, query_mem_desc, generator1, generator2, 1, true);
 }
 
 TEST(Reduce, BaselineHashColumnar) {
@@ -2180,8 +1817,45 @@ TEST(Reduce, BaselineHashColumnar) {
   query_mem_desc.setOutputColumnar(true);
   EvenNumberGenerator generator1;
   ReverseOddOrEvenNumberGenerator generator2(2 * query_mem_desc.getEntryCount() - 1);
-  test_reduce(target_infos, query_mem_desc, generator1, generator2, 1);
+  test_reduce(target_infos, query_mem_desc, generator1, generator2, 1, true);
 }
+
+#ifndef HAVE_TSAN
+// The large buffers tests allocate too much memory to instrument under TSAN
+TEST(ReduceLargeBuffers, PerfectHashOne_Overflow32) {
+  const auto target_infos = generate_random_groups_nullable_target_infos();
+  auto query_mem_desc = perfect_hash_one_col_desc(target_infos, 8, 0, 222208903, {8});
+  EvenNumberGenerator gen1;
+  EvenNumberGenerator gen2;
+  test_reduce(target_infos, query_mem_desc, gen1, gen2, 2, false);
+}
+
+TEST(ReduceLargeBuffers, PerfectHashColumnarOne_Overflow32) {
+  const auto target_infos = generate_random_groups_nullable_target_infos();
+  auto query_mem_desc = perfect_hash_one_col_desc(target_infos, 8, 0, 222208903, {8});
+  query_mem_desc.setOutputColumnar(true);
+  EvenNumberGenerator gen1;
+  EvenNumberGenerator gen2;
+  test_reduce(target_infos, query_mem_desc, gen1, gen2, 2, false);
+}
+
+TEST(ReduceLargeBuffers, BaselineHash_Overflow32) {
+  const auto target_infos = generate_random_groups_nullable_target_infos();
+  auto query_mem_desc = baseline_hash_two_col_desc_overflow32(target_infos, 8);
+  EvenNumberGenerator gen1;
+  EvenNumberGenerator gen2;
+  run_reduction(target_infos, query_mem_desc, gen1, gen2, 2);
+}
+
+TEST(ReduceLargeBuffers, BaselineHashColumnar_Overflow32) {
+  const auto target_infos = generate_random_groups_nullable_target_infos();
+  auto query_mem_desc = baseline_hash_two_col_desc_overflow32(target_infos, 8);
+  query_mem_desc.setOutputColumnar(true);
+  EvenNumberGenerator gen1;
+  EvenNumberGenerator gen2;
+  run_reduction(target_infos, query_mem_desc, gen1, gen2, 2);
+}
+#endif
 
 TEST(MoreReduce, MissingValues) {
   std::vector<TargetInfo> target_infos;
@@ -2191,12 +1865,13 @@ TEST(MoreReduce, MissingValues) {
   target_infos.push_back(TargetInfo{true, kCOUNT, bigint_ti, null_ti, true, false});
   auto query_mem_desc = perfect_hash_one_col_desc(target_infos, 8, 7, 9);
   query_mem_desc.setHasKeylessHash(false);
-  const auto row_set_mem_owner = std::make_shared<RowSetMemoryOwner>();
+  const auto row_set_mem_owner = std::make_shared<RowSetMemoryOwner>(
+      Executor::getArenaBlockSize(), Executor::UNITARY_EXECUTOR_ID);
   const auto rs1 = std::make_unique<ResultSet>(
-      target_infos, ExecutorDeviceType::CPU, query_mem_desc, row_set_mem_owner, nullptr);
+      target_infos, ExecutorDeviceType::CPU, query_mem_desc, row_set_mem_owner, 0, 0);
   const auto storage1 = rs1->allocateStorage();
   const auto rs2 = std::make_unique<ResultSet>(
-      target_infos, ExecutorDeviceType::CPU, query_mem_desc, row_set_mem_owner, nullptr);
+      target_infos, ExecutorDeviceType::CPU, query_mem_desc, row_set_mem_owner, 0, 0);
   const auto storage2 = rs2->allocateStorage();
   {
     auto buff1 = reinterpret_cast<int64_t*>(storage1->getUnderlyingBuffer());
@@ -2222,7 +1897,12 @@ TEST(MoreReduce, MissingValues) {
     buff2[1 * 3 + 2] = 0;
     buff2[2 * 3 + 2] = 5;
   }
-  storage1->reduce(*storage2, {});
+  ResultSetReductionJIT reduction_jit(rs1->getQueryMemDesc(),
+                                      rs1->getTargetInfos(),
+                                      rs1->getTargetInitVals(),
+                                      Executor::UNITARY_EXECUTOR_ID);
+  const auto reduction_code = reduction_jit.codegen();
+  storage1->reduce(*storage2, {}, reduction_code, Executor::UNITARY_EXECUTOR_ID);
   {
     const auto row = rs1->getNextRow(false, false);
     CHECK_EQ(size_t(2), row.size());
@@ -2249,12 +1929,13 @@ TEST(MoreReduce, MissingValuesKeyless) {
   target_infos.push_back(TargetInfo{true, kCOUNT, bigint_ti, null_ti, true, false});
   auto query_mem_desc = perfect_hash_one_col_desc(target_infos, 8, 7, 9);
   query_mem_desc.setHasKeylessHash(true);
-  const auto row_set_mem_owner = std::make_shared<RowSetMemoryOwner>();
+  const auto row_set_mem_owner = std::make_shared<RowSetMemoryOwner>(
+      Executor::getArenaBlockSize(), Executor::UNITARY_EXECUTOR_ID);
   const auto rs1 = std::make_unique<ResultSet>(
-      target_infos, ExecutorDeviceType::CPU, query_mem_desc, row_set_mem_owner, nullptr);
+      target_infos, ExecutorDeviceType::CPU, query_mem_desc, row_set_mem_owner, 0, 0);
   const auto storage1 = rs1->allocateStorage();
   const auto rs2 = std::make_unique<ResultSet>(
-      target_infos, ExecutorDeviceType::CPU, query_mem_desc, row_set_mem_owner, nullptr);
+      target_infos, ExecutorDeviceType::CPU, query_mem_desc, row_set_mem_owner, 0, 0);
   const auto storage2 = rs2->allocateStorage();
   {
     auto buff1 = reinterpret_cast<int64_t*>(storage1->getUnderlyingBuffer());
@@ -2274,7 +1955,12 @@ TEST(MoreReduce, MissingValuesKeyless) {
     buff2[1 * 2 + 1] = 0;
     buff2[2 * 2 + 1] = 5;
   }
-  storage1->reduce(*storage2, {});
+  ResultSetReductionJIT reduction_jit(rs1->getQueryMemDesc(),
+                                      rs1->getTargetInfos(),
+                                      rs1->getTargetInitVals(),
+                                      Executor::UNITARY_EXECUTOR_ID);
+  const auto reduction_code = reduction_jit.codegen();
+  storage1->reduce(*storage2, {}, reduction_code, Executor::UNITARY_EXECUTOR_ID);
   {
     const auto row = rs1->getNextRow(false, false);
     CHECK_EQ(size_t(2), row.size());
@@ -2303,12 +1989,13 @@ TEST(MoreReduce, OffsetRewrite) {
   target_infos.push_back(TargetInfo{true, kSAMPLE, real_str_ti, null_ti, true, false});
   auto query_mem_desc = perfect_hash_one_col_desc(target_infos, 8, 7, 9);
   query_mem_desc.setHasKeylessHash(false);
-  const auto row_set_mem_owner = std::make_shared<RowSetMemoryOwner>();
+  const auto row_set_mem_owner = std::make_shared<RowSetMemoryOwner>(
+      Executor::getArenaBlockSize(), Executor::UNITARY_EXECUTOR_ID);
   const auto rs1 = std::make_unique<ResultSet>(
-      target_infos, ExecutorDeviceType::CPU, query_mem_desc, row_set_mem_owner, nullptr);
+      target_infos, ExecutorDeviceType::CPU, query_mem_desc, row_set_mem_owner, 0, 0);
   const auto storage1 = rs1->allocateStorage();
   const auto rs2 = std::make_unique<ResultSet>(
-      target_infos, ExecutorDeviceType::CPU, query_mem_desc, row_set_mem_owner, nullptr);
+      target_infos, ExecutorDeviceType::CPU, query_mem_desc, row_set_mem_owner, 0, 0);
   const auto storage2 = rs2->allocateStorage();
   std::vector<std::string> serialized_varlen_buffer{"foo", "bar", "hello"};
 
@@ -2344,7 +2031,13 @@ TEST(MoreReduce, OffsetRewrite) {
   }
 
   storage1->rewriteAggregateBufferOffsets(serialized_varlen_buffer);
-  storage1->reduce(*storage2, serialized_varlen_buffer);
+  ResultSetReductionJIT reduction_jit(rs1->getQueryMemDesc(),
+                                      rs1->getTargetInfos(),
+                                      rs1->getTargetInitVals(),
+                                      Executor::UNITARY_EXECUTOR_ID);
+  const auto reduction_code = reduction_jit.codegen();
+  storage1->reduce(
+      *storage2, serialized_varlen_buffer, reduction_code, Executor::UNITARY_EXECUTOR_ID);
   rs1->setSeparateVarlenStorageValid(true);
   {
     const auto row = rs1->getNextRow(false, false);
@@ -2391,12 +2084,13 @@ TEST(MoreReduce, OffsetRewriteGeo) {
 
   auto query_mem_desc = perfect_hash_one_col_desc(target_infos, 8, 7, 9);
   query_mem_desc.setHasKeylessHash(false);
-  const auto row_set_mem_owner = std::make_shared<RowSetMemoryOwner>();
+  const auto row_set_mem_owner = std::make_shared<RowSetMemoryOwner>(
+      Executor::getArenaBlockSize(), Executor::UNITARY_EXECUTOR_ID);
   const auto rs1 = std::make_unique<ResultSet>(
-      target_infos, ExecutorDeviceType::CPU, query_mem_desc, row_set_mem_owner, nullptr);
+      target_infos, ExecutorDeviceType::CPU, query_mem_desc, row_set_mem_owner, 0, 0);
   const auto storage1 = rs1->allocateStorage();
   const auto rs2 = std::make_unique<ResultSet>(
-      target_infos, ExecutorDeviceType::CPU, query_mem_desc, row_set_mem_owner, nullptr);
+      target_infos, ExecutorDeviceType::CPU, query_mem_desc, row_set_mem_owner, 0, 0);
   const auto storage2 = rs2->allocateStorage();
   std::vector<std::string> serialized_varlen_buffer{
       arr_to_byte_string(std::vector<double>{1, 1, 2, 2, 3, 3, 4, 4}),
@@ -2444,7 +2138,13 @@ TEST(MoreReduce, OffsetRewriteGeo) {
   }
 
   storage1->rewriteAggregateBufferOffsets(serialized_varlen_buffer);
-  storage1->reduce(*storage2, serialized_varlen_buffer);
+  ResultSetReductionJIT reduction_jit(rs1->getQueryMemDesc(),
+                                      rs1->getTargetInfos(),
+                                      rs1->getTargetInitVals(),
+                                      Executor::UNITARY_EXECUTOR_ID);
+  const auto reduction_code = reduction_jit.codegen();
+  storage1->reduce(
+      *storage2, serialized_varlen_buffer, reduction_code, Executor::UNITARY_EXECUTOR_ID);
   rs1->setGeoReturnType(ResultSet::GeoReturnType::WktString);
   rs1->setSeparateVarlenStorageValid(true);
   {
@@ -2487,12 +2187,13 @@ TEST(MoreReduce, OffsetRewriteGeoKeyless) {
   auto query_mem_desc = perfect_hash_one_col_desc(target_infos, 8, 7, 9);
   query_mem_desc.setHasKeylessHash(true);
   query_mem_desc.setTargetIdxForKey(0);
-  const auto row_set_mem_owner = std::make_shared<RowSetMemoryOwner>();
+  const auto row_set_mem_owner = std::make_shared<RowSetMemoryOwner>(
+      Executor::getArenaBlockSize(), Executor::UNITARY_EXECUTOR_ID);
   const auto rs1 = std::make_unique<ResultSet>(
-      target_infos, ExecutorDeviceType::CPU, query_mem_desc, row_set_mem_owner, nullptr);
+      target_infos, ExecutorDeviceType::CPU, query_mem_desc, row_set_mem_owner, 0, 0);
   const auto storage1 = rs1->allocateStorage();
   const auto rs2 = std::make_unique<ResultSet>(
-      target_infos, ExecutorDeviceType::CPU, query_mem_desc, row_set_mem_owner, nullptr);
+      target_infos, ExecutorDeviceType::CPU, query_mem_desc, row_set_mem_owner, 0, 0);
   const auto storage2 = rs2->allocateStorage();
   std::vector<std::string> serialized_varlen_buffer{
       arr_to_byte_string(std::vector<double>{1, 1, 2, 2, 3, 3, 4, 4}),
@@ -2540,7 +2241,13 @@ TEST(MoreReduce, OffsetRewriteGeoKeyless) {
   }
 
   storage1->rewriteAggregateBufferOffsets(serialized_varlen_buffer);
-  storage1->reduce(*storage2, serialized_varlen_buffer);
+  ResultSetReductionJIT reduction_jit(rs1->getQueryMemDesc(),
+                                      rs1->getTargetInfos(),
+                                      rs1->getTargetInitVals(),
+                                      Executor::UNITARY_EXECUTOR_ID);
+  const auto reduction_code = reduction_jit.codegen();
+  storage1->reduce(
+      *storage2, serialized_varlen_buffer, reduction_code, Executor::UNITARY_EXECUTOR_ID);
   rs1->setGeoReturnType(ResultSet::GeoReturnType::WktString);
   rs1->setSeparateVarlenStorageValid(true);
   {
@@ -3313,9 +3020,157 @@ TEST(ReduceRandomGroups, BaselineHashColumnar_Large_NullVal_0075) {
       target_infos, query_mem_desc, gen1, gen2, prct1, prct2, silent, 2);
 }
 
+TEST(ResultsetConversion, EnforceParallelColumnarConversion) {
+  // if we try to columnarize intermediate result which 1) is not truncated and
+  // has more than 20000 rows, i.e., rows.entryCount() >= 20000, then
+  // we trigger parallel columnarize conversion for SELECT query
+  // so, the purpose of this test is to check
+  // whether the large columnar conversion is done correctly
+
+  // load 50M rows - single-frag
+  QR::get()->runDDLStatement("DROP TABLE IF EXISTS t_large;");
+  QR::get()->runDDLStatement(
+      "CREATE TABLE t_large (x int not null, y int not null, z int not null) with "
+      "(fragment_size = 100000000);");
+  std::string import_large_t{
+      "COPY t_large FROM "
+      "'../../Tests/Import/datafiles/interrupt_table_very_large.parquet' WITH "
+      "(header='false', source_type='parquet_file')"};
+  QR::get()->runDDLStatement(import_large_t);
+
+  // load 50M rows - two frags (use default frag size)
+  QR::get()->runDDLStatement("DROP TABLE IF EXISTS t_large_multi_frag;");
+  QR::get()->runDDLStatement(
+      "CREATE TABLE t_large_multi_frag (x int not null, y int not null, z int not "
+      "null);");
+  std::string import_large_t_multi_frag{
+      "COPY t_large_multi_frag FROM "
+      "'../../Tests/Import/datafiles/interrupt_table_very_large.parquet' WITH "
+      "(header='false', source_type='parquet_file')"};
+  QR::get()->runDDLStatement(import_large_t_multi_frag);
+
+  QR::get()->runDDLStatement("DROP TABLE IF EXISTS t_small;");
+  QR::get()->runDDLStatement(
+      "CREATE TABLE t_small (x int not null, y int not null, z int not null);");
+  QR::get()->runSQL(
+      "INSERT INTO t_small VALUES(1, 1, 1);", ExecutorDeviceType::CPU, false);
+  int64_t answer = 9999999;
+
+  for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
+    SKIP_NO_GPU();
+
+    // single-frag test
+    std::shared_ptr<ResultSet> res1 = QR::get()->runSQL(
+        "SELECT COUNT(1) FROM (SELECT x FROM t_large WHERE x < 2) t, t_small r where t.x "
+        "= r.x",
+        dt,
+        false);
+    EXPECT_EQ(1, (int64_t)res1.get()->rowCount());
+    const auto crt_row1 = res1.get()->getNextRow(false, false);
+    EXPECT_EQ(answer, v<int64_t>(crt_row1[0]));
+
+    // multi-frag test
+    std::shared_ptr<ResultSet> res2 = QR::get()->runSQL(
+        "SELECT COUNT(1) FROM (SELECT x FROM t_large_multi_frag WHERE x < 2) t, t_small "
+        "r where t.x = r.x",
+        dt,
+        false);
+    EXPECT_EQ(1, (int64_t)res2.get()->rowCount());
+    const auto crt_row2 = res2.get()->getNextRow(false, false);
+    EXPECT_EQ(answer, v<int64_t>(crt_row1[0]));
+  }
+}
+
+TEST(Util, ReinterpretBits) {
+  uint64_t const u64 = 0x0123456789abcdef;
+  uint32_t const u32 = 0x89abcdef;
+  uint16_t const u16 = 0xcdef;
+  uint8_t const u8 = 0xef;
+  // downcast
+  EXPECT_EQ(u64, shared::reinterpret_bits<uint64_t>(u64));
+  EXPECT_EQ(u32, shared::reinterpret_bits<uint32_t>(u64));
+  EXPECT_EQ(u16, shared::reinterpret_bits<uint16_t>(u64));
+  EXPECT_EQ(u8, shared::reinterpret_bits<uint8_t>(u64));
+  // upcast
+  EXPECT_EQ(static_cast<uint64_t>(u8), shared::reinterpret_bits<uint64_t>(u8));
+  EXPECT_EQ(static_cast<uint64_t>(u16), shared::reinterpret_bits<uint64_t>(u16));
+  EXPECT_EQ(static_cast<uint64_t>(u32), shared::reinterpret_bits<uint64_t>(u32));
+  EXPECT_EQ(static_cast<uint64_t>(u64), shared::reinterpret_bits<uint64_t>(u64));
+  // floats
+  EXPECT_EQ(int64_t(1) << 23, (shared::reinterpret_bits<int64_t, float>(FLT_MIN)));
+  EXPECT_EQ(int32_t(1) << 23, (shared::reinterpret_bits<int32_t, float>(FLT_MIN)));
+  EXPECT_EQ(int64_t(1) << 52, (shared::reinterpret_bits<int64_t, double>(DBL_MIN)));
+  EXPECT_EQ(FLT_MIN, shared::reinterpret_bits<float>(int64_t(1) << 23));
+  EXPECT_EQ(FLT_MIN, shared::reinterpret_bits<float>(int32_t(1) << 23));
+  EXPECT_EQ(DBL_MIN, shared::reinterpret_bits<double>(int64_t(1) << 52));
+}
+
+TEST(Util, PairToDouble) {
+  const int64_t null_float = shared::reinterpret_bits<int64_t, float>(NULL_FLOAT);
+  const int64_t null_double = shared::reinterpret_bits<int64_t, double>(NULL_DOUBLE);
+  EXPECT_EQ(int64_t(1) << 23, null_float);
+  EXPECT_EQ(int64_t(1) << 52, null_double);
+  // Test all 8 combinations of (kFloat,kDouble)x(bool)x(bool).
+  // If the denominator is 0, then the return value should always be NULL_DOUBLE.
+  EXPECT_EQ(NULL_DOUBLE, pair_to_double({-4, 0}, SQLTypeInfo(kFLOAT, false), false));
+  EXPECT_EQ(NULL_DOUBLE, pair_to_double({-3, 0}, SQLTypeInfo(kFLOAT, false), true));
+  EXPECT_EQ(NULL_DOUBLE, pair_to_double({-2, 0}, SQLTypeInfo(kFLOAT, true), false));
+  EXPECT_EQ(NULL_DOUBLE, pair_to_double({-1, 0}, SQLTypeInfo(kFLOAT, true), true));
+  EXPECT_EQ(NULL_DOUBLE, pair_to_double({0, 0}, SQLTypeInfo(kDOUBLE, false), false));
+  EXPECT_EQ(NULL_DOUBLE, pair_to_double({1, 0}, SQLTypeInfo(kDOUBLE, false), true));
+  EXPECT_EQ(NULL_DOUBLE, pair_to_double({2, 0}, SQLTypeInfo(kDOUBLE, true), false));
+  EXPECT_EQ(NULL_DOUBLE, pair_to_double({3, 0}, SQLTypeInfo(kDOUBLE, true), true));
+  // Test all 16 combinations of (null_float,null_double)x(kFloat,kDouble)x(bool)x(bool).
+  // All should be non-null.
+  EXPECT_EQ(shared::reinterpret_bits<double>(null_float) / 2,
+            pair_to_double({null_float, 2}, SQLTypeInfo(kFLOAT, false), false));
+  EXPECT_EQ(shared::reinterpret_bits<float>(null_float) / 2,
+            pair_to_double({null_float, 2}, SQLTypeInfo(kFLOAT, false), true));
+  EXPECT_EQ(shared::reinterpret_bits<double>(null_float) / 2,
+            pair_to_double({null_float, 2}, SQLTypeInfo(kFLOAT, true), false));
+  EXPECT_EQ(shared::reinterpret_bits<float>(null_float) / 2,
+            pair_to_double({null_float, 2}, SQLTypeInfo(kFLOAT, true), true));
+  EXPECT_EQ(shared::reinterpret_bits<double>(null_float) / 2,
+            pair_to_double({null_float, 2}, SQLTypeInfo(kDOUBLE, false), false));
+  EXPECT_EQ(shared::reinterpret_bits<double>(null_float) / 2,
+            pair_to_double({null_float, 2}, SQLTypeInfo(kDOUBLE, false), true));
+  EXPECT_EQ(shared::reinterpret_bits<double>(null_float) / 2,
+            pair_to_double({null_float, 2}, SQLTypeInfo(kDOUBLE, true), false));
+  EXPECT_EQ(shared::reinterpret_bits<double>(null_float) / 2,
+            pair_to_double({null_float, 2}, SQLTypeInfo(kDOUBLE, true), true));
+  EXPECT_EQ(NULL_DOUBLE / 2,
+            pair_to_double({null_double, 2}, SQLTypeInfo(kFLOAT, false), false));
+  EXPECT_EQ(0.0 / 2, pair_to_double({null_double, 2}, SQLTypeInfo(kFLOAT, false), true));
+  EXPECT_EQ(NULL_DOUBLE / 2,
+            pair_to_double({null_double, 2}, SQLTypeInfo(kFLOAT, true), false));
+  EXPECT_EQ(0.0 / 2, pair_to_double({null_double, 2}, SQLTypeInfo(kFLOAT, true), true));
+  EXPECT_EQ(NULL_DOUBLE / 2,
+            pair_to_double({null_double, 2}, SQLTypeInfo(kDOUBLE, false), false));
+  EXPECT_EQ(NULL_DOUBLE / 2,
+            pair_to_double({null_double, 2}, SQLTypeInfo(kDOUBLE, false), true));
+  EXPECT_EQ(NULL_DOUBLE / 2,
+            pair_to_double({null_double, 2}, SQLTypeInfo(kDOUBLE, true), false));
+  EXPECT_EQ(NULL_DOUBLE / 2,
+            pair_to_double({null_double, 2}, SQLTypeInfo(kDOUBLE, true), true));
+  // Misc
+  EXPECT_EQ(0.5,
+            pair_to_double({shared::reinterpret_bits<int64_t, float>(1.0), 2},
+                           SQLTypeInfo(kFLOAT, false),
+                           true));
+  EXPECT_EQ(-0.5,
+            pair_to_double({shared::reinterpret_bits<int64_t, double>(-1.0), 2},
+                           SQLTypeInfo(kDOUBLE, false),
+                           true));
+  EXPECT_EQ(2.5, pair_to_double({1000, 4}, SQLTypeInfo(kDECIMAL, 19, 2), true));
+}
+
 int main(int argc, char** argv) {
-  google::InitGoogleLogging(argv[0]);
+  g_is_test_env = true;
+
+  TestHelpers::init_logger_stderr_only(argc, argv);
   testing::InitGoogleTest(&argc, argv);
+
+  QR::init(BASE_PATH);
 
   int err{0};
   try {
@@ -3323,5 +3178,6 @@ int main(int argc, char** argv) {
   } catch (const std::exception& e) {
     LOG(ERROR) << e.what();
   }
+  QR::reset();
   return err;
 }

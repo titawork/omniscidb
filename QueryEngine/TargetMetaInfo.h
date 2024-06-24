@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -37,10 +37,21 @@ class TargetMetaInfo {
   const SQLTypeInfo& get_type_info() const { return ti_; }
   const SQLTypeInfo& get_physical_type_info() const { return physical_ti_; }
 
+  std::string toString() const {
+    return "TargetMetaInfo(" + resname_ + ", " + ti_.to_string() + ", " +
+           physical_ti_.to_string() + ") ";
+  }
+
  private:
   std::string resname_;
   SQLTypeInfo ti_;
   SQLTypeInfo physical_ti_;
 };
+
+inline std::ostream& operator<<(std::ostream& os, TargetMetaInfo const& tmi) {
+  return os << "TargetMetaInfo(resname_(" << tmi.get_resname() << ") ti_("
+            << tmi.get_type_info().to_string() << ") physical_ti_("
+            << tmi.get_physical_type_info().to_string() << "))";
+}
 
 #endif  // QUERYENGINE_TARGETMETAINFO_H

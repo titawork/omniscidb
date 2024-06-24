@@ -1,0 +1,8 @@
+# required for gdal3 in debug mode
+leak:__cxa_thread_atexit
+# ml_predict
+leak:fpk_serv_malloc
+leak:daal::algorithms::engines::mt2203::interface1::Batch
+leak:daal::algorithms::engines::mt2203::interface1::BatchContainer
+leak:daal::algorithms::interface1::AlgorithmDispatchContainer
+leak:daal::algorithms::interface1::Argument::Argument

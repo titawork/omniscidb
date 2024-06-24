@@ -1,5 +1,5 @@
 /*
- * Copyright 2018 OmniSci, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,10 +14,14 @@
  * limitations under the License.
  */
 
-#include "../../Shared/DateConverters.h"
+#include "Shared/DateConverters.h"
+#include "Shared/DateTimeParser.h"
+#include "Tests/TestHelpers.h"
 
-#include <glog/logging.h>
 #include <gtest/gtest.h>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace {
 
@@ -55,8 +59,49 @@ TEST(DATE, EpochDaysToSecondsTest) {
   compare_epoch(computed, sample.expected_seconds);
 }
 
+TEST(TIME, LegalParseTimeString) {
+  using namespace std::string_literals;
+  static const std::unordered_map<std::string, int64_t> values = {
+      {"22:28:48"s, 80928},
+      {"22:28:48.876"s, 80928},
+      {"T22:28:48"s, 80928},
+      {"222848"s, 80928},
+      {"22:28:48-05:00"s, 98928},
+      {"22:28:48+05:00"s, 62928},
+      {"22:28"s, 80880}};
+
+  for (const auto& [time_str, expected_epoch] : values) {
+    ASSERT_EQ(expected_epoch, dateTimeParse<kTIME>(time_str, 0)) << time_str;
+  }
+}
+
+TEST(TIME, IllegalParseTimeString) {
+  using namespace std::string_literals;
+  static const std::unordered_set<std::string> values = {
+      "22-28-48"s, "2228.48"s, "22.28.48"s, "22"s};
+
+  for (const auto& val : values) {
+    ASSERT_THROW(dateTimeParse<kTIME>(val, 0), std::runtime_error) << val;
+  }
+}
+
+TEST(TIMESTAMPS, OverflowUnderflow) {
+  using namespace std::string_literals;
+  static const std::unordered_set<std::string> values = {
+      "2273-01-01 23:12:12"s,
+      "2263-01-01 00:00:00"s,
+      "09/21/1676 00:12:43.145224193"s,
+      "09/21/1677 00:00:43.145224193"s};
+  for (const auto& value : values) {
+    ASSERT_NO_THROW(dateTimeParse<kTIMESTAMP>(value, 0));
+    ASSERT_NO_THROW(dateTimeParse<kTIMESTAMP>(value, 3));
+    ASSERT_NO_THROW(dateTimeParse<kTIMESTAMP>(value, 6));
+    ASSERT_NO_THROW(dateTimeParse<kTIMESTAMP>(value, 9));
+  }
+}
+
 int main(int argc, char** argv) {
-  google::InitGoogleLogging(argv[0]);
+  TestHelpers::init_logger_stderr_only(argc, argv);
   testing::InitGoogleTest(&argc, argv);
 
   int err{0};

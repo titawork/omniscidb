@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 OmniSci, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,30 +14,28 @@
  * limitations under the License.
  */
 
-#include "TestHelpers.h"
-
-#include "../Import/Importer.h"
-#include "../Parser/parser.h"
-#include "../QueryEngine/ArrowResultSet.h"
-#include "../QueryEngine/Descriptors/RelAlgExecutionDescriptor.h"
-#include "../QueryEngine/Execute.h"
-#include "../QueryEngine/FromTableReordering.h"
-#include "../QueryRunner/QueryRunner.h"
-#include "../Shared/Compressor.h"
-#include "../Shared/ConfigResolve.h"
-#include "../Shared/TimeGM.h"
-#include "../Shared/scope.h"
-#include "../SqliteConnector/SqliteConnector.h"
-#include "DistributedLoader.h"
-
-#include <glog/logging.h>
 #include <gtest/gtest.h>
+
+#include "DistributedLoader.h"
+#include "ImportExport/Importer.h"
+#include "QueryEngine/ArrowResultSet.h"
+#include "QueryEngine/Descriptors/RelAlgExecutionDescriptor.h"
+#include "QueryEngine/Execute.h"
+#include "QueryEngine/FromTableReordering.h"
+#include "QueryRunner/QueryRunner.h"
+#include "Shared/Compressor.h"
+#include "Shared/DbObjectKeys.h"
+#include "Shared/scope.h"
+#include "SqliteConnector/SqliteConnector.h"
+#include "TestHelpers.h"
 
 TEST(Ordering, Basic) {
   // Basic test of inner join ordering. Equal table sizes.
   {
-    auto a1 = std::make_shared<Analyzer::ColumnVar>(SQLTypeInfo{kINT, true}, 0, 0, 0);
-    auto a2 = std::make_shared<Analyzer::ColumnVar>(SQLTypeInfo{kINT, true}, 1, 1, 1);
+    auto a1 = std::make_shared<Analyzer::ColumnVar>(
+        SQLTypeInfo{kINT, true}, shared::ColumnKey{0, 0, 0}, 0);
+    auto a2 = std::make_shared<Analyzer::ColumnVar>(
+        SQLTypeInfo{kINT, true}, shared::ColumnKey{1, 1, 1}, 1);
     auto op = std::make_shared<Analyzer::BinOper>(kINT, kGT, kONE, a1, a2);
 
     JoinCondition jc{{op}, JoinType::INNER};
@@ -54,8 +52,10 @@ TEST(Ordering, Basic) {
 
   // Basic test of inner join ordering. Descending table sizes.
   {
-    auto a1 = std::make_shared<Analyzer::ColumnVar>(SQLTypeInfo{kINT, true}, 0, 0, 0);
-    auto a2 = std::make_shared<Analyzer::ColumnVar>(SQLTypeInfo{kINT, true}, 1, 1, 1);
+    auto a1 = std::make_shared<Analyzer::ColumnVar>(
+        SQLTypeInfo{kINT, true}, shared::ColumnKey{0, 0, 0}, 0);
+    auto a2 = std::make_shared<Analyzer::ColumnVar>(
+        SQLTypeInfo{kINT, true}, shared::ColumnKey{1, 1, 1}, 1);
     auto op = std::make_shared<Analyzer::BinOper>(kINT, kGT, kONE, a1, a2);
 
     JoinCondition jc{{op}, JoinType::INNER};
@@ -74,8 +74,10 @@ TEST(Ordering, Basic) {
 
   // Basic test of inner join ordering. Ascending table sizes.
   {
-    auto a1 = std::make_shared<Analyzer::ColumnVar>(SQLTypeInfo{kINT, true}, 0, 0, 0);
-    auto a2 = std::make_shared<Analyzer::ColumnVar>(SQLTypeInfo{kINT, true}, 1, 1, 1);
+    auto a1 = std::make_shared<Analyzer::ColumnVar>(
+        SQLTypeInfo{kINT, true}, shared::ColumnKey{0, 0, 0}, 0);
+    auto a2 = std::make_shared<Analyzer::ColumnVar>(
+        SQLTypeInfo{kINT, true}, shared::ColumnKey{1, 1, 1}, 1);
     auto op = std::make_shared<Analyzer::BinOper>(kINT, kGT, kONE, a1, a2);
 
     JoinCondition jc{{op}, JoinType::INNER};
@@ -94,8 +96,10 @@ TEST(Ordering, Basic) {
 
   // Basic test of left join ordering. Equal table sizes.
   {
-    auto a1 = std::make_shared<Analyzer::ColumnVar>(SQLTypeInfo{kINT, true}, 0, 0, 0);
-    auto a2 = std::make_shared<Analyzer::ColumnVar>(SQLTypeInfo{kINT, true}, 1, 1, 1);
+    auto a1 = std::make_shared<Analyzer::ColumnVar>(
+        SQLTypeInfo{kINT, true}, shared::ColumnKey{0, 0, 0}, 0);
+    auto a2 = std::make_shared<Analyzer::ColumnVar>(
+        SQLTypeInfo{kINT, true}, shared::ColumnKey{1, 1, 1}, 1);
     auto op = std::make_shared<Analyzer::BinOper>(kINT, kGT, kONE, a1, a2);
 
     JoinCondition jc{{op}, JoinType::LEFT};
@@ -112,8 +116,10 @@ TEST(Ordering, Basic) {
 
   // Basic test of left join ordering. Descending table sizes.
   {
-    auto a1 = std::make_shared<Analyzer::ColumnVar>(SQLTypeInfo{kINT, true}, 0, 0, 0);
-    auto a2 = std::make_shared<Analyzer::ColumnVar>(SQLTypeInfo{kINT, true}, 1, 1, 1);
+    auto a1 = std::make_shared<Analyzer::ColumnVar>(
+        SQLTypeInfo{kINT, true}, shared::ColumnKey{0, 0, 0}, 0);
+    auto a2 = std::make_shared<Analyzer::ColumnVar>(
+        SQLTypeInfo{kINT, true}, shared::ColumnKey{1, 1, 1}, 1);
     auto op = std::make_shared<Analyzer::BinOper>(kINT, kGT, kONE, a1, a2);
 
     JoinCondition jc{{op}, JoinType::LEFT};
@@ -132,8 +138,10 @@ TEST(Ordering, Basic) {
 
   // Basic test of left join ordering. Ascending table sizes.
   {
-    auto a1 = std::make_shared<Analyzer::ColumnVar>(SQLTypeInfo{kINT, true}, 0, 0, 0);
-    auto a2 = std::make_shared<Analyzer::ColumnVar>(SQLTypeInfo{kINT, true}, 1, 1, 1);
+    auto a1 = std::make_shared<Analyzer::ColumnVar>(
+        SQLTypeInfo{kINT, true}, shared::ColumnKey{0, 0, 0}, 0);
+    auto a2 = std::make_shared<Analyzer::ColumnVar>(
+        SQLTypeInfo{kINT, true}, shared::ColumnKey{1, 1, 1}, 1);
     auto op = std::make_shared<Analyzer::BinOper>(kINT, kGT, kONE, a1, a2);
 
     JoinCondition jc{{op}, JoinType::LEFT};
@@ -152,9 +160,10 @@ TEST(Ordering, Basic) {
 
   // Basic test of inner geojoin ordering. Equal table sizes.
   {
-    auto a1 =
-        std::make_shared<Analyzer::ColumnVar>(SQLTypeInfo{kMULTIPOLYGON, true}, 1, 1, 1);
-    auto a2 = std::make_shared<Analyzer::ColumnVar>(SQLTypeInfo{kPOINT, true}, 0, 0, 0);
+    auto a1 = std::make_shared<Analyzer::ColumnVar>(
+        SQLTypeInfo{kMULTIPOLYGON, true}, shared::ColumnKey{1, 1, 1}, 1);
+    auto a2 = std::make_shared<Analyzer::ColumnVar>(
+        SQLTypeInfo{kPOINT, true}, shared::ColumnKey{0, 0, 0}, 0);
     std::vector<std::shared_ptr<Analyzer::Expr>> geoargs = {a1, a2};
     auto op = std::make_shared<Analyzer::FunctionOper>(
         SQLTypeInfo{kBOOLEAN, true}, "ST_Contains_MultiPolygon_Point", geoargs);
@@ -173,9 +182,10 @@ TEST(Ordering, Basic) {
 
   // Basic test of inner geojoin ordering. Descending table sizes.
   {
-    auto a1 =
-        std::make_shared<Analyzer::ColumnVar>(SQLTypeInfo{kMULTIPOLYGON, true}, 1, 1, 1);
-    auto a2 = std::make_shared<Analyzer::ColumnVar>(SQLTypeInfo{kPOINT, true}, 0, 0, 0);
+    auto a1 = std::make_shared<Analyzer::ColumnVar>(
+        SQLTypeInfo{kMULTIPOLYGON, true}, shared::ColumnKey{1, 1, 1}, 1);
+    auto a2 = std::make_shared<Analyzer::ColumnVar>(
+        SQLTypeInfo{kPOINT, true}, shared::ColumnKey{0, 0, 0}, 0);
     std::vector<std::shared_ptr<Analyzer::Expr>> geoargs = {a1, a2};
     auto op = std::make_shared<Analyzer::FunctionOper>(
         SQLTypeInfo{kBOOLEAN, true}, "ST_Contains_MultiPolygon_Point", geoargs);
@@ -196,9 +206,10 @@ TEST(Ordering, Basic) {
 
   // Basic test of inner geojoin ordering. Ascending table sizes.
   {
-    auto a1 =
-        std::make_shared<Analyzer::ColumnVar>(SQLTypeInfo{kMULTIPOLYGON, true}, 1, 1, 1);
-    auto a2 = std::make_shared<Analyzer::ColumnVar>(SQLTypeInfo{kPOINT, true}, 0, 0, 0);
+    auto a1 = std::make_shared<Analyzer::ColumnVar>(
+        SQLTypeInfo{kMULTIPOLYGON, true}, shared::ColumnKey{1, 1, 1}, 1);
+    auto a2 = std::make_shared<Analyzer::ColumnVar>(
+        SQLTypeInfo{kPOINT, true}, shared::ColumnKey{0, 0, 0}, 0);
     std::vector<std::shared_ptr<Analyzer::Expr>> geoargs = {a1, a2};
     auto op = std::make_shared<Analyzer::FunctionOper>(
         SQLTypeInfo{kBOOLEAN, true}, "ST_Contains_MultiPolygon_Point", geoargs);
@@ -213,7 +224,8 @@ TEST(Ordering, Basic) {
     viti[1].info.setPhysicalNumTuples(2);
 
     auto input_permutation = get_node_input_permutation(nesting_levels, viti, nullptr);
-    decltype(input_permutation) expected_input_permutation{0, 1};
+    // now we can reorder tables for geo join by their cardinality
+    decltype(input_permutation) expected_input_permutation{1, 0};
     ASSERT_EQ(expected_input_permutation, input_permutation);
   }
 }
@@ -221,9 +233,12 @@ TEST(Ordering, Basic) {
 TEST(Ordering, Triple) {
   // Triple test of inner join ordering. Equal table sizes.
   {
-    auto a1 = std::make_shared<Analyzer::ColumnVar>(SQLTypeInfo{kINT, true}, 0, 0, 0);
-    auto a2 = std::make_shared<Analyzer::ColumnVar>(SQLTypeInfo{kINT, true}, 1, 1, 1);
-    auto a3 = std::make_shared<Analyzer::ColumnVar>(SQLTypeInfo{kINT, true}, 2, 2, 2);
+    auto a1 = std::make_shared<Analyzer::ColumnVar>(
+        SQLTypeInfo{kINT, true}, shared::ColumnKey{0, 0, 0}, 0);
+    auto a2 = std::make_shared<Analyzer::ColumnVar>(
+        SQLTypeInfo{kINT, true}, shared::ColumnKey{1, 1, 1}, 1);
+    auto a3 = std::make_shared<Analyzer::ColumnVar>(
+        SQLTypeInfo{kINT, true}, shared::ColumnKey{2, 2, 2}, 2);
     auto op1 = std::make_shared<Analyzer::BinOper>(kINT, kEQ, kONE, a1, a2);
     auto op2 = std::make_shared<Analyzer::BinOper>(kINT, kEQ, kONE, a2, a3);
 
@@ -243,9 +258,12 @@ TEST(Ordering, Triple) {
 
   // Triple test of inner join ordering. Descending table sizes.
   {
-    auto a1 = std::make_shared<Analyzer::ColumnVar>(SQLTypeInfo{kINT, true}, 0, 0, 0);
-    auto a2 = std::make_shared<Analyzer::ColumnVar>(SQLTypeInfo{kINT, true}, 1, 1, 1);
-    auto a3 = std::make_shared<Analyzer::ColumnVar>(SQLTypeInfo{kINT, true}, 2, 2, 2);
+    auto a1 = std::make_shared<Analyzer::ColumnVar>(
+        SQLTypeInfo{kINT, true}, shared::ColumnKey{0, 0, 0}, 0);
+    auto a2 = std::make_shared<Analyzer::ColumnVar>(
+        SQLTypeInfo{kINT, true}, shared::ColumnKey{1, 1, 1}, 1);
+    auto a3 = std::make_shared<Analyzer::ColumnVar>(
+        SQLTypeInfo{kINT, true}, shared::ColumnKey{2, 2, 2}, 2);
     auto op1 = std::make_shared<Analyzer::BinOper>(kINT, kEQ, kONE, a1, a2);
     auto op2 = std::make_shared<Analyzer::BinOper>(kINT, kEQ, kONE, a2, a3);
 
@@ -268,9 +286,12 @@ TEST(Ordering, Triple) {
 
   // Triple test of inner join ordering. Ascending table sizes.
   {
-    auto a1 = std::make_shared<Analyzer::ColumnVar>(SQLTypeInfo{kINT, true}, 0, 0, 0);
-    auto a2 = std::make_shared<Analyzer::ColumnVar>(SQLTypeInfo{kINT, true}, 1, 1, 1);
-    auto a3 = std::make_shared<Analyzer::ColumnVar>(SQLTypeInfo{kINT, true}, 2, 2, 2);
+    auto a1 = std::make_shared<Analyzer::ColumnVar>(
+        SQLTypeInfo{kINT, true}, shared::ColumnKey{0, 0, 0}, 0);
+    auto a2 = std::make_shared<Analyzer::ColumnVar>(
+        SQLTypeInfo{kINT, true}, shared::ColumnKey{1, 1, 1}, 1);
+    auto a3 = std::make_shared<Analyzer::ColumnVar>(
+        SQLTypeInfo{kINT, true}, shared::ColumnKey{2, 2, 2}, 2);
     auto op1 = std::make_shared<Analyzer::BinOper>(kINT, kEQ, kONE, a1, a2);
     auto op2 = std::make_shared<Analyzer::BinOper>(kINT, kEQ, kONE, a2, a3);
 
@@ -293,9 +314,12 @@ TEST(Ordering, Triple) {
 
   // Triple test of left join ordering. Equal table sizes.
   {
-    auto a1 = std::make_shared<Analyzer::ColumnVar>(SQLTypeInfo{kINT, true}, 0, 0, 0);
-    auto a2 = std::make_shared<Analyzer::ColumnVar>(SQLTypeInfo{kINT, true}, 1, 1, 1);
-    auto a3 = std::make_shared<Analyzer::ColumnVar>(SQLTypeInfo{kINT, true}, 2, 2, 2);
+    auto a1 = std::make_shared<Analyzer::ColumnVar>(
+        SQLTypeInfo{kINT, true}, shared::ColumnKey{0, 0, 0}, 0);
+    auto a2 = std::make_shared<Analyzer::ColumnVar>(
+        SQLTypeInfo{kINT, true}, shared::ColumnKey{1, 1, 1}, 1);
+    auto a3 = std::make_shared<Analyzer::ColumnVar>(
+        SQLTypeInfo{kINT, true}, shared::ColumnKey{2, 2, 2}, 2);
     auto op1 = std::make_shared<Analyzer::BinOper>(kINT, kEQ, kONE, a1, a2);
     auto op2 = std::make_shared<Analyzer::BinOper>(kINT, kEQ, kONE, a2, a3);
 
@@ -315,9 +339,12 @@ TEST(Ordering, Triple) {
 
   // Triple test of left join ordering. Descending table sizes.
   {
-    auto a1 = std::make_shared<Analyzer::ColumnVar>(SQLTypeInfo{kINT, true}, 0, 0, 0);
-    auto a2 = std::make_shared<Analyzer::ColumnVar>(SQLTypeInfo{kINT, true}, 1, 1, 1);
-    auto a3 = std::make_shared<Analyzer::ColumnVar>(SQLTypeInfo{kINT, true}, 2, 2, 2);
+    auto a1 = std::make_shared<Analyzer::ColumnVar>(
+        SQLTypeInfo{kINT, true}, shared::ColumnKey{0, 0, 0}, 0);
+    auto a2 = std::make_shared<Analyzer::ColumnVar>(
+        SQLTypeInfo{kINT, true}, shared::ColumnKey{1, 1, 1}, 1);
+    auto a3 = std::make_shared<Analyzer::ColumnVar>(
+        SQLTypeInfo{kINT, true}, shared::ColumnKey{2, 2, 2}, 2);
     auto op1 = std::make_shared<Analyzer::BinOper>(kINT, kEQ, kONE, a1, a2);
     auto op2 = std::make_shared<Analyzer::BinOper>(kINT, kEQ, kONE, a2, a3);
 
@@ -340,9 +367,12 @@ TEST(Ordering, Triple) {
 
   // Triple test of left join ordering. Ascending table sizes.
   {
-    auto a1 = std::make_shared<Analyzer::ColumnVar>(SQLTypeInfo{kINT, true}, 0, 0, 0);
-    auto a2 = std::make_shared<Analyzer::ColumnVar>(SQLTypeInfo{kINT, true}, 1, 1, 1);
-    auto a3 = std::make_shared<Analyzer::ColumnVar>(SQLTypeInfo{kINT, true}, 2, 2, 2);
+    auto a1 = std::make_shared<Analyzer::ColumnVar>(
+        SQLTypeInfo{kINT, true}, shared::ColumnKey{0, 0, 0}, 0);
+    auto a2 = std::make_shared<Analyzer::ColumnVar>(
+        SQLTypeInfo{kINT, true}, shared::ColumnKey{1, 1, 1}, 1);
+    auto a3 = std::make_shared<Analyzer::ColumnVar>(
+        SQLTypeInfo{kINT, true}, shared::ColumnKey{2, 2, 2}, 2);
     auto op1 = std::make_shared<Analyzer::BinOper>(kINT, kEQ, kONE, a1, a2);
     auto op2 = std::make_shared<Analyzer::BinOper>(kINT, kEQ, kONE, a2, a3);
 
@@ -365,7 +395,7 @@ TEST(Ordering, Triple) {
 }
 
 int main(int argc, char** argv) {
-  google::InitGoogleLogging(argv[0]);
+  TestHelpers::init_logger_stderr_only(argc, argv);
   testing::InitGoogleTest(&argc, argv);
 
   int err{0};

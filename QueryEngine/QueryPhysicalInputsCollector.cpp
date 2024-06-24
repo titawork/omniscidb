@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,9 +16,11 @@
 
 #include "QueryPhysicalInputsCollector.h"
 
-#include "RelAlgAbstractInterpreter.h"
+#include "RelAlgDag.h"
 #include "RelAlgVisitor.h"
 #include "RexVisitor.h"
+#include "Shared/misc.h"
+#include "Visitors/RelRexDagVisitor.h"
 
 namespace {
 
@@ -57,7 +59,8 @@ class RexPhysicalInputsVisitor : public RexVisitor<PhysicalInputSet> {
     const int col_id = input->getIndex() + 1;
     const int table_id = scan_td->tableId;
     CHECK_GT(table_id, 0);
-    return {{col_id, table_id}};
+    auto db_id = scan_ra->getCatalog().getDatabaseId();
+    return {{col_id, table_id, db_id}};
   }
 
   PhysicalInputSet visitSubQuery(const RexSubQuery* subquery) const override {
@@ -87,7 +90,6 @@ class RexPhysicalInputsVisitor : public RexVisitor<PhysicalInputSet> {
           result = aggregateResult(result, visit(input));
         }
       }
-      return result;
     }
     for (size_t i = 0; i < oper->size(); i++) {
       result = aggregateResult(result, visit(oper->getOperand(i)));
@@ -185,20 +187,28 @@ PhysicalInputSet RelAlgPhysicalInputsVisitor::aggregateResult(
   return result;
 }
 
-class RelAlgPhysicalTableInputsVisitor : public RelAlgVisitor<std::unordered_set<int>> {
+class RelAlgPhysicalTableInputsVisitor : public RelRexDagVisitor {
  public:
-  std::unordered_set<int> visitScan(const RelScan* scan) const override {
-    return {scan->getTableDescriptor()->tableId};
+  using RelRexDagVisitor::visit;
+  using TableKeys = std::unordered_set<shared::TableKey>;
+
+  static TableKeys getTableIds(RelAlgNode const* node) {
+    RelAlgPhysicalTableInputsVisitor visitor;
+    visitor.visit(node);
+    return std::move(visitor.table_ids_);
   }
 
- protected:
-  std::unordered_set<int> aggregateResult(
-      const std::unordered_set<int>& aggregate,
-      const std::unordered_set<int>& next_result) const override {
-    auto result = aggregate;
-    result.insert(next_result.begin(), next_result.end());
-    return result;
+ private:
+  TableKeys table_ids_;
+
+  void visit(RelScan const* scan) override {
+    table_ids_.insert(
+        {scan->getCatalog().getDatabaseId(), scan->getTableDescriptor()->tableId});
   }
+
+  // Only RelScan nodes have physical table ids, so we may prune any nodes that can never
+  // have a RelScan node as a descendant.
+  void visit(RelLogicalValues const*) override {}
 };
 
 }  // namespace
@@ -208,7 +218,20 @@ std::unordered_set<PhysicalInput> get_physical_inputs(const RelAlgNode* ra) {
   return phys_inputs_visitor.visit(ra);
 }
 
-std::unordered_set<int> get_physical_table_inputs(const RelAlgNode* ra) {
-  RelAlgPhysicalTableInputsVisitor phys_table_inputs_visitor;
-  return phys_table_inputs_visitor.visit(ra);
+std::unordered_set<shared::TableKey> get_physical_table_inputs(const RelAlgNode* ra) {
+  return RelAlgPhysicalTableInputsVisitor::getTableIds(ra);
+}
+
+std::ostream& operator<<(std::ostream& os, PhysicalInput const& physical_input) {
+  return os << '(' << physical_input.col_id << ',' << physical_input.table_id << ','
+            << physical_input.db_id << ')';
+}
+
+size_t PhysicalInput::hash() const {
+  auto hash_value = shared::compute_hash(col_id, table_id);
+  return hash_value;
+}
+
+bool PhysicalInput::operator==(const PhysicalInput& that) const {
+  return col_id == that.col_id && table_id == that.table_id && db_id == that.db_id;
 }

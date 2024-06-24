@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,42 +14,42 @@
  * limitations under the License.
  */
 
-/*
+/**
  * @file    QueryPhysicalInputsCollector.h
- * @author  Alex Suhan <alex@mapd.com>
  * @brief   Find out all the physical inputs (columns) a query is using.
  *
- * Copyright (c) 2016 MapD Technologies, Inc.  All rights reserved.
  */
 
 #ifndef QUERYENGINE_QUERYPHYSICALINPUTSCOLLECTOR_H
 #define QUERYENGINE_QUERYPHYSICALINPUTSCOLLECTOR_H
 
+#include <ostream>
 #include <unordered_set>
 
 class RelAlgNode;
 
 struct PhysicalInput {
-  int col_id;
-  int table_id;
+  int32_t col_id;
+  int32_t table_id;
+  int32_t db_id;
 
-  bool operator==(const PhysicalInput& that) const {
-    return col_id == that.col_id && table_id == that.table_id;
-  }
+  size_t hash() const;
+
+  bool operator==(const PhysicalInput& that) const;
 };
+
+std::ostream& operator<<(std::ostream&, PhysicalInput const&);
 
 namespace std {
 
 template <>
 struct hash<PhysicalInput> {
-  size_t operator()(const PhysicalInput& phys_input) const {
-    return phys_input.col_id ^ phys_input.table_id;
-  }
+  size_t operator()(const PhysicalInput& phys_input) const { return phys_input.hash(); }
 };
 
 }  // namespace std
 
 std::unordered_set<PhysicalInput> get_physical_inputs(const RelAlgNode*);
-std::unordered_set<int> get_physical_table_inputs(const RelAlgNode*);
+std::unordered_set<shared::TableKey> get_physical_table_inputs(const RelAlgNode*);
 
 #endif  // QUERYENGINE_QUERYPHYSICALINPUTSCOLLECTOR_H

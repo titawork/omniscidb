@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 OmniSci, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 #pragma once
 
 #include "InsertOrderFragmenter.h"
@@ -46,14 +47,14 @@ class SortedOrderFragmenter : public InsertOrderFragmenter {
                               defaultInsertLevel) {}
 
   ~SortedOrderFragmenter() override {}
-  void insertData(InsertData& insertDataStruct) override {
-    sortData(insertDataStruct);
-    InsertOrderFragmenter::insertData(insertDataStruct);
+  void insertData(InsertData& insert_data_struct) override {
+    sortData(insert_data_struct);
+    InsertOrderFragmenter::insertData(insert_data_struct);
   }
 
-  void insertDataNoCheckpoint(InsertData& insertDataStruct) override {
-    sortData(insertDataStruct);
-    InsertOrderFragmenter::insertDataNoCheckpoint(insertDataStruct);
+  void insertDataNoCheckpoint(InsertData& insert_data_struct) override {
+    sortData(insert_data_struct);
+    InsertOrderFragmenter::insertDataNoCheckpoint(insert_data_struct);
   }
 
   SortedOrderFragmenter(SortedOrderFragmenter&&) = default;

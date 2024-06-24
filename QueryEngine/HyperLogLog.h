@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,11 +16,9 @@
 
 /**
  * @file    HyperLogLog.h
- * @author  Alex Suhan <alex@mapd.com>
  * @brief   Functions used to work with HyperLogLog records.
  *
- * Copyright (c) 2017 MapD Technologies, Inc.  All rights reserved.
- **/
+ */
 
 #ifndef QUERYENGINE_HYPERLOGLOG_H
 #define QUERYENGINE_HYPERLOGLOG_H
@@ -88,7 +86,7 @@ inline uint32_t count_zeros(T* M, size_t m) {
 
 template <class T>
 inline size_t hll_size(const T* M, const size_t bitmap_sz_bits) {
-  size_t m = 1 << bitmap_sz_bits;
+  size_t const m = size_t(1) << bitmap_sz_bits;
 
   uint32_t zeros = count_zeros(M, m);
   double estimate = get_alpha_adjusted_estimate(m, M);

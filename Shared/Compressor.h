@@ -1,5 +1,5 @@
 /*
- * Copyright 2018 OmniSci, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,18 +17,17 @@
 /**
  * @file		Compressor.h
  * @brief		singleton class to handle concurrancy and state for blosc library.
- *A C++ wraper over a pure C library.
+ *          A C++ wrapper over a pure C library.
  *
- * Copyright (c) 2018 OmniSci, Inc.  All rights reserved.
- **/
+ */
 
-#include <memory>
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
 #include <mutex>
+#include <stdexcept>
 #include <string>
-#include <vector>
-
-#ifndef COMPRESSOR_H
-#define COMPRESSOR_H
 
 class CompressionFailedError : public std::runtime_error {
  public:
@@ -44,7 +43,9 @@ class BloscCompressor {
   // buffer to do the scratch work. We have to provide the compressor extra 10%
   // space for it.
   // https://github.com/Blosc/c-blosc/blob/c7792d6153eaf3d3d86eb33a28e9c613d2337040/blosc/blosclz.h#L28
-  inline size_t getScratchSpaceSize(const size_t len) const { return len * 1.1; }
+  inline size_t getScratchSpaceSize(const size_t len) const {
+    return static_cast<size_t>(len * 1.1);
+  }
 
   // requires a compressed buffer at least as large as uncompressed buffer.
   // use 0 to always force compression for min_compressor_bytes.
@@ -86,5 +87,3 @@ class BloscCompressor {
   std::mutex compressor_lock;
   static BloscCompressor* instance;
 };
-
-#endif

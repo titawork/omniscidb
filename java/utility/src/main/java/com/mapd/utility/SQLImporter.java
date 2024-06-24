@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,13 +19,6 @@ import static java.lang.Math.pow;
 import static java.lang.System.exit;
 
 import com.mapd.common.SockTransportProperties;
-import com.mapd.thrift.server.MapD;
-import com.mapd.thrift.server.TColumn;
-import com.mapd.thrift.server.TColumnData;
-import com.mapd.thrift.server.TColumnType;
-import com.mapd.thrift.server.TMapDException;
-import com.mapd.thrift.server.TQueryResult;
-import com.mapd.thrift.server.TTableDetails;
 import com.mapd.utility.db_vendors.Db_vendor_types;
 
 import org.apache.commons.cli.*;
@@ -48,6 +41,8 @@ import java.sql.*;
 import java.time.*;
 import java.util.ArrayList;
 import java.util.List;
+
+import ai.heavy.thrift.server.*;
 
 interface DateTimeUtils {
   long getSecondsFromMilliseconds(long milliseconds);
@@ -89,10 +84,10 @@ class SQLImporter_args {
     sb.append(
             "[-d <other database JDBC drive class>] -c <other database JDBC connection string>\n");
     sb.append(
-            "-su <other database user> -sp <other database user password> -su <other database sql statement>\n");
+            "-su <other database user> -sp <other database user password> -ss <other database sql statement>\n");
     sb.append(
-            "-t <OmniSci target table> -b <transfer buffer size> -f <table fragment size>\n");
-    sb.append("[-tr] -i <init commands file>\n");
+            "-t <HEAVYAI target table> -b <transfer buffer size> -f <table fragment size>\n");
+    sb.append("[-tr] [-adtf] [-nprg] -i <init commands file>\n");
     sb.append("\nSQLImporter -h | --help\n\n");
 
     HelpFormatter formatter = new HelpFormatter();
@@ -106,46 +101,46 @@ class SQLImporter_args {
   SQLImporter_args() {
     options.addOption("r", true, "Row Load Limit");
 
-    // OmniSci authentication options
+    // HEAVYAI authentication options
     options.addOption(Option.builder("h").desc("help message").longOpt("help").build());
     options.addOption(
-            Option.builder("u").hasArg().desc("OmniSci User").longOpt("user").build());
+            Option.builder("u").hasArg().desc("HEAVYAI User").longOpt("user").build());
     options.addOption(Option.builder("p")
                               .hasArg()
-                              .desc("OmniSci Password")
+                              .desc("HEAVYAI Password")
                               .longOpt("passwd")
                               .build());
-    // OmniSci transport options
+    // HEAVYAI transport options
     OptionGroup transport_grp = new OptionGroup();
     transport_grp.addOption(Option.builder()
-                                    .desc("use binary transport to connect to OmniSci ")
+                                    .desc("use binary transport to connect to HEAVYAI ")
                                     .longOpt("binary")
                                     .build());
     transport_grp.addOption(Option.builder()
-                                    .desc("use http transport to connect to OmniSci ")
+                                    .desc("use http transport to connect to HEAVYAI ")
                                     .longOpt("http")
                                     .build());
     transport_grp.addOption(Option.builder()
-                                    .desc("use https transport to connect to OmniSci ")
+                                    .desc("use https transport to connect to HEAVYAI ")
                                     .longOpt("https")
                                     .build());
     options.addOptionGroup(transport_grp);
 
-    // OmniSci database server details
+    // HEAVYAI database server details
     options.addOption(Option.builder("s")
                               .hasArg()
-                              .desc("OmniSci Server")
+                              .desc("HEAVYAI Server")
                               .longOpt("server")
                               .build());
     options.addOption(Option.builder("db")
                               .hasArg()
-                              .desc("OmniSci Database")
+                              .desc("HEAVYAI Database")
                               .longOpt("database")
                               .build());
     options.addOption(
-            Option.builder().hasArg().desc("OmniSci Port").longOpt("port").build());
+            Option.builder().hasArg().desc("HEAVYAI Port").longOpt("port").build());
 
-    // OmniSci server authentication options
+    // HEAVYAI server authentication options
     options.addOption(Option.builder()
                               .hasArg()
                               .desc("CA certificate trust store")
@@ -158,7 +153,7 @@ class SQLImporter_args {
                               .build());
     options.addOption(
             Option.builder()
-                    .desc("Inseure TLS - do not validate server OmniSci server credentials")
+                    .desc("Insecure TLS - do not validate server HEAVYAI server credentials")
                     .longOpt("insecure")
                     .build());
 
@@ -195,7 +190,7 @@ class SQLImporter_args {
 
     options.addOption(Option.builder("t")
                               .hasArg()
-                              .desc("OmniSci Target Table")
+                              .desc("HEAVYAI Target Table")
                               .longOpt("targetTable")
                               .required()
                               .build());
@@ -215,10 +210,29 @@ class SQLImporter_args {
                               .desc("Truncate table if it exists")
                               .longOpt("truncate")
                               .build());
+
     options.addOption(Option.builder("i")
                               .hasArg()
                               .desc("File containing init command for DB")
                               .longOpt("initializeFile")
+                              .build());
+
+    options.addOption(
+            Option.builder("adtf")
+                    .desc("Allow double to float conversion, note precision will be reduced")
+                    .longOpt("AllowDoubleToFloat")
+                    .build());
+
+    options.addOption(
+            Option.builder("ain")
+                    .desc("Allow conversion from bigger integer types to smaller. Overflow might occur, "
+                            + "use it only when casting is impossible")
+                    .longOpt("AllowIntegerNarrowing")
+                    .build());
+
+    options.addOption(Option.builder("nlj")
+                              .desc("Omit JDBC connection string from logs.")
+                              .longOpt("no-log-jdbc-connection-string")
                               .build());
   }
 
@@ -248,7 +262,7 @@ class SQLImporter_args {
         cmd = super.parse(options, strings);
         if (!cmd.hasOption("user") && !cmd.hasOption("client-cert")) {
           throw new MissingArgumentException(
-                  "Must supply either an OmniSci db user or a user certificate");
+                  "Must supply either an HEAVYAI db user or a user certificate");
         }
         // if user supplied must have password and visa versa
         if (cmd.hasOption("user") || cmd.hasOption("passwd")) {
@@ -306,7 +320,7 @@ class SQLImporter_args {
 
 public class SQLImporter {
   protected String session = null;
-  protected MapD.Client client = null;
+  protected Heavy.Client client = null;
   private CommandLine cmd = null;
   final static Logger LOGGER = LoggerFactory.getLogger(SQLImporter.class);
   private DateTimeUtils dateTimeUtils = (milliseconds) -> {
@@ -343,7 +357,11 @@ public class SQLImporter {
 
     try {
       // Open a connection
-      LOGGER.info("Connecting to database url :" + cmd.getOptionValue("jdbcConnect"));
+      if (cmd.hasOption("nlj")) {
+        LOGGER.info("Connecting to source database.");
+      } else {
+        LOGGER.info("Connecting to database url :" + cmd.getOptionValue("jdbcConnect"));
+      }
       conn = DriverManager.getConnection(cmd.getOptionValue("jdbcConnect"),
               cmd.getOptionValue("sourceUser"),
               cmd.getOptionValue("sourcePasswd"));
@@ -355,9 +373,10 @@ public class SQLImporter {
         run_init(conn);
       }
 
-      // set autocommit off to allow postgress to not load all results
       try {
-        conn.setAutoCommit(false);
+        if (vendor_types.isAutoCommitDisabledRequired()) {
+          conn.setAutoCommit(false);
+        }
       } catch (SQLException se) {
         LOGGER.warn(
                 "SQLException when attempting to setAutoCommit to false, jdbc driver probably doesnt support it.  Error is "
@@ -375,10 +394,10 @@ public class SQLImporter {
 
       ResultSet rs = stmt.executeQuery(cmd.getOptionValue("sqlStmt"));
 
-      // check if table already exists and is compatible in OmniSci with the query
+      // check if table already exists and is compatible in HEAVYAI with the query
       // metadata
       ResultSetMetaData md = rs.getMetaData();
-      checkMapDTable(conn, md);
+      checkDBTable(conn, md);
 
       timer = System.currentTimeMillis();
 
@@ -406,9 +425,9 @@ public class SQLImporter {
         bufferCount++;
         if (bufferCount == bufferSize) {
           bufferCount = 0;
-          // send the buffer to mapD
+          // send the buffer to HEAVY.AI
           client.load_table_binary_columnar(
-                  session, cmd.getOptionValue("targetTable"), cols); // old
+                  session, cmd.getOptionValue("targetTable"), cols, null);
           // recreate columnar store for use
           for (int i = 1; i <= md.getColumnCount(); i++) {
             resetBinaryColumn(i, md, bufferSize, cols.get(i - 1));
@@ -420,25 +439,26 @@ public class SQLImporter {
         }
       }
       if (bufferCount > 0) {
-        // send the LAST buffer to mapD
+        // send the LAST buffer to HEAVY.AI
         client.load_table_binary_columnar(
-                session, cmd.getOptionValue("targetTable"), cols);
+                session, cmd.getOptionValue("targetTable"), cols, null);
         bufferCount = 0;
       }
+
       LOGGER.info("result set count is " + resultCount + " read time is "
               + (System.currentTimeMillis() - timer) + "ms");
 
       // Clean-up environment
       rs.close();
       stmt.close();
+      conn.close();
 
       totalTime = System.currentTimeMillis() - startTime;
-      conn.close();
     } catch (SQLException se) {
       LOGGER.error("SQLException - " + se.toString());
       se.printStackTrace();
-    } catch (TMapDException ex) {
-      LOGGER.error("TMapDException - " + ex.toString());
+    } catch (TDBException ex) {
+      LOGGER.error("TDBException - " + ex.getError_msg());
       ex.printStackTrace();
     } catch (TException ex) {
       LOGGER.error("TException failed - " + ex.toString());
@@ -458,8 +478,19 @@ public class SQLImporter {
       } catch (SQLException se) {
         LOGGER.error("SQlException in close - " + se.toString());
         se.printStackTrace();
-      } // end finally try
-    } // end try
+      }
+      try {
+        if (session != null) {
+          client.disconnect(session);
+        }
+      } catch (TDBException ex) {
+        LOGGER.error("TDBException - in finalization " + ex.getError_msg());
+        ex.printStackTrace();
+      } catch (TException ex) {
+        LOGGER.error("TException - in finalization" + ex.toString());
+        ex.printStackTrace();
+      }
+    }
   }
 
   private void run_init(Connection conn) {
@@ -496,46 +527,157 @@ public class SQLImporter {
     formatter.printHelp("SQLImporter", options);
   }
 
-  private void checkMapDTable(Connection otherdb_conn, ResultSetMetaData md)
+  private void checkDBTable(Connection otherdb_conn, ResultSetMetaData md)
           throws SQLException {
-    createMapDConnection();
+    createDBConnection();
     String tName = cmd.getOptionValue("targetTable");
 
     if (tableExists(tName)) {
       // check if we want to truncate
       if (cmd.hasOption("truncate")) {
-        executeMapDCommand("Drop table " + tName);
-        createMapDTable(otherdb_conn, md);
+        executeDBCommand("Drop table " + tName);
+        createDBTable(otherdb_conn, md);
       } else {
         List<TColumnType> columnInfo = getColumnInfo(tName);
-        // table exists lets check it has same number of columns
-
-        if (md.getColumnCount() != columnInfo.size()) {
-          LOGGER.error("Table sizes do not match - OmniSci " + columnInfo.size()
-                  + " versus Select " + md.getColumnCount());
-          exit(1);
-        }
-        // table exists lets check it is same layout - check names will do for now
-        // Note weird start from 1 and reduce index by one is due to sql metatdata
-        // beinging with 1 not 0
-        for (int colNum = 1; colNum <= columnInfo.size(); colNum++) {
-          if (!columnInfo.get(colNum - 1)
-                          .col_name.equalsIgnoreCase(md.getColumnName(colNum))) {
-            LOGGER.error(
-                    "OmniSci Table does not have matching column in same order for column number"
-                    + colNum + " OmniSci column name is "
-                    + columnInfo.get(colNum - 1).col_name + " versus Select "
-                    + md.getColumnName(colNum));
-            exit(1);
-          }
-        }
+        verifyColumnSignaturesMatch(otherdb_conn, columnInfo, md);
       }
     } else {
-      createMapDTable(otherdb_conn, md);
+      createDBTable(otherdb_conn, md);
     }
   }
 
-  private void createMapDTable(Connection otherdb_conn, ResultSetMetaData metaData) {
+  private void verifyColumnSignaturesMatch(Connection otherdb_conn,
+          List<TColumnType> dstColumns,
+          ResultSetMetaData srcColumns) throws SQLException {
+    if (srcColumns.getColumnCount() != dstColumns.size()) {
+      LOGGER.error("Table sizes do not match: Destination " + dstColumns.size()
+              + " versus Source " + srcColumns.getColumnCount());
+      exit(1);
+    }
+    for (int i = 1; i <= dstColumns.size(); ++i) {
+      if (!dstColumns.get(i - 1).getCol_name().equalsIgnoreCase(
+                  srcColumns.getColumnName(i))) {
+        LOGGER.error(
+                "Destination table does not have matching column in same order for column number "
+                + i + " destination column name is " + dstColumns.get(i - 1).col_name
+                + " versus target column " + srcColumns.getColumnName(i));
+        exit(1);
+      }
+      TDatumType dstType = dstColumns.get(i - 1).getCol_type().getType();
+      int dstPrecision = dstColumns.get(i - 1).getCol_type().getPrecision();
+      int dstScale = dstColumns.get(i - 1).getCol_type().getScale();
+      int srcType = srcColumns.getColumnType(i);
+      int srcPrecision = srcColumns.getPrecision(i);
+      int srcScale = srcColumns.getScale(i);
+
+      boolean match = false;
+      switch (srcType) {
+        case java.sql.Types.TINYINT:
+          match |= dstType == TDatumType.TINYINT;
+          // NOTE: it's okay to import smaller type to a bigger one,
+          // so we just fall through and try to match the next type.
+          // But the order of case statements is important here!
+        case java.sql.Types.SMALLINT:
+          match |= dstType == TDatumType.SMALLINT;
+        case java.sql.Types.INTEGER:
+          match |= dstType == TDatumType.INT;
+        case java.sql.Types.BIGINT:
+          match |= dstType == TDatumType.BIGINT;
+          if (cmd.hasOption("AllowIntegerNarrowing")) {
+            match |= dstType == TDatumType.TINYINT || dstType == TDatumType.SMALLINT
+                    || dstType == TDatumType.INT;
+          }
+          break;
+        case java.sql.Types.DECIMAL:
+        case java.sql.Types.NUMERIC:
+          match = dstType == TDatumType.DECIMAL && dstPrecision == srcPrecision
+                  && dstScale == srcScale;
+          break;
+        case java.sql.Types.FLOAT:
+        case java.sql.Types.REAL:
+          match |= dstType == TDatumType.FLOAT;
+          // Fall through and try double
+        case java.sql.Types.DOUBLE:
+          match |= dstType == TDatumType.DOUBLE;
+          if (cmd.hasOption("AllowDoubleToFloat")) {
+            match |= dstType == TDatumType.FLOAT;
+          }
+          break;
+        case java.sql.Types.TIME:
+          match = dstType == TDatumType.TIME;
+          break;
+        case java.sql.Types.TIMESTAMP:
+          match = dstType == TDatumType.TIMESTAMP;
+          break;
+        case java.sql.Types.DATE:
+          match = dstType == TDatumType.DATE;
+          break;
+        case java.sql.Types.BOOLEAN:
+        case java.sql.Types
+                .BIT: // deal with postgres treating boolean as bit... this will bite me
+          match = dstType == TDatumType.BOOL;
+          break;
+        case java.sql.Types.NVARCHAR:
+        case java.sql.Types.VARCHAR:
+        case java.sql.Types.NCHAR:
+        case java.sql.Types.CHAR:
+        case java.sql.Types.LONGVARCHAR:
+        case java.sql.Types.LONGNVARCHAR:
+          match = (dstType == TDatumType.STR || dstType == TDatumType.POINT
+                  || dstType == TDatumType.POLYGON || dstType == TDatumType.MULTIPOLYGON
+                  || dstType == TDatumType.LINESTRING
+                  || dstType == TDatumType.MULTILINESTRING
+                  || dstType == TDatumType.MULTIPOINT);
+          break;
+        case java.sql.Types.OTHER:
+          // NOTE: I ignore subtypes (geography vs geopetry vs none) here just because
+          // it makes no difference for OmniSciDB at the moment
+          Db_vendor_types.GisType gisType =
+                  vendor_types.find_gis_type(otherdb_conn, srcColumns, i);
+          if (gisType.srid != dstScale) {
+            match = false;
+            break;
+          }
+          switch (dstType) {
+            case POINT:
+              match = gisType.type.equalsIgnoreCase("POINT");
+              break;
+            case MULTIPOINT:
+              match = gisType.type.equalsIgnoreCase("MULTIPOINT");
+              break;
+            case LINESTRING:
+              match = gisType.type.equalsIgnoreCase("LINESTRING");
+              break;
+            case MULTILINESTRING:
+              match = gisType.type.equalsIgnoreCase("MULTILINESTRING");
+              break;
+            case POLYGON:
+              match = gisType.type.equalsIgnoreCase("POLYGON");
+              break;
+            case MULTIPOLYGON:
+              match = gisType.type.equalsIgnoreCase("MULTIPOLYGON");
+              break;
+            default:
+              LOGGER.error("Column type " + JDBCType.valueOf(srcType).getName()
+                      + " not Supported");
+              exit(1);
+          }
+          break;
+        default:
+          LOGGER.error("Column type " + JDBCType.valueOf(srcType).getName()
+                  + " not Supported");
+          exit(1);
+      }
+      if (!match) {
+        LOGGER.error("Source and destination types for column "
+                + srcColumns.getColumnName(i)
+                + " do not match. Please make sure that type, precision and scale are exactly the same");
+        exit(1);
+      }
+    }
+  }
+
+  private void createDBTable(Connection otherdb_conn, ResultSetMetaData metaData) {
     StringBuilder sb = new StringBuilder();
     sb.append("Create table ").append(cmd.getOptionValue("targetTable")).append("(");
 
@@ -552,9 +694,9 @@ public class SQLImporter {
         sb.append(metaData.getColumnName(i)).append(" ");
         int col_type = metaData.getColumnType(i);
         if (col_type == java.sql.Types.OTHER) {
-          sb.append(vendor_types.find_gis_type(otherdb_conn,
-                  metaData.getColumnName(i),
-                  metaData.getColumnTypeName(i)));
+          Db_vendor_types.GisType type =
+                  vendor_types.find_gis_type(otherdb_conn, metaData, i);
+          sb.append(Db_vendor_types.gis_type_to_str(type));
         } else {
           sb.append(getColType(metaData.getColumnType(i),
                   metaData.getPrecision(i),
@@ -574,10 +716,10 @@ public class SQLImporter {
       exit(1);
     }
 
-    executeMapDCommand(sb.toString());
+    executeDBCommand(sb.toString());
   }
 
-  private void createMapDConnection() {
+  private void createDBConnection() {
     TTransport transport = null;
     TProtocol protocol = new TBinaryProtocol(transport);
     int port = Integer.valueOf(cmd.getOptionValue("port", "6274"));
@@ -587,22 +729,23 @@ public class SQLImporter {
       boolean load_trust_store = cmd.hasOption("https");
       SockTransportProperties skT = null;
       if (cmd.hasOption("https")) {
-        skT = new SockTransportProperties(load_trust_store & !cmd.hasOption("insecure"));
+        skT = SockTransportProperties.getEncryptedClientDefaultTrustStore(
+                !cmd.hasOption("insecure"));
         transport = skT.openHttpsClientTransport(server, port);
         transport.open();
         protocol = new TJSONProtocol(transport);
       } else if (cmd.hasOption("http")) {
-        skT = new SockTransportProperties(load_trust_store);
+        skT = SockTransportProperties.getUnencryptedClient();
         transport = skT.openHttpClientTransport(server, port);
         protocol = new TJSONProtocol(transport);
       } else {
-        skT = new SockTransportProperties(load_trust_store);
+        skT = SockTransportProperties.getUnencryptedClient();
         transport = skT.openClientTransport(server, port);
         transport.open();
         protocol = new TBinaryProtocol(transport);
       }
 
-      client = new MapD.Client(protocol);
+      client = new Heavy.Client(protocol);
       // This if will be useless until PKI signon
       if (cmd.hasOption("user")) {
         session = client.connect(cmd.getOptionValue("user", "admin"),
@@ -614,8 +757,8 @@ public class SQLImporter {
     } catch (TTransportException ex) {
       LOGGER.error("Connection failed - " + ex.toString());
       exit(1);
-    } catch (TMapDException ex) {
-      LOGGER.error("Connection failed - " + ex.toString());
+    } catch (TDBException ex) {
+      LOGGER.error("Connection failed - " + ex.getError_msg());
       exit(2);
     } catch (TException ex) {
       LOGGER.error("Connection failed - " + ex.toString());
@@ -632,8 +775,8 @@ public class SQLImporter {
     try {
       TTableDetails table_details = client.get_table_details(session, tName);
       row_descriptor = table_details.row_desc;
-    } catch (TMapDException ex) {
-      LOGGER.error("column check failed - " + ex.toString());
+    } catch (TDBException ex) {
+      LOGGER.error("column check failed - " + ex.getError_msg());
       exit(3);
     } catch (TException ex) {
       LOGGER.error("column check failed - " + ex.toString());
@@ -651,8 +794,8 @@ public class SQLImporter {
           return true;
         }
       }
-    } catch (TMapDException ex) {
-      LOGGER.error("Table check failed - " + ex.toString());
+    } catch (TDBException ex) {
+      LOGGER.error("Table check failed - " + ex.getError_msg());
       exit(3);
     } catch (TException ex) {
       LOGGER.error("Table check failed - " + ex.toString());
@@ -661,13 +804,13 @@ public class SQLImporter {
     return false;
   }
 
-  private void executeMapDCommand(String sql) {
-    LOGGER.info(" run comamnd :" + sql);
+  private void executeDBCommand(String sql) {
+    LOGGER.info("Run Command - " + sql);
 
     try {
       TQueryResult sqlResult = client.sql_execute(session, sql + ";", true, null, -1, -1);
-    } catch (TMapDException ex) {
-      LOGGER.error("SQL Execute failed - " + ex.toString());
+    } catch (TDBException ex) {
+      LOGGER.error("SQL Execute failed - " + ex.getError_msg());
       exit(1);
     } catch (TException ex) {
       LOGGER.error("SQL Execute failed - " + ex.toString());
@@ -883,6 +1026,7 @@ public class SQLImporter {
         }
         break;
       case java.sql.Types.OTHER:
+        Object objVal = rs.getObject(colNum);
         if (rs.wasNull()) {
           col.nulls.add(Boolean.TRUE);
           col.data.str_col.add("");
@@ -928,9 +1072,9 @@ public class SQLImporter {
       case java.sql.Types.CHAR:
       case java.sql.Types.LONGVARCHAR:
       case java.sql.Types.LONGNVARCHAR:
+      case java.sql.Types.OTHER:
         col.data.str_col.clear();
         break;
-
       default:
         throw new AssertionError("Column type " + md.getColumnType(i) + " not Supported");
     }

@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,15 +16,15 @@
 
 /**
  * @file		ArrayNoneEncoder.h
- * @author	Wei Hong <wei@mapd.com>
  * @brief		unencoded array encoder
  *
- * Copyright (c) 2014 MapD Technologies, Inc.  All rights reserved.
- **/
+ */
+
 #ifndef ARRAY_NONE_ENCODER_H
 #define ARRAY_NONE_ENCODER_H
 
-#include <glog/logging.h>
+#include "Logger/Logger.h"
+
 #include <cassert>
 #include <cstring>
 #include <memory>
@@ -37,6 +37,7 @@
 
 using Data_Namespace::AbstractBuffer;
 
+// TODO(Misiu): All of these functions should be moved to a .cpp file.
 class ArrayNoneEncoder : public Encoder {
  public:
   ArrayNoneEncoder(AbstractBuffer* buffer)
@@ -64,36 +65,81 @@ class ArrayNoneEncoder : public Encoder {
     return n - start_idx;
   }
 
-  ChunkMetadata appendData(int8_t*& srcData,
-                           const size_t numAppendElems,
-                           const SQLTypeInfo&,
-                           const bool replicating = false) override {
-    assert(false);  // should never be called for arrays
-    return ChunkMetadata{};
+  size_t getNumElemsForBytesEncodedDataAtIndices(const int8_t* index_data,
+                                                 const std::vector<size_t>& selected_idx,
+                                                 const size_t byte_limit) override {
+    size_t num_elements = 0;
+    size_t data_size = 0;
+    for (const auto& offset_index : selected_idx) {
+      auto element_size = getArrayDatumSizeAtIndex(index_data, offset_index);
+      if (data_size + element_size > byte_limit) {
+        break;
+      }
+      data_size += element_size;
+      num_elements++;
+    }
+    return num_elements;
   }
 
-  ChunkMetadata appendData(const std::vector<ArrayDatum>* srcData,
-                           const int start_idx,
-                           const size_t numAppendElems,
-                           const bool replicating) {
-    assert(index_buf != nullptr);  // index_buf must be set before this.
-    size_t index_size = numAppendElems * sizeof(ArrayOffsetT);
-    if (num_elems_ == 0) {
-      index_size += sizeof(ArrayOffsetT);  // plus one for the initial offset
-    }
-    index_buf->reserve(index_size);
+  std::shared_ptr<ChunkMetadata> appendData(int8_t*& src_data,
+                                            const size_t num_elems_to_append,
+                                            const SQLTypeInfo& ti,
+                                            const bool replicating = false,
+                                            const int64_t offset = -1) override {
+    UNREACHABLE();  // should never be called for arrays
+    return nullptr;
+  }
 
-    bool first_elem_is_null = false;
+  std::shared_ptr<ChunkMetadata> appendEncodedDataAtIndices(
+      const int8_t* index_data,
+      int8_t* data,
+      const std::vector<size_t>& selected_idx) override {
+    std::vector<ArrayDatum> data_subset;
+    data_subset.reserve(selected_idx.size());
+    for (const auto& offset_index : selected_idx) {
+      data_subset.emplace_back(getArrayDatumAtIndex(index_data, data, offset_index));
+    }
+    return appendData(&data_subset, 0, selected_idx.size(), false);
+  }
+
+  std::shared_ptr<ChunkMetadata> appendEncodedData(const int8_t* index_data,
+                                                   int8_t* data,
+                                                   const size_t start_idx,
+                                                   const size_t num_elements) override {
+    std::vector<ArrayDatum> data_subset;
+    data_subset.reserve(num_elements);
+    for (size_t count = 0; count < num_elements; ++count) {
+      auto current_index = start_idx + count;
+      data_subset.emplace_back(getArrayDatumAtIndex(index_data, data, current_index));
+    }
+    return appendData(&data_subset, 0, num_elements, false);
+  }
+
+  std::shared_ptr<ChunkMetadata> appendData(const std::vector<ArrayDatum>* srcData,
+                                            const int start_idx,
+                                            const size_t numAppendElems,
+                                            const bool replicating) {
+    CHECK(index_buf != nullptr);  // index_buf must be set before this.
+    size_t append_index_size = numAppendElems * sizeof(ArrayOffsetT);
+    if (num_elems_ == 0) {
+      append_index_size += sizeof(ArrayOffsetT);  // plus one for the initial offset
+    }
+    index_buf->reserve(index_buf->size() + append_index_size);
+
+    bool first_elem_padded = false;
     ArrayOffsetT initial_offset = 0;
     if (num_elems_ == 0) {
-      // If the very first ArrayDatum is NULL, initial offset will be set to 4
-      // so we could negate it and write it out to index buffer to convey NULLness
-      if ((*srcData)[0].is_null) {
-        initial_offset = 4;
-        first_elem_is_null = true;
+      if ((*srcData)[0].is_null || (*srcData)[0].length <= 1) {
+        // Covers following potentially problematic first arrays:
+        // (1) NULL array, issue - can't encode a NULL with 0 initial offset
+        // otherwise, if first array is not NULL:
+        // (2) length=1 array - could be followed by a {}*/NULL, covers tinyint,bool
+        // (3) empty array - could be followed by {}*/NULL, or {}*|{x}|{}*|NULL, etc.
+        initial_offset = DEFAULT_NULL_PADDING_SIZE;
+        first_elem_padded = true;
       }
       index_buf->append((int8_t*)&initial_offset,
-                        sizeof(ArrayOffsetT));  // write the inital offset
+                        sizeof(ArrayOffsetT));  // write the initial offset
       last_offset = initial_offset;
     } else {
       // Valid last_offset is never negative
@@ -104,28 +150,28 @@ class ArrayNoneEncoder : public Encoder {
                       sizeof(ArrayOffsetT),
                       index_buf->size() - sizeof(ArrayOffsetT),
                       Data_Namespace::CPU_LEVEL);
-      assert(last_offset != -1);
+      CHECK(last_offset != -1);
       // If the loaded offset is negative it means the last value was a NULL array,
       // convert to a valid last offset
       if (last_offset < 0) {
         last_offset = -last_offset;
       }
     }
-    // Need to start data from 4 byte offset if first array encoded is a NULL array
-    size_t data_size = (first_elem_is_null) ? 4 : 0;
+    // Need to start data from 8 byte offset if first array encoded is a NULL array
+    size_t append_data_size = (first_elem_padded) ? DEFAULT_NULL_PADDING_SIZE : 0;
     for (size_t n = start_idx; n < start_idx + numAppendElems; n++) {
       // NULL arrays don't take any space so don't add to the data size
       if ((*srcData)[replicating ? 0 : n].is_null) {
         continue;
       }
-      data_size += (*srcData)[replicating ? 0 : n].length;
+      append_data_size += (*srcData)[replicating ? 0 : n].length;
     }
-    buffer_->reserve(data_size);
+    buffer_->reserve(buffer_->size() + append_data_size);
 
-    size_t inbuf_size =
-        std::min(std::max(index_size, data_size), (size_t)MAX_INPUT_BUF_SIZE);
-    auto inbuf = new int8_t[inbuf_size];
-    std::unique_ptr<int8_t[]> gc_inbuf(inbuf);
+    size_t inbuf_size = std::min(std::max(append_index_size, append_data_size),
+                                 (size_t)MAX_INPUT_BUF_SIZE);
+    auto gc_inbuf = std::make_unique<int8_t[]>(inbuf_size);
+    auto inbuf = gc_inbuf.get();
     for (size_t num_appended = 0; num_appended < numAppendElems;) {
       ArrayOffsetT* p = (ArrayOffsetT*)inbuf;
       size_t i;
@@ -142,9 +188,10 @@ class ArrayNoneEncoder : public Encoder {
       index_buf->append(inbuf, i * sizeof(ArrayOffsetT));
     }
 
-    // Pad buffer_ with 4 bytes if first encoded array is a NULL array
-    if (first_elem_is_null) {
-      buffer_->append(inbuf, 4);
+    // Pad buffer_ with 8 bytes if first encoded array is a NULL array
+    if (first_elem_padded) {
+      auto padding_size = DEFAULT_NULL_PADDING_SIZE;
+      buffer_->append(inbuf, padding_size);
     }
     for (size_t num_appended = 0; num_appended < numAppendElems;) {
       size_t size = 0;
@@ -188,25 +235,44 @@ class ArrayNoneEncoder : public Encoder {
       update_elem_stats((*srcData)[replicating ? 0 : n]);
     }
     num_elems_ += numAppendElems;
-    ChunkMetadata chunkMetadata;
-    getMetadata(chunkMetadata);
-    return chunkMetadata;
+    auto chunk_metadata = std::make_shared<ChunkMetadata>();
+    getMetadata(chunk_metadata);
+    return chunk_metadata;
   }
 
-  void getMetadata(ChunkMetadata& chunkMetadata) override {
+  void getMetadata(const std::shared_ptr<ChunkMetadata>& chunkMetadata) override {
     Encoder::getMetadata(chunkMetadata);  // call on parent class
-    chunkMetadata.fillChunkStats(elem_min, elem_max, has_nulls);
+    chunkMetadata->fillChunkStats(elem_min, elem_max, has_nulls);
   }
 
   // Only called from the executor for synthesized meta-information.
-  ChunkMetadata getMetadata(const SQLTypeInfo& ti) override {
-    ChunkMetadata chunk_metadata{ti, 0, 0, ChunkStats{elem_min, elem_max, has_nulls}};
+  std::shared_ptr<ChunkMetadata> getMetadata(const SQLTypeInfo& ti) override {
+    auto chunk_metadata = std::make_shared<ChunkMetadata>(
+        ti, 0, 0, ChunkStats{elem_min, elem_max, has_nulls});
     return chunk_metadata;
   }
 
   void updateStats(const int64_t, const bool) override { CHECK(false); }
 
   void updateStats(const double, const bool) override { CHECK(false); }
+
+  void updateStats(const int8_t* const src_data, const size_t num_elements) override {
+    CHECK(false);
+  }
+
+  void updateStats(const std::vector<std::string>* const src_data,
+                   const size_t start_idx,
+                   const size_t num_elements) override {
+    UNREACHABLE();
+  }
+
+  void updateStats(const std::vector<ArrayDatum>* const src_data,
+                   const size_t start_idx,
+                   const size_t num_elements) override {
+    for (size_t n = start_idx; n < start_idx + num_elements; n++) {
+      update_elem_stats((*src_data)[n]);
+    }
+  }
 
   void reduceStats(const Encoder&) override { CHECK(false); }
 
@@ -237,16 +303,35 @@ class ArrayNoneEncoder : public Encoder {
     initialized = array_encoder->initialized;
   }
 
-  AbstractBuffer* get_index_buf() const { return index_buf; }
+  AbstractBuffer* getIndexBuf() const { return index_buf; }
+
+  bool resetChunkStats(const ChunkStats& stats) override {
+    auto elem_type = buffer_->getSqlType().get_elem_type();
+    if (initialized && DatumEqual(elem_min, stats.min, elem_type) &&
+        DatumEqual(elem_max, stats.max, elem_type) && has_nulls == stats.has_nulls) {
+      return false;
+    }
+    elem_min = stats.min;
+    elem_max = stats.max;
+    has_nulls = stats.has_nulls;
+    return true;
+  }
+
+  void resetChunkStats() override {
+    has_nulls = false;
+    initialized = false;
+  }
 
   Datum elem_min;
   Datum elem_max;
   bool has_nulls;
   bool initialized;
-  void set_index_buf(AbstractBuffer* buf) {
+  void setIndexBuffer(AbstractBuffer* buf) {
     std::unique_lock<std::mutex> lock(EncoderMutex_);
     index_buf = buf;
   }
+
+  static constexpr size_t DEFAULT_NULL_PADDING_SIZE{8};
 
  private:
   std::mutex EncoderMutex_;
@@ -256,18 +341,19 @@ class ArrayNoneEncoder : public Encoder {
   void update_elem_stats(const ArrayDatum& array) {
     if (array.is_null) {
       has_nulls = true;
-      return;
     }
-    switch (buffer_->sqlType.get_subtype()) {
+    switch (buffer_->getSqlType().get_subtype()) {
       case kBOOLEAN: {
-        if (!initialized && array.length == 0) {
-          elem_min.boolval = true;
-          elem_max.boolval = false;
+        if (!initialized) {
+          elem_min.boolval = 1;
+          elem_max.boolval = 0;
+        }
+        if (array.is_null || array.length == 0) {
           break;
         }
-        const bool* bool_array = (bool*)array.pointer;
+        const int8_t* bool_array = array.pointer;
         for (size_t i = 0; i < array.length / sizeof(bool); i++) {
-          if ((int8_t)bool_array[i] == NULL_BOOLEAN) {
+          if (bool_array[i] == NULL_BOOLEAN) {
             has_nulls = true;
           } else if (initialized) {
             elem_min.boolval = std::min(elem_min.boolval, bool_array[i]);
@@ -278,11 +364,14 @@ class ArrayNoneEncoder : public Encoder {
             initialized = true;
           }
         }
-      } break;
+        break;
+      }
       case kINT: {
-        if (!initialized && array.length == 0) {
+        if (!initialized) {
           elem_min.intval = 1;
           elem_max.intval = 0;
+        }
+        if (array.is_null || array.length == 0) {
           break;
         }
         const int32_t* int_array = (int32_t*)array.pointer;
@@ -298,11 +387,14 @@ class ArrayNoneEncoder : public Encoder {
             initialized = true;
           }
         }
-      } break;
+        break;
+      }
       case kSMALLINT: {
-        if (!initialized && array.length == 0) {
+        if (!initialized) {
           elem_min.smallintval = 1;
           elem_max.smallintval = 0;
+        }
+        if (array.is_null || array.length == 0) {
           break;
         }
         const int16_t* int_array = (int16_t*)array.pointer;
@@ -318,11 +410,14 @@ class ArrayNoneEncoder : public Encoder {
             initialized = true;
           }
         }
-      } break;
+        break;
+      }
       case kTINYINT: {
-        if (!initialized && array.length == 0) {
+        if (!initialized) {
           elem_min.tinyintval = 1;
           elem_max.tinyintval = 0;
+        }
+        if (array.is_null || array.length == 0) {
           break;
         }
         const int8_t* int_array = (int8_t*)array.pointer;
@@ -338,13 +433,16 @@ class ArrayNoneEncoder : public Encoder {
             initialized = true;
           }
         }
-      } break;
+        break;
+      }
       case kBIGINT:
       case kNUMERIC:
       case kDECIMAL: {
-        if (!initialized && array.length == 0) {
+        if (!initialized) {
           elem_min.bigintval = 1;
           elem_max.bigintval = 0;
+        }
+        if (array.is_null || array.length == 0) {
           break;
         }
         const int64_t* int_array = (int64_t*)array.pointer;
@@ -360,11 +458,14 @@ class ArrayNoneEncoder : public Encoder {
             initialized = true;
           }
         }
-      } break;
+        break;
+      }
       case kFLOAT: {
-        if (!initialized && array.length == 0) {
+        if (!initialized) {
           elem_min.floatval = 1.0;
           elem_max.floatval = 0.0;
+        }
+        if (array.is_null || array.length == 0) {
           break;
         }
         const float* flt_array = (float*)array.pointer;
@@ -380,11 +481,14 @@ class ArrayNoneEncoder : public Encoder {
             initialized = true;
           }
         }
-      } break;
+        break;
+      }
       case kDOUBLE: {
-        if (!initialized && array.length == 0) {
+        if (!initialized) {
           elem_min.doubleval = 1.0;
           elem_max.doubleval = 0.0;
+        }
+        if (array.is_null || array.length == 0) {
           break;
         }
         const double* dbl_array = (double*)array.pointer;
@@ -400,13 +504,16 @@ class ArrayNoneEncoder : public Encoder {
             initialized = true;
           }
         }
-      } break;
+        break;
+      }
       case kTIME:
       case kTIMESTAMP:
       case kDATE: {
-        if (!initialized && array.length == 0) {
+        if (!initialized) {
           elem_min.bigintval = 1;
           elem_max.bigintval = 0;
+        }
+        if (array.is_null || array.length == 0) {
           break;
         }
         const auto tm_array = reinterpret_cast<int64_t*>(array.pointer);
@@ -422,14 +529,17 @@ class ArrayNoneEncoder : public Encoder {
             initialized = true;
           }
         }
-      } break;
+        break;
+      }
       case kCHAR:
       case kVARCHAR:
       case kTEXT: {
-        assert(buffer_->sqlType.get_compression() == kENCODING_DICT);
-        if (!initialized && array.length == 0) {
+        CHECK_EQ(buffer_->getSqlType().get_compression(), kENCODING_DICT);
+        if (!initialized) {
           elem_min.intval = 1;
           elem_max.intval = 0;
+        }
+        if (array.is_null || array.length == 0) {
           break;
         }
         const int32_t* int_array = (int32_t*)array.pointer;
@@ -445,11 +555,37 @@ class ArrayNoneEncoder : public Encoder {
             initialized = true;
           }
         }
-      } break;
+        break;
+      }
       default:
-        assert(false);
+        UNREACHABLE();
     }
   };
+
+ private:
+  std::pair<ArrayOffsetT, ArrayOffsetT> getArrayOffsetsAtIndex(const int8_t* index_data,
+                                                               size_t index) {
+    auto array_offsets = reinterpret_cast<const ArrayOffsetT*>(index_data);
+    auto current_index = index + 1;
+    auto offset = array_offsets[current_index];
+    int64_t last_offset = array_offsets[current_index - 1];
+    return {offset, last_offset};
+  }
+
+  size_t getArrayDatumSizeAtIndex(const int8_t* index_data, size_t index) {
+    auto [offset, last_offset] = getArrayOffsetsAtIndex(index_data, index);
+    size_t array_byte_size = std::abs(offset) - std::abs(last_offset);
+    return array_byte_size;
+  }
+
+  ArrayDatum getArrayDatumAtIndex(const int8_t* index_data, int8_t* data, size_t index) {
+    auto [offset, last_offset] = getArrayOffsetsAtIndex(index_data, index);
+    size_t array_byte_size = std::abs(offset) - std::abs(last_offset);
+    bool is_null = offset < 0;
+    auto current_data = data + std::abs(last_offset);
+    return is_null ? ArrayDatum(0, nullptr, true, DoNothingDeleter{})
+                   : ArrayDatum(array_byte_size, current_data, false, DoNothingDeleter{});
+  }
 
 };  // class ArrayNoneEncoder
 

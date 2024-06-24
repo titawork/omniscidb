@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,11 +17,14 @@
 #ifndef ARCHIVE_ARCHIVE_H_
 #define ARCHIVE_ARCHIVE_H_
 
+#include <archive.h>
+#include <archive_entry.h>
+#include <map>
 #include <regex>
 #include <string>
 
-#include <archive.h>
-#include <archive_entry.h>
+// archive_entry.h includes windows.h
+#include "Shared/cleanup_global_namespace.h"
 
 // this is the base class from which all archives that represent files sources
 // hosted on native/netwrok filesystems, AWS S3, HDFS, HTTP URL, FTP URL, ...
@@ -95,7 +98,6 @@ class Archive {
 
   virtual bool read_next_header() {
     int rc;
-    archive_entry* entry;
     switch (rc = archive_read_next_header(ar, &entry)) {
       case ARCHIVE_EOF:
         return false;  // signal caller end of stream
@@ -116,7 +118,9 @@ class Archive {
     throw std::runtime_error(archive_error(rc));
   }
 
-  virtual int64_t get_position_compressed() const { return archive_filter_bytes(ar, -1); }
+  virtual int64_t get_position_compressed() const {
+    return archive_filter_bytes(ar, -1);
+  }
 
   /*  !!!
       7z files can't work with streaming model. Only local 7z files work.
@@ -129,9 +133,15 @@ class Archive {
          c) customize init_for_read() which uses archive_read_open
 
    */
-  virtual int open() { return ARCHIVE_OK; }              // nop
-  virtual int close() { return ARCHIVE_OK; }             // nop
-  virtual ssize_t read(const void** buff) { return 0; }  // nop
+  virtual int open() {
+    return ARCHIVE_OK;
+  }  // nop
+  virtual int close() {
+    return ARCHIVE_OK;
+  }  // nop
+  virtual ptrdiff_t read(const void** buff) {
+    return 0;
+  }  // nop
 
   virtual void init_for_read() {
     // set libarchive callbacks
@@ -139,7 +149,7 @@ class Archive {
   }
 
   // these methods are callback for libarchive
-  static ssize_t read(struct archive* a, void* client_data, const void** buff) {
+  static ptrdiff_t read(struct archive* a, void* client_data, const void** buff) {
     return ((Archive*)client_data)->read(buff);
   }
 
@@ -180,12 +190,19 @@ class Archive {
     }
   }
 
-  const std::string url_part(const int i) { return url_parts[i]; }
+  const std::string url_part(const int i) {
+    return url_parts[i];
+  }
+
+  std::string entryName() {
+    return std::string(archive_entry_pathname(entry));
+  }
 
  protected:
   std::string url;
   std::map<int, std::string> url_parts;
   archive* ar = 0;
+  archive_entry* entry;
   bool plain_text;
 };
 

@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,7 +17,6 @@
 #include <csignal>
 #include <cstdlib>
 
-#include <glog/logging.h>
 #include <gtest/gtest.h>
 
 #include <boost/algorithm/string.hpp>
@@ -27,20 +26,23 @@
 
 #include "Catalog/Catalog.h"
 #include "Fragmenter/InsertOrderFragmenter.h"
-#include "Import/Importer.h"
-#include "Parser/parser.h"
+#include "ImportExport/Importer.h"
+#include "Parser/ParserNode.h"
+#include "QueryEngine/Execute.h"
 #include "QueryEngine/ResultSet.h"
 #include "QueryEngine/TableOptimizer.h"
 #include "QueryRunner/QueryRunner.h"
-#include "Shared/MapDParameters.h"
 #include "Shared/UpdelRoll.h"
 #include "Shared/measure.h"
+#include "TestHelpers.h"
 
 #ifndef BASE_PATH
 #define BASE_PATH "./tmp"
 #endif
 
 using namespace Catalog_Namespace;
+
+using QR = QueryRunner::QueryRunner;
 
 namespace {
 struct UpdelTestConfig {
@@ -62,7 +64,7 @@ bool UpdelTestConfig::enableVarUpdelPerfTest = false;
 bool UpdelTestConfig::enableFixUpdelPerfTest = false;
 int64_t UpdelTestConfig::fixNumRows = fixNumRowsByDefault;
 int64_t UpdelTestConfig::varNumRows = varNumRowsByDefault;
-std::string UpdelTestConfig::fixFile = "trip_data_b.txt";
+std::string UpdelTestConfig::fixFile = "trip_data_dir/trip_data_b.txt";
 std::string UpdelTestConfig::varFile = "varlen.txt";
 std::string UpdelTestConfig::sequence = "rate_code_id";
 }  // namespace
@@ -84,11 +86,8 @@ struct ScalarTargetValueExtractor : public boost::static_visitor<std::string> {
 // namespace
 namespace {
 
-std::unique_ptr<SessionInfo> g_session;
-bool g_hoist_literals{true};
-
 inline void run_ddl_statement(const std::string& input_str) {
-  QueryRunner::run_ddl_statement(input_str, g_session);
+  QR::get()->runDDLStatement(input_str);
 }
 
 template <class T>
@@ -101,8 +100,7 @@ T v(const TargetValue& r) {
 }
 
 std::shared_ptr<ResultSet> run_query(const std::string& query_str) {
-  return QueryRunner::run_multiple_agg(
-      query_str, g_session, ExecutorDeviceType::CPU, g_hoist_literals, true);
+  return QR::get()->runSQL(query_str, ExecutorDeviceType::CPU, true, true);
 }
 
 bool compare_agg(const std::string& table,
@@ -143,16 +141,21 @@ void update_common(const std::string& table,
   std::vector<uint64_t> fragOffsets;
   std::vector<ScalarTargetValue> rhsValues;
   update_prepare_offsets_values<T>(cnt, step, val, fragOffsets, rhsValues);
-  Fragmenter_Namespace::InsertOrderFragmenter::updateColumn(
-      &g_session->getCatalog(),
-      table,
-      column,
-      0,  // 1st frag since we have only 100 rows
-      fragOffsets,
-      rhsValues,
-      rhsType,
-      Data_Namespace::MemoryLevel::CPU_LEVEL,
-      updelRoll);
+  auto catalog = QR::get()->getCatalog();
+  const auto td = catalog->getMetadataForTable(table);
+  CHECK(td);
+  CHECK(td->fragmenter);
+  const auto cd = catalog->getMetadataForColumn(td->tableId, column);
+  CHECK(cd);
+  td->fragmenter->updateColumn(catalog.get(),
+                               td,
+                               cd,
+                               0,  // 1st frag since we have only 100 rows
+                               fragOffsets,
+                               rhsValues,
+                               rhsType,
+                               Data_Namespace::MemoryLevel::CPU_LEVEL,
+                               updelRoll);
   if (commit) {
     updelRoll.commitUpdate();
   }
@@ -182,7 +185,7 @@ bool nullize_a_fixed_encoded_column(const std::string& table,
   update_common<int64_t>(
       table, column, cnt, 1, inline_int_null_value<T>(), SQLTypeInfo());
   std::string query_str =
-      "SELECT count() FROM " + table + " WHERE " + column + " IS NULL;";
+      "SELECT count(*) FROM " + table + " WHERE " + column + " IS NULL;";
   auto rows = run_query(query_str);
   auto crt_row = rows->getNextRow(true, true);
   CHECK_EQ(size_t(1), crt_row.size());
@@ -271,7 +274,7 @@ bool compare_row(const std::string& table,
                  const ResultRow& newr,
                  const TargetValue& val,
                  const bool commit) {
-  const auto cat = &g_session->getCatalog();
+  const auto cat = QR::get()->getCatalog();
   const auto td = cat->getMetadataForTable(table);
   const auto cdl = cat->getAllColumnMetadataForTable(td->tableId, false, false, false);
   const auto cds = std::vector<const ColumnDescriptor*>(cdl.begin(), cdl.end());
@@ -299,7 +302,7 @@ bool update_a_encoded_string_column(const std::string& table,
   update_common<const std::string>(table, column, cnt, step, val, SQLTypeInfo(), commit);
   // count updated string
   std::string query_str =
-      "SELECT count() FROM " + table + " WHERE " + column + " = '" + val + "';";
+      "SELECT count(*) FROM " + table + " WHERE " + column + " = '" + val + "';";
   auto rows = run_query(query_str);
   auto crt_row = rows->getNextRow(true, true);
   CHECK_EQ(size_t(1), crt_row.size());
@@ -319,7 +322,7 @@ bool update_a_boolean_column(const std::string& table,
       table, column, cnt, step, val ? "T" : "F", SQLTypeInfo(), commit);
   // count updated bools
   std::string query_str =
-      "SELECT count() FROM " + table + " WHERE " + (val ? "" : " NOT ") + column + ";";
+      "SELECT count(*) FROM " + table + " WHERE " + (val ? "" : " NOT ") + column + ";";
   auto rows = run_query(query_str);
   auto crt_row = rows->getNextRow(true, true);
   CHECK_EQ(size_t(1), crt_row.size());
@@ -363,20 +366,13 @@ void import_table_file(const std::string& table, const std::string& file) {
                           "../../Tests/Import/datafiles/" + file +
                           "' WITH (header='true');";
 
-  SQLParser parser;
-  std::list<std::unique_ptr<Parser::Stmt>> parse_trees;
-  std::string last_parsed;
-  if (parser.parse(query_str, parse_trees, last_parsed)) {
-    throw std::runtime_error("Failed to parse: " + query_str);
-  }
-  CHECK_EQ(parse_trees.size(), size_t(1));
+  auto stmt = QR::get()->createStatement(query_str);
 
-  const auto& stmt = parse_trees.front();
-  Parser::DDLStmt* ddl = dynamic_cast<Parser::DDLStmt*>(stmt.get());
-  if (!ddl) {
-    throw std::runtime_error("Not a DDLStmt: " + query_str);
+  auto copy_stmt = dynamic_cast<Parser::CopyTableStmt*>(stmt.get());
+  if (!copy_stmt) {
+    throw std::runtime_error("Expected a CopyTableStatment: " + query_str);
   }
-  ddl->execute(*g_session);
+  QR::get()->runImport(copy_stmt);
 }
 
 bool prepare_table_for_delete(const std::string& table = "trips",
@@ -390,23 +386,29 @@ bool prepare_table_for_delete(const std::string& table = "trips",
     rhsValues.emplace_back(ScalarTargetValue(i));
   }
   auto ms = measure<>::execution([&]() {
-    Fragmenter_Namespace::InsertOrderFragmenter::updateColumn(
-        &g_session->getCatalog(),
-        table,
-        column,
-        0,  // 1st frag since we have only 100 rows
-        fragOffsets,
-        rhsValues,
-        SQLTypeInfo(kBIGINT, false),
-        Data_Namespace::MemoryLevel::CPU_LEVEL,
-        updelRoll);
+    auto catalog = QR::get()->getCatalog();
+    const auto td = catalog->getMetadataForTable(table);
+    CHECK(td);
+    CHECK(td->fragmenter);
+    const auto cd = catalog->getMetadataForColumn(td->tableId, column);
+    CHECK(cd);
+
+    td->fragmenter->updateColumn(catalog.get(),
+                                 td,
+                                 cd,
+                                 0,  // 1st frag since we have only 100 rows
+                                 fragOffsets,
+                                 rhsValues,
+                                 SQLTypeInfo(kBIGINT, false),
+                                 Data_Namespace::MemoryLevel::CPU_LEVEL,
+                                 updelRoll);
   });
   if (UpdelTestConfig::showMeasuredTime) {
-    VLOG(2) << "time on update " << cnt << " rows:" << ms << " ms";
+    VLOG(1) << "time on update " << cnt << " rows:" << ms << " ms";
   }
   ms = measure<>::execution([&]() { updelRoll.commitUpdate(); });
   if (UpdelTestConfig::showMeasuredTime) {
-    VLOG(2) << "time on commit:" << ms << " ms";
+    VLOG(1) << "time on commit:" << ms << " ms";
   }
   return compare_agg(table, column, cnt, (0 + cnt - 1) * cnt / 2. / cnt);
 }
@@ -416,7 +418,7 @@ bool check_row_count_with_string(const std::string& table,
                                  const int64_t cnt,
                                  const std::string& val) {
   std::string query_str =
-      "SELECT count() FROM " + table + " WHERE " + column + " = '" + val + "';";
+      "SELECT count(*) FROM " + table + " WHERE " + column + " = '" + val + "';";
   auto rows = run_query(query_str);
   auto crt_row = rows->getNextRow(true, true);
   CHECK_EQ(size_t(1), crt_row.size());
@@ -453,7 +455,7 @@ bool delete_and_immediately_vacuum_rows(const std::string& table,
   }
 
   // delete and vacuum rows supposedly immediately
-  auto cat = &g_session->getCatalog();
+  auto cat = QR::get()->getCatalog().get();
   auto td = cat->getMetadataForTable(table);
   auto cd = cat->getMetadataForColumn(td->tableId, deleted_column);
   const_cast<ColumnDescriptor*>(cd)->isDeletedCol = true;
@@ -469,12 +471,12 @@ bool delete_and_immediately_vacuum_rows(const std::string& table,
                                  updelRoll);
   });
   if (UpdelTestConfig::showMeasuredTime) {
-    VLOG(2) << "time on delete & vacuum " << dcnt << " of " << nall << " rows:" << ms
+    VLOG(1) << "time on delete & vacuum " << dcnt << " of " << nall << " rows:" << ms
             << " ms";
   }
   ms = measure<>::execution([&]() { updelRoll.commitUpdate(); });
   if (UpdelTestConfig::showMeasuredTime) {
-    VLOG(2) << "time on commit:" << ms << " ms";
+    VLOG(1) << "time on commit:" << ms << " ms";
   }
   cnt = nall - cnt;
   // check varlen column vacuumed
@@ -508,22 +510,22 @@ bool delete_and_vacuum_varlen_rows(const std::string& table,
     ASSERT_NO_THROW(run_query("delete from " + table + " where " + cond + ";"););
   });
   if (UpdelTestConfig::showMeasuredTime) {
-    VLOG(2) << "time on delete " << (manual_vacuum ? "" : "& vacuum ")
+    VLOG(1) << "time on delete " << (manual_vacuum ? "" : "& vacuum ")
             << fragOffsets.size() << " rows:" << ms << " ms";
   }
 
   if (manual_vacuum) {
     ms = measure<>::execution([&]() {
-      auto cat = &g_session->getCatalog();
+      auto cat = QR::get()->getCatalog().get();
       const auto td = cat->getMetadataForTable(table,
                                                /*populateFragmenter=*/true);
-      auto executor = Executor::getExecutor(cat->getCurrentDB().dbId);
+      auto executor = Executor::getExecutor(Executor::UNITARY_EXECUTOR_ID);
       TableOptimizer optimizer(td, executor.get(), *cat);
       optimizer.vacuumDeletedRows();
       optimizer.recomputeMetadata();
     });
     if (UpdelTestConfig::showMeasuredTime) {
-      VLOG(2) << "time on vacuum:" << ms << " ms";
+      VLOG(1) << "time on vacuum:" << ms << " ms";
     }
   }
 
@@ -608,7 +610,7 @@ void init_table_data(const std::string& table = "trips",
   if (file.size()) {
     auto ms = measure<>::execution([&]() { import_table_file(table, file); });
     if (UpdelTestConfig::showMeasuredTime) {
-      VLOG(2) << "time on import: " << ms << " ms";
+      VLOG(1) << "time on import: " << ms << " ms";
     }
   }
 }
@@ -780,32 +782,6 @@ TEST_F(RowVacuumTest, Vacuum_Interleaved_4) {
                                                  0,
                                                  4));
 }
-
-// It is currently not possible to do select query on temp table w/o
-// MapDHandler. Perhaps in the future a thrift rpc like `push_table_details`
-// can be added to enable such queries here...
-#if 0
-const char* create_temp_table = "CREATE TEMPORARY TABLE temp(i int) WITH (vacuum='delayed');";
-
-class UpdateStorageTest_Temp : public ::testing::Test {
- protected:
-  virtual void SetUp() {
-    ASSERT_NO_THROW(init_table_data("temp", create_temp_table, ""););
-    EXPECT_NO_THROW(run_query("insert into temp values(1)"););
-    EXPECT_NO_THROW(run_query("insert into temp values(1)"););
-  }
-
-  virtual void TearDown() { ASSERT_NO_THROW(run_ddl_statement("drop table temp;");); }
-};
-
-TEST_F(UpdateStorageTest_Temp, Update_temp) {
-  EXPECT_TRUE(update_a_numeric_column("temp", "i", 2, 1, 99, 99));
-}
-
-TEST_F(UpdateStorageTest_Temp, Update_temp_rollback) {
-  EXPECT_TRUE(update_a_numeric_column("temp", "i", 2, 1, 99, 1, true));
-}
-#endif
 
 class UpdateStorageTest : public ::testing::Test {
  protected:
@@ -1080,11 +1056,223 @@ TEST_F(UpdateStorageTest, Half_boolean_deleted_rollback) {
 
 }  // namespace
 
+class VarLenColumnUpdateTest : public ::testing::Test {
+ protected:
+  static void SetUpTestSuite() { g_vacuum_min_selectivity = 1.1; }
+
+  void SetUp() override {
+    run_ddl_statement("drop table if exists test_table;");
+    run_ddl_statement(
+        "create table test_table (t text encoding none) with (fragment_size = 2);");
+  }
+
+  void TearDown() override { run_ddl_statement("drop table if exists test_table;"); }
+
+  void clearFragmenter() {
+    const auto catalog = QR::get()->getCatalog();
+    const auto td = catalog->getMetadataForTable("test_table", false);
+    catalog->removeFragmenterForTable(td->tableId);
+  }
+
+  void sqlAndCompareResult(const std::string& sql,
+                           const std::vector<std::string>& expected_result) {
+    auto result = run_query(sql);
+    ASSERT_EQ(expected_result.size(), result->rowCount());
+    for (const auto& expected_value : expected_result) {
+      auto row = result->getNextRow(true, true);
+      auto& target_value = boost::get<ScalarTargetValue>(row[0]);
+      auto& nullable_str = boost::get<NullableString>(target_value);
+      auto& value = boost::get<std::string>(nullable_str);
+      ASSERT_EQ(expected_value, value);
+    }
+  }
+
+  void assertElementCount(std::vector<size_t> counts_per_fragment) {
+    const auto catalog = QR::get()->getCatalog();
+    const auto td = catalog->getMetadataForTable("test_table");
+    CHECK(td->fragmenter);
+    ChunkKey table_chunk_key{catalog->getDatabaseId(), td->tableId};
+    ChunkMetadataVector metadata_vector;
+    catalog->getDataMgr().getChunkMetadataVecForKeyPrefix(metadata_vector,
+                                                          table_chunk_key);
+    for (const auto& [chunk_key, chunk_metadata] : metadata_vector) {
+      auto fragment_id = static_cast<size_t>(chunk_key[CHUNK_KEY_FRAGMENT_IDX]);
+      ASSERT_LT(fragment_id, counts_per_fragment.size());
+      ASSERT_EQ(counts_per_fragment[fragment_id], chunk_metadata->numElements);
+    }
+    for (size_t i = 0; i < counts_per_fragment.size(); i++) {
+      auto fragment_info = td->fragmenter->getFragmentInfo(i);
+      ASSERT_EQ(counts_per_fragment[i], fragment_info->getPhysicalNumTuples());
+    }
+  }
+};
+
+TEST_F(VarLenColumnUpdateTest, UpdateOnFullFragment) {
+  run_query("insert into test_table values ('a')");
+  run_query("insert into test_table values ('b')");
+
+  clearFragmenter();
+  run_query("update test_table set t = 'c' where t = 'a';");
+  assertElementCount({2, 1});
+  sqlAndCompareResult("select * from test_table;", {"b", "c"});
+}
+
+TEST_F(VarLenColumnUpdateTest, UpdateOnFragmentWithSpace) {
+  run_query("insert into test_table values ('a')");
+
+  clearFragmenter();
+  run_query("update test_table set t = 'c' where t = 'a';");
+  assertElementCount({2});
+  sqlAndCompareResult("select * from test_table;", {"c"});
+}
+
+class TableWithImmediateVacuumTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    run_ddl_statement("drop table if exists test_table;");
+    run_ddl_statement(
+        "create table test_table (i int, t text encoding none) with (vacuum = "
+        "'immediate');");
+    run_query("insert into test_table values (1, 'a');");
+  }
+
+  void TearDown() override { run_ddl_statement("drop table if exists test_table;"); }
+
+  void sqlAndAssertException(const std::string& query, const std::string& error_message) {
+    try {
+      run_query(query);
+      FAIL() << "An exception should have been thrown for this test case";
+    } catch (const std::exception& e) {
+      ASSERT_EQ(error_message, e.what());
+    }
+  }
+
+  void sqlAndCompareResult(const std::string& query,
+                           int64_t i_column,
+                           const std::string& t_column) {
+    auto result = run_query(query);
+    ASSERT_EQ(static_cast<size_t>(1), result->rowCount());
+    ASSERT_EQ(static_cast<size_t>(2), result->colCount());
+
+    auto row = result->getNextRow(true, true);
+    auto& target_value_1 = boost::get<ScalarTargetValue>(row[0]);
+    EXPECT_EQ(i_column, boost::get<int64_t>(target_value_1));
+
+    auto& target_value_2 = boost::get<ScalarTargetValue>(row[1]);
+    auto& nullable_str = boost::get<NullableString>(target_value_2);
+    EXPECT_EQ(t_column, boost::get<std::string>(nullable_str));
+  }
+};
+
+TEST_F(TableWithImmediateVacuumTest, Delete) {
+  sqlAndAssertException("delete from test_table where i = 1;",
+                        "DELETE queries are only supported on tables with the vacuum "
+                        "attribute set to 'delayed'");
+}
+
+TEST_F(TableWithImmediateVacuumTest, VarLenColumnUpdate) {
+  sqlAndAssertException("update test_table set t = 'b' where t = 'a';",
+                        "UPDATE queries involving variable length columns are only "
+                        "supported on tables with the vacuum attribute set to 'delayed'");
+}
+
+TEST_F(TableWithImmediateVacuumTest, FixedLenColumnUpdate) {
+  sqlAndCompareResult("select * from test_table;", 1, "a");
+  run_query("update test_table set i = 2 where i = 1;");
+  sqlAndCompareResult("select * from test_table;", 2, "a");
+}
+
+using TestResultSet = std::vector<std::tuple<int32_t, std::string, std::string>>;
+class UpdateAndDeleteQueryTest : public ::testing::Test {
+ public:
+  static void SetUpTestSuite() {
+    run_ddl_statement(
+        "CREATE TABLE test_table_2 (i INTEGER, t TEXT ENCODING DICT(32), "
+        "t2 TEXT ENCODING NONE) WITH (fragment_size = 2);");
+    run_query(
+        "INSERT INTO test_table_2 VALUES (1, 'a', 'aaa'), (10, 'aa', 'aa'), "
+        "(100, 'aaa', 'a');");
+  }
+
+  static void TearDownTestSuite() {
+    run_ddl_statement("DROP TABLE IF EXISTS test_table_2;");
+  }
+
+  void SetUp() override {
+    run_ddl_statement("DROP TABLE IF EXISTS test_table_1;");
+    run_ddl_statement(
+        "CREATE TABLE test_table_1 (i INTEGER, t TEXT ENCODING DICT(32), "
+        "t2 TEXT ENCODING NONE) WITH (fragment_size = 2);");
+    run_query(
+        "INSERT INTO test_table_1 VALUES (1, 'a', 'cc'), (2, 'b', 'bb'), "
+        "(10, 'aa', 'aa'), (20, 'bb', 'b'), (30, 'cc', 'a');");
+  }
+
+  void TearDown() override { run_ddl_statement("DROP TABLE IF EXISTS test_table_1;"); }
+
+  void sqlAndCompareResult(const std::string& query,
+                           const TestResultSet& expected_result) {
+    auto result = run_query(query);
+    ASSERT_EQ(expected_result.size(), result->rowCount());
+    ASSERT_EQ(result->colCount(), size_t(3));
+
+    for (const auto& expected_row : expected_result) {
+      auto row = result->getNextRow(true, true);
+      EXPECT_EQ(std::get<0>(expected_row), getInt(row[0]));
+      EXPECT_EQ(std::get<1>(expected_row), getString(row[1]));
+      EXPECT_EQ(std::get<2>(expected_row), getString(row[2]));
+    }
+  }
+
+  int64_t getInt(const TargetValue& target_value) {
+    const auto& scalar_value = boost::get<ScalarTargetValue>(target_value);
+    return boost::get<int64_t>(scalar_value);
+  }
+
+  std::string getString(const TargetValue& target_value) {
+    const auto& scalar_value = boost::get<ScalarTargetValue>(target_value);
+    const auto& nullable_str = boost::get<NullableString>(scalar_value);
+    return boost::get<std::string>(nullable_str);
+  }
+};
+
+TEST_F(UpdateAndDeleteQueryTest, DeleteWithNestedQuery) {
+  run_query("DELETE FROM test_table_1 WHERE i IN (SELECT i FROM test_table_2);");
+  sqlAndCompareResult("SELECT * FROM test_table_1 ORDER BY i;",
+                      TestResultSet{{2, "b", "bb"}, {20, "bb", "b"}, {30, "cc", "a"}});
+}
+
+TEST_F(UpdateAndDeleteQueryTest, UpdateWithNestedQuery) {
+  run_query("UPDATE test_table_1 SET t = 'abc' WHERE i IN (SELECT i FROM test_table_2);");
+  sqlAndCompareResult("SELECT * FROM test_table_1 ORDER BY i;",
+                      TestResultSet{{1, "abc", "cc"},
+                                    {2, "b", "bb"},
+                                    {10, "abc", "aa"},
+                                    {20, "bb", "b"},
+                                    {30, "cc", "a"}});
+}
+
 int main(int argc, char** argv) {
-  google::InitGoogleLogging(argv[0]);
+  TestHelpers::init_logger_stderr_only(argc, argv);
   testing::InitGoogleTest(&argc, argv);
 
-  g_session.reset(QueryRunner::get_session(BASE_PATH));
+  namespace po = boost::program_options;
+  po::options_description desc("Options");
+  // these two are here to allow passing correctly google testing parameters
+  desc.add_options()("gtest_list_tests", "list all test");
+  desc.add_options()("gtest_filter", "filters tests, use --help for details");
+  desc.add_options()("use-disk-cache",
+                     "Use the disk cache for all tables with default size settings.");
+  po::variables_map vm;
+  po::store(po::command_line_parser(argc, argv).options(desc).run(), vm);
+  po::notify(vm);
+  File_Namespace::DiskCacheConfig disk_cache_config{};
+  if (vm.count("use-disk-cache")) {
+    disk_cache_config = File_Namespace::DiskCacheConfig{
+        File_Namespace::DiskCacheConfig::getDefaultPath(std::string(BASE_PATH)),
+        File_Namespace::DiskCacheLevel::all};
+  }
+  QR::init(&disk_cache_config, BASE_PATH);
 
   // the data files for perf tests are too big to check in, so perf tests
   // are done privately in someone's dev host. prog option seems a overkill.
@@ -1111,6 +1299,6 @@ int main(int argc, char** argv) {
   } catch (const std::exception& e) {
     LOG(ERROR) << e.what();
   }
-  g_session.reset(nullptr);
+  QR::reset();
   return err;
 }

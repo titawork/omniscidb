@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,14 +16,17 @@
 
 /**
  * @file    StreamInsert.cpp
- * @author  Wei Hong <wei@mapd.com>
  * @brief   Sample MapD Client code for inserting a stream of rows
  * with optional transformations from stdin to a MapD table.
  *
- * Copyright (c) 2014 MapD Technologies, Inc.  All rights reserved.
- **/
+ */
 
-#include <boost/regex.hpp>
+#ifdef HAVE_THRIFT_MESSAGE_LIMIT
+#include "Shared/ThriftConfig.h"
+#endif
+
+#include "Shared/clean_boost_regex.hpp"
+
 #include <cstring>
 #include <iostream>
 #include <iterator>
@@ -38,25 +41,11 @@
 #include <thrift/protocol/TBinaryProtocol.h>
 #include <thrift/transport/TBufferTransports.h>
 #include <thrift/transport/TSocket.h>
-#include "gen-cpp/MapD.h"
+#include "gen-cpp/Heavy.h"
 
 using namespace ::apache::thrift;
 using namespace ::apache::thrift::protocol;
 using namespace ::apache::thrift::transport;
-
-#ifdef HAVE_THRIFT_STD_SHAREDPTR
-#include <memory>
-namespace mapd {
-using std::make_shared;
-using std::shared_ptr;
-}  // namespace mapd
-#else
-#include <boost/make_shared.hpp>
-namespace mapd {
-using boost::make_shared;
-using boost::shared_ptr;
-}  // namespace mapd
-#endif  // HAVE_THRIFT_STD_SHAREDPTR
 
 struct CopyParams {
   char delimiter;
@@ -95,9 +84,9 @@ struct ConnectionDetails {
 bool print_error_data = false;
 bool print_transformation = false;
 
-mapd::shared_ptr<MapDClient> client;
+std::shared_ptr<HeavyClient> client;
 TSessionId session;
-mapd::shared_ptr<apache::thrift::transport::TTransport> mytransport;
+std::shared_ptr<apache::thrift::transport::TTransport> mytransport;
 
 namespace {
 // anonymous namespace for private functions
@@ -105,15 +94,22 @@ namespace {
 #define MAX_FIELD_LEN 20000
 
 void createConnection(ConnectionDetails con) {
-  mapd::shared_ptr<TTransport> socket(new TSocket(con.server_host, con.port));
+#ifdef HAVE_THRIFT_MESSAGE_LIMIT
+  std::shared_ptr<TTransport> socket(
+      new TSocket(con.server_host, con.port, shared::default_tconfig()));
+  mytransport.reset(new TBufferedTransport(socket, shared::default_tconfig()));
+#else
+  std::shared_ptr<TTransport> socket(new TSocket(con.server_host, con.port));
   mytransport.reset(new TBufferedTransport(socket));
-  mapd::shared_ptr<TProtocol> protocol(new TBinaryProtocol(mytransport));
-  client.reset(new MapDClient(protocol));
+#endif
+  std::shared_ptr<TProtocol> protocol(new TBinaryProtocol(mytransport));
+
+  client.reset(new HeavyClient(protocol));
   try {
     mytransport->open();  // open transport
     client->connect(
-        session, con.user_name, con.passwd, con.db_name);  // connect to omnisci_server
-  } catch (TMapDException& e) {
+        session, con.user_name, con.passwd, con.db_name);  // connect to heavydb
+  } catch (TDBException& e) {
     std::cerr << e.error_msg << std::endl;
   } catch (TException& te) {
     std::cerr << "Thrift error: " << te.what() << std::endl;
@@ -122,9 +118,9 @@ void createConnection(ConnectionDetails con) {
 
 void closeConnection() {
   try {
-    client->disconnect(session);  // disconnect from omnisci_server
+    client->disconnect(session);  // disconnect from heavydb
     mytransport->close();         // close transport
-  } catch (TMapDException& e) {
+  } catch (TDBException& e) {
     std::cerr << e.error_msg << std::endl;
   } catch (TException& te) {
     std::cerr << "Thrift error: " << te.what() << std::endl;
@@ -137,7 +133,7 @@ void wait_disconnet_reconnnect_retry(size_t tries,
   std::cout << "  Waiting  " << copy_params.retry_wait
             << " secs to retry Inserts , will try " << (copy_params.retry_count - tries)
             << " times more " << std::endl;
-  sleep(copy_params.retry_wait);
+  std::this_thread::sleep_for(std::chrono::seconds(copy_params.retry_wait));
 
   closeConnection();
   createConnection(conn_details);
@@ -152,13 +148,13 @@ void do_load(int& nrows,
   for (size_t tries = 0; tries < copy_params.retry_count;
        tries++) {  // allow for retries in case of insert failure
     try {
-      client->load_table(session, table_name, input_rows);
+      client->load_table(session, table_name, input_rows, {});
       nrows += input_rows.size();
       std::cout << nrows << " Rows Inserted, " << nskipped << " rows skipped."
                 << std::endl;
       // we successfully loaded the data, lets move on
       return;
-    } catch (TMapDException& e) {
+    } catch (TDBException& e) {
       std::cerr << "Exception trying to insert data " << e.error_msg << std::endl;
       wait_disconnet_reconnnect_retry(tries, copy_params, conn_details);
     } catch (TException& te) {
@@ -196,8 +192,9 @@ void stream_insert(
   int nskipped = 0;
   bool backEscape = false;
 
-  const std::pair<std::unique_ptr<boost::regex>, std::unique_ptr<std::string>>*
-      xforms[row_desc.size()];
+  std::vector<
+      const std::pair<std::unique_ptr<boost::regex>, std::unique_ptr<std::string>>*>
+      xforms(row_desc.size());
   for (size_t i = 0; i < row_desc.size(); i++) {
     auto it = transformations.find(row_desc[i].col_name);
     if (it != transformations.end()) {
@@ -346,9 +343,9 @@ int main(int argc, char** argv) {
       "passwd,p", po::value<std::string>(&passwd)->required(), "User Password");
   desc.add_options()("host",
                      po::value<std::string>(&server_host)->default_value(server_host),
-                     "OmniSci Server Hostname");
+                     "HeavyDB Server Hostname");
   desc.add_options()(
-      "port", po::value<int>(&port)->default_value(port), "OmniSci Server Port Number");
+      "port", po::value<int>(&port)->default_value(port), "HeavyDB Server Port Number");
   desc.add_options()("delim",
                      po::value<std::string>(&delim_str)->default_value(delim_str),
                      "Field delimiter");

@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,10 +16,8 @@
 
 /**
  * @file    QueryMemoryDescriptor.h
- * @author  Alex Suhan <alex@mapd.com>
  * @brief   Descriptor for the result set buffer layout.
  *
- * Copyright (c) 2014 MapD Technologies, Inc.  All rights reserved.
  */
 
 #ifndef QUERYENGINE_QUERYMEMORYDESCRIPTOR_H
@@ -30,8 +28,8 @@
 #include "ColSlotContext.h"
 #include "Types.h"
 
-#include <glog/logging.h>
 #include <boost/optional.hpp>
+#include "Logger/Logger.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -43,7 +41,6 @@
 
 #include <Shared/SqlTypesLayout.h>
 #include <Shared/TargetInfo.h>
-#include <Shared/unreachable.h>
 
 extern bool g_cluster;
 
@@ -52,17 +49,19 @@ class QueryExecutionContext;
 class RenderInfo;
 class RowSetMemoryOwner;
 struct InputTableInfo;
-
-// Shared: threads in the same block share memory, atomic operations required
-// SharedForKeylessOneColumnKnownRange: special case of "Shared", but for keyless
-// aggregates with single column group by
-enum class GroupByMemSharing { Shared, SharedForKeylessOneColumnKnownRange };
-
 struct RelAlgExecutionUnit;
 class TResultSetBufferDescriptor;
 class GroupByAndAggregate;
 struct ColRangeInfo;
 struct KeylessInfo;
+
+class StreamingTopNOOM : public std::runtime_error {
+ public:
+  StreamingTopNOOM(const size_t heap_size_bytes)
+      : std::runtime_error("Unable to use streaming top N due to required heap size of " +
+                           std::to_string(heap_size_bytes) +
+                           " bytes exceeding maximum slab size.") {}
+};
 
 class QueryMemoryDescriptor {
  public:
@@ -80,15 +79,15 @@ class QueryMemoryDescriptor {
                         const ColSlotContext& col_slot_context,
                         const std::vector<int8_t>& group_col_widths,
                         const int8_t group_col_compact_width,
-                        const std::vector<ssize_t>& target_groupby_indices,
+                        const std::vector<int64_t>& target_groupby_indices,
                         const size_t entry_count,
-                        const GroupByMemSharing sharing,
-                        const bool shared_mem_for_group_by,
                         const CountDistinctDescriptors count_distinct_descriptors,
                         const bool sort_on_gpu_hint,
                         const bool output_columnar,
                         const bool render_output,
-                        const bool must_use_baseline_sort);
+                        const bool must_use_baseline_sort,
+                        const bool use_streaming_top_n,
+                        const bool threads_can_reuse_group_by_buffers);
 
   QueryMemoryDescriptor(const Executor* executor,
                         const size_t entry_count,
@@ -121,18 +120,24 @@ class QueryMemoryDescriptor {
       RenderInfo* render_info,
       const CountDistinctDescriptors count_distinct_descriptors,
       const bool must_use_baseline_sort,
-      const bool output_columnar_hint);
+      const bool output_columnar_hint,
+      const bool streaming_top_n_hint,
+      const bool threads_can_reuse_group_by_buffers);
 
   std::unique_ptr<QueryExecutionContext> getQueryExecutionContext(
       const RelAlgExecutionUnit&,
       const Executor* executor,
       const ExecutorDeviceType device_type,
+      const ExecutorDispatchMode dispatch_mode,
       const int device_id,
+      const shared::TableKey& outer_table_key,
+      const int64_t num_rows,
       const std::vector<std::vector<const int8_t*>>& col_buffers,
       const std::vector<std::vector<uint64_t>>& frag_offsets,
       std::shared_ptr<RowSetMemoryOwner>,
       const bool output_columnar,
       const bool sort_on_gpu,
+      const size_t thread_idx,
       RenderInfo*) const;
 
   static bool many_entries(const int64_t max_val,
@@ -177,7 +182,6 @@ class QueryMemoryDescriptor {
   int32_t getTargetIdxForKey() const { return idx_target_as_key_; }
   void setTargetIdxForKey(const int32_t val) { idx_target_as_key_ = val; }
 
-  size_t groupColWidthsSize() const { return group_col_widths_.size(); }
   int8_t groupColWidth(const size_t key_idx) const {
     CHECK_LT(key_idx, group_col_widths_.size());
     return group_col_widths_[key_idx];
@@ -199,6 +203,8 @@ class QueryMemoryDescriptor {
   const int8_t getPaddedSlotWidthBytes(const size_t slot_idx) const;
   const int8_t getLogicalSlotWidthBytes(const size_t slot_idx) const;
 
+  void setPaddedSlotWidthBytes(const size_t slot_idx, const int8_t bytes);
+
   const int8_t getSlotIndexForSingleSlotCol(const size_t col_idx) const;
 
   size_t getPaddedColWidthForRange(const size_t offset, const size_t range) const {
@@ -216,15 +222,36 @@ class QueryMemoryDescriptor {
 
   void addColSlotInfo(const std::vector<std::tuple<int8_t, int8_t>>& slots_for_col);
 
+  // FlatBuffer support:
+  void addColSlotInfoFlatBuffer(const int64_t flatbuffer_size);
+  int64_t getFlatBufferSize(const size_t slot_idx) const {
+    return col_slot_context_.getFlatBufferSize(slot_idx);
+  }
+  bool checkSlotUsesFlatBufferFormat(const size_t slot_idx) const {
+    return col_slot_context_.checkSlotUsesFlatBufferFormat(slot_idx);
+  }
+  int64_t getPaddedSlotBufferSize(const size_t slot_idx) const;
+
   void clearSlotInfo();
 
   void alignPaddedSlots();
 
-  ssize_t getTargetGroupbyIndex(const size_t target_idx) const {
+  int64_t getTargetGroupbyIndex(const size_t target_idx) const {
     CHECK_LT(target_idx, target_groupby_indices_.size());
     return target_groupby_indices_[target_idx];
   }
+
+  void setAllTargetGroupbyIndices(std::vector<int64_t> group_by_indices) {
+    target_groupby_indices_ = group_by_indices;
+  }
+
   size_t targetGroupbyIndicesSize() const { return target_groupby_indices_.size(); }
+  size_t targetGroupbyNegativeIndicesSize() const {
+    return std::count_if(
+        target_groupby_indices_.begin(),
+        target_groupby_indices_.end(),
+        [](const int64_t& target_group_by_index) { return target_group_by_index < 0; });
+  }
   void clearTargetGroupbyIndices() { target_groupby_indices_.clear(); }
 
   size_t getEntryCount() const { return entry_count_; }
@@ -235,9 +262,8 @@ class QueryMemoryDescriptor {
   int64_t getBucket() const { return bucket_; }
 
   bool hasNulls() const { return has_nulls_; }
-  GroupByMemSharing getGpuMemSharing() const { return sharing_; }
 
-  const CountDistinctDescriptor getCountDistinctDescriptor(const size_t idx) const {
+  const CountDistinctDescriptor& getCountDistinctDescriptor(const size_t idx) const {
     CHECK_LT(idx, count_distinct_descriptors_.size());
     return count_distinct_descriptors_[idx];
   }
@@ -251,7 +277,19 @@ class QueryMemoryDescriptor {
   bool didOutputColumnar() const { return output_columnar_; }
   void setOutputColumnar(const bool val);
 
+  bool useStreamingTopN() const { return use_streaming_top_n_; }
+
+  bool isLogicalSizedColumnsAllowed() const;
+
   bool mustUseBaselineSort() const { return must_use_baseline_sort_; }
+
+  bool threadsCanReuseGroupByBuffers() const {
+    return threads_can_reuse_group_by_buffers_;
+  }
+
+  void setThreadsCanReuseGroupByBuffers(const bool val) {
+    threads_can_reuse_group_by_buffers_ = val;
+  }
 
   // TODO(adb): remove and store this info more naturally in another
   // member
@@ -267,6 +305,8 @@ class QueryMemoryDescriptor {
                             const unsigned thread_count,
                             const ExecutorDeviceType device_type) const;
   size_t getBufferSizeBytes(const ExecutorDeviceType device_type) const;
+  size_t getBufferSizeBytes(const ExecutorDeviceType device_type,
+                            const size_t override_entry_count) const;
 
   const ColSlotContext& getColSlotContext() const { return col_slot_context_; }
 
@@ -280,13 +320,15 @@ class QueryMemoryDescriptor {
 
   bool interleavedBins(const ExecutorDeviceType) const;
 
-  size_t sharedMemBytes(const ExecutorDeviceType) const;
-
   size_t getColOffInBytes(const size_t col_idx) const;
   size_t getColOffInBytesInNextBin(const size_t col_idx) const;
   size_t getNextColOffInBytes(const int8_t* col_ptr,
                               const size_t bin,
                               const size_t col_idx) const;
+
+  // returns the ptr offset of the next column, 64-bit aligned
+  size_t getNextColOffInBytesRowOnly(const int8_t* col_ptr, const size_t col_idx) const;
+  // returns the ptr offset of the current column, 64-bit aligned
   size_t getColOnlyOffInBytes(const size_t col_idx) const;
   size_t getRowSize() const;
   size_t getColsSize() const;
@@ -300,7 +342,35 @@ class QueryMemoryDescriptor {
 
   bool isWarpSyncRequired(const ExecutorDeviceType) const;
 
+  std::string queryDescTypeToString() const;
   std::string toString() const;
+
+  std::string reductionKey() const;
+
+  bool hasVarlenOutput() const { return col_slot_context_.hasVarlenOutput(); }
+
+  // returns a value if the buffer can be a fixed size; otherwise, we will need to use the
+  // bump allocator
+  std::optional<size_t> varlenOutputBufferElemSize() const;
+
+  // returns the number of bytes needed for all slots preceeding slot_idx. Used to compute
+  // the offset into the varlen buffer for each projected target in a given row.
+  size_t varlenOutputRowSizeToSlot(const size_t slot_idx) const;
+
+  bool slotIsVarlenOutput(const size_t slot_idx) const {
+    return col_slot_context_.slotIsVarlen(slot_idx);
+  }
+
+  size_t getAvailableCpuThreads() const { return num_available_threads_; }
+
+  void setAvailableCpuThreads(size_t num_available_threads) const {
+    num_available_threads_ = num_available_threads;
+  }
+
+  std::optional<size_t> getMaxPerDeviceCardinality(
+      const RelAlgExecutionUnit& ra_exe_unit) const;
+
+  bool canUsePerDeviceCardinality(const RelAlgExecutionUnit& ra_exe_unit) const;
 
  protected:
   void resetGroupColWidths(const std::vector<int8_t>& new_group_col_widths) {
@@ -313,28 +383,37 @@ class QueryMemoryDescriptor {
   QueryDescriptionType query_desc_type_;
   bool keyless_hash_;
   bool interleaved_bins_on_gpu_;
-  int32_t idx_target_as_key_;
+  int32_t idx_target_as_key_;  // If keyless_hash_ enabled, then represents what target
+                               // expression should be used to identify the key (e.g., in
+                               // locating empty entries). Currently only valid with
+                               // keyless_hash_ and single-column GroupByPerfectHash
   std::vector<int8_t> group_col_widths_;
   int8_t group_col_compact_width_;  // compact width for all group
                                     // cols if able to be consistent
                                     // otherwise 0
-  std::vector<ssize_t> target_groupby_indices_;
+  std::vector<int64_t> target_groupby_indices_;
   size_t entry_count_;  // the number of entries in the main buffer
   int64_t min_val_;     // meaningful for OneColKnownRange,
                         // MultiColPerfectHash only
   int64_t max_val_;
   int64_t bucket_;
   bool has_nulls_;
-  GroupByMemSharing sharing_;  // meaningful for GPU only
   CountDistinctDescriptors count_distinct_descriptors_;
   bool sort_on_gpu_;
   bool output_columnar_;
   bool render_output_;
   bool must_use_baseline_sort_;
-
+  bool use_streaming_top_n_;
+  bool threads_can_reuse_group_by_buffers_;
   bool force_4byte_float_;
 
   ColSlotContext col_slot_context_;
+
+  // # available CPU threads can be used for this query kernel, i.e., to parallelize rest
+  // of query initialization step its default value is one which means we do not
+  // parallelize for the query kernel, and it will be updated to a proper value before
+  // performing the query initialization
+  mutable size_t num_available_threads_{1};
 
   size_t getTotalBytesOfColumnarBuffers() const;
   size_t getTotalBytesOfColumnarBuffers(const size_t num_entries_per_column) const;
@@ -342,9 +421,6 @@ class QueryMemoryDescriptor {
 
   friend class ResultSet;
   friend class QueryExecutionContext;
-
-  template <typename META_CLASS_TYPE>
-  friend class AggregateReductionEgress;
 };
 
 inline void set_notnull(TargetInfo& target, const bool not_null) {

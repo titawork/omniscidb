@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,17 +14,8 @@
  * limitations under the License.
  */
 
-#ifndef QUERYENGINE_CALCITEADAPTER_H
-#define QUERYENGINE_CALCITEADAPTER_H
-
-#include "../Catalog/Catalog.h"
-#include "../Planner/Planner.h"
+#pragma once
 
 #include <string>
 
-Planner::RootPlan* translate_query(const std::string& query,
-                                   const Catalog_Namespace::Catalog& catalog);
-
 std::string pg_shim(const std::string&);
-
-#endif  // QUERYENGINE_CALCITEADAPTER_H

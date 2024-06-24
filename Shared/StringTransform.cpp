@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,10 +15,23 @@
  */
 
 #include "StringTransform.h"
+#include "Logger/Logger.h"
+
+#include <boost/algorithm/string/classification.hpp>  // Include boost::for is_any_of
+#include <boost/algorithm/string/split.hpp>           // Include for boost::split
 
 #include <numeric>
 #include <random>
 #include <regex>
+#include <string>
+
+#include <cmath>   // format_bytes round call
+#include <vector>  // format_bytes
+
+#ifndef __CUDACC__
+#include <boost/filesystem.hpp>
+#include <iomanip>
+#endif
 
 void apply_shim(std::string& result,
                 const boost::regex& reg_expr,
@@ -33,8 +46,8 @@ void apply_shim(std::string& result,
     }
     const auto next_start =
         inside_string_literal(what.position(), what.length(), lit_pos);
-    if (next_start >= 0) {
-      start_it = result.cbegin() + next_start;
+    if (next_start) {
+      start_it = result.cbegin() + *next_start;
     } else {
       shim_fn(result, what);
       lit_pos = find_string_literals(result);
@@ -51,7 +64,17 @@ std::vector<std::pair<size_t, size_t>> find_string_literals(const std::string& q
   auto prev_it = it;
   std::vector<std::pair<size_t, size_t>> positions;
   while (true) {
-    if (!boost::regex_search(it, query.end(), what, literal_string_regex)) {
+    try {
+      if (!boost::regex_search(it, query.end(), what, literal_string_regex)) {
+        break;
+      }
+    } catch (const std::exception& e) {
+      LOG(WARNING) << "Error processing literals: " << e.what()
+                   << "\nContinuing query parse...";
+      // boost::regex throws an exception about the complexity of matching when
+      // the wrong type of quotes are used or they're mismatched. Let the query
+      // through unmodified, the parser will throw a much more informative error.
+      // This can also throw on very long queries
       break;
     }
     CHECK_GT(what[1].length(), 0);
@@ -67,7 +90,9 @@ std::string hide_sensitive_data_from_query(std::string const& query_str) {
   constexpr std::regex::flag_type flags =
       std::regex::ECMAScript | std::regex::icase | std::regex::optimize;
   static const std::initializer_list<std::pair<std::regex, std::string>> rules{
-      {std::regex(R"(\b((?:password|s3_access_key|s3_secret_key)\s*=\s*)'.+?')", flags),
+      {std::regex(
+           R"(\b((?:password|s3_access_key|s3_secret_key|s3_session_token|username|credential_string)\s*=\s*)'.+?')",
+           flags),
        "$1'XXXXXXXX'"},
       {std::regex(R"((\\set_license\s+)\S+)", flags), "$1XXXXXXXX"}};
   return std::accumulate(
@@ -76,17 +101,29 @@ std::string hide_sensitive_data_from_query(std::string const& query_str) {
       });
 }
 
-ssize_t inside_string_literal(
-    const size_t start,
-    const size_t length,
-    const std::vector<std::pair<size_t, size_t>>& literal_positions) {
-  const auto end = start + length;
-  for (const auto& literal_position : literal_positions) {
-    if (literal_position.first <= start && end <= literal_position.second) {
-      return literal_position.second;
-    }
+std::string format_num_bytes(const size_t bytes) {
+  const size_t units_per_k_unit{1024};
+  const std::vector<std::string> byte_units = {" bytes", "KB", "MB", "GB", "TB", "PB"};
+  const std::vector<size_t> bytes_per_scale_unit = {size_t(1),
+                                                    size_t(1) << 10,
+                                                    size_t(1) << 20,
+                                                    size_t(1) << 30,
+                                                    size_t(1) << 40,
+                                                    size_t(1) << 50,
+                                                    size_t(1) << 60};
+  if (bytes < units_per_k_unit) {
+    return std::to_string(bytes) + " bytes";
   }
-  return -1;
+  CHECK_GE(bytes, units_per_k_unit);
+  const size_t byte_scale = log(bytes) / log(units_per_k_unit);
+  CHECK_GE(byte_scale, size_t(1));
+  CHECK_LE(byte_scale, size_t(5));
+  const size_t scaled_bytes_left_of_decimal = bytes / bytes_per_scale_unit[byte_scale];
+  const size_t scaled_bytes_right_of_decimal = bytes % bytes_per_scale_unit[byte_scale];
+  const size_t fractional_digits = static_cast<double>(scaled_bytes_right_of_decimal) /
+                                   bytes_per_scale_unit[byte_scale] * 100.;
+  return std::to_string(scaled_bytes_left_of_decimal) + "." +
+         std::to_string(fractional_digits) + " " + byte_units[byte_scale];
 }
 
 template <>
@@ -97,6 +134,19 @@ std::string to_string(char const*&& v) {
 template <>
 std::string to_string(std::string&& v) {
   return std::move(v);
+}
+
+std::pair<std::string_view, const char*> substring(const std::string& str,
+                                                   size_t substr_length) {
+  // return substring with a post_fix
+  // assume input str is valid and we perform substring starting from str's initial pos
+  // (=0)
+  const auto str_size = str.size();
+  if (substr_length >= str_size) {
+    return {str, ""};
+  }
+  std::string_view substr(str.c_str(), substr_length);
+  return {substr, "..."};
 }
 
 std::string generate_random_string(const size_t len) {
@@ -116,20 +166,60 @@ std::string generate_random_string(const size_t len) {
   return str;
 }
 
-std::vector<std::string> split(const std::string& str, const std::string& delim) {
-  CHECK(!delim.empty());
+#ifndef __CUDACC__
+// This version of split works almost exactly like Python's split,
+// which is very convienently-designed.
+// See also: https://docs.python.org/3.8/library/stdtypes.html#str.split
+std::vector<std::string> split(std::string_view str,
+                               std::string_view delim,
+                               std::optional<size_t> maxsplit) {
   std::vector<std::string> result;
-  std::string::size_type i = 0, j = 0;
-  while ((i = str.find(delim, i)) != std::string::npos) {
-    result.emplace_back(str, j, i - j);
-    i += delim.size();
-    j = i;
+
+  // Use an explicit delimiter.
+  if (!delim.empty()) {
+    std::string::size_type i = 0, j = 0;
+    while ((i = str.find(delim, i)) != std::string::npos &&
+           (!maxsplit || result.size() < maxsplit.value())) {
+      result.emplace_back(str, j, i - j);
+      i += delim.size();
+      j = i;
+    }
+    result.emplace_back(str, j, std::string::npos);
+    return result;
+
+    // Treat any number of consecutive whitespace characters as a delimiter.
+  } else {
+    bool prev_ws = true;
+    std::string::size_type i = 0, j = 0;
+    for (; i < str.size(); ++i) {
+      if (prev_ws) {
+        if (!isspace(str[i])) {
+          // start of word
+          prev_ws = false;
+          j = i;
+        }
+      } else {
+        if (isspace(str[i])) {
+          // start of space
+          result.emplace_back(str, j, i - j);
+          prev_ws = true;
+          j = i;
+          if ((maxsplit && result.size() == maxsplit.value())) {
+            // stop early if maxsplit was reached
+            result.emplace_back(str, j, std::string::npos);
+            return result;
+          }
+        }
+      }
+    }
+    if (!prev_ws) {
+      result.emplace_back(str, j, std::string::npos);
+    }
+    return result;
   }
-  result.emplace_back(str, j);
-  return result;
 }
 
-std::string strip(const std::string& str) {
+std::string_view sv_strip(std::string_view str) {
   std::string::size_type i, j;
   for (i = 0; i < str.size() && std::isspace(str[i]); ++i) {
   }
@@ -137,3 +227,79 @@ std::string strip(const std::string& str) {
   }
   return str.substr(i, j - i);
 }
+
+std::string strip(std::string_view str) {
+  return std::string(sv_strip(str));
+}
+
+std::optional<size_t> inside_string_literal(
+    const size_t start,
+    const size_t length,
+    const std::vector<std::pair<size_t, size_t>>& literal_positions) {
+  const auto end = start + length;
+  for (const auto& literal_position : literal_positions) {
+    if (literal_position.first <= start && end <= literal_position.second) {
+      return literal_position.second;
+    }
+  }
+  return std::nullopt;
+}
+
+#endif  // __CUDACC__
+
+bool remove_unquoted_newlines_linefeeds_and_tabs_from_sql_string(
+    std::string& str) noexcept {
+  char inside_quote = 0;
+  bool previous_c_was_backslash = false;
+  for (auto& c : str) {
+    // if this character is a quote of either type
+    if (c == '\'' || c == '\"') {
+      // ignore if previous character was a backslash
+      if (!previous_c_was_backslash) {
+        // start or end of a quoted region
+        if (inside_quote == c) {
+          // end region
+          inside_quote = 0;
+        } else if (inside_quote == 0) {
+          // start region
+          inside_quote = c;
+        }
+      }
+    } else if (inside_quote == 0) {
+      // outside quoted region
+      if (c == '\n' || c == '\t' || c == '\r') {
+        // replace these with space
+        c = ' ';
+      }
+      // otherwise leave alone, including quotes of a different type
+    }
+    // handle backslashes, except for double backslashes
+    if (c == '\\') {
+      previous_c_was_backslash = !previous_c_was_backslash;
+    } else {
+      previous_c_was_backslash = false;
+    }
+  }
+  // if we didn't end a region, there were unclosed or mixed-nested quotes
+  // accounting for backslashes should mean that this should only be the
+  // case with truly malformed strings which Calcite will barf on anyway
+  return (inside_quote == 0);
+}
+
+#ifndef __CUDACC__
+std::string get_quoted_string(const std::string& filename, char quote, char escape) {
+  std::stringstream ss;
+  ss << std::quoted(filename, quote, escape);  // TODO: prevents string_view Jun 2020
+  return ss.str();
+}
+#endif  // __CUDACC__
+
+#ifndef __CUDACC__
+std::string simple_sanitize(const std::string& str) {
+  auto sanitized_str{str};
+  for (auto& c : sanitized_str) {
+    c = (c < 32) ? ' ' : c;
+  }
+  return sanitized_str;
+}
+#endif  // __CUDACC__

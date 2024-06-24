@@ -1,11 +1,28 @@
 #include <cuda.h>
 #include <float.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <limits>
 #include "BufferCompaction.h"
 #include "ExtensionFunctions.hpp"
 #include "GpuRtConstants.h"
 #include "HyperLogLogRank.h"
+
+#if CUDA_VERSION < 10000
+static_assert(false, "CUDA v10.0 or later is required.");
+#endif
+
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 350)
+static_assert(false, "CUDA Compute Capability of 3.5 or greater is required.");
+#endif
+
+extern "C" __device__ int64_t get_thread_index() {
+  return threadIdx.x;
+}
+
+extern "C" __device__ int64_t get_block_index() {
+  return blockIdx.x;
+}
 
 extern "C" __device__ int32_t pos_start_impl(const int32_t* row_index_resume) {
   return blockIdx.x * blockDim.x + threadIdx.x;
@@ -32,117 +49,34 @@ extern "C" __device__ const int64_t* init_shared_mem_nop(
 extern "C" __device__ void write_back_nop(int64_t* dest, int64_t* src, const int32_t sz) {
 }
 
-extern "C" __device__ const int64_t* init_shared_mem(const int64_t* groups_buffer,
+/*
+ * Just declares and returns a dynamic shared memory pointer. Total size should be
+ * properly set during kernel launch
+ */
+extern "C" __device__ int64_t* declare_dynamic_shared_memory() {
+  extern __shared__ int64_t shared_mem_buffer[];
+  return shared_mem_buffer;
+}
+
+/**
+ * Initializes the shared memory buffer for perfect hash group by.
+ * In this function, we simply copy the global group by buffer (already initialized on the
+ * host and transferred) to all shared memory group by buffers.
+ */
+extern "C" __device__ const int64_t* init_shared_mem(const int64_t* global_groups_buffer,
                                                      const int32_t groups_buffer_size) {
-  extern __shared__ int64_t fast_bins[];
-  if (threadIdx.x == 0) {
-    memcpy(fast_bins, groups_buffer, groups_buffer_size);
+  // dynamic shared memory declaration
+  extern __shared__ int64_t shared_groups_buffer[];
+
+  // it is assumed that buffer size is aligned with 64-bit units
+  // so it is safe to assign 64-bit to each thread
+  const int32_t buffer_units = groups_buffer_size >> 3;
+
+  for (int32_t pos = threadIdx.x; pos < buffer_units; pos += blockDim.x) {
+    shared_groups_buffer[pos] = global_groups_buffer[pos];
   }
   __syncthreads();
-  return fast_bins;
-}
-
-/**
- * Dynamically allocates shared memory per block.
- * The amount of shared memory allocated is defined at kernel launch time.
- * Returns a pointer to the beginning of allocated shared memory
- */
-extern "C" __device__ int64_t* alloc_shared_mem_dynamic() {
-  extern __shared__ int64_t groups_buffer_smem[];
-  return groups_buffer_smem;
-}
-
-/**
- * Set the allocated shared memory elements to be equal to the 'identity_element'.
- * groups_buffer_size: number of 64-bit elements in shared memory per thread-block
- * NOTE: groups_buffer_size is in units of 64-bit elements.
- */
-extern "C" __device__ void set_shared_mem_to_identity(
-    int64_t* groups_buffer_smem,
-    const int32_t groups_buffer_size,
-    const int64_t identity_element = 0) {
-#pragma unroll
-  for (int i = threadIdx.x; i < groups_buffer_size; i += blockDim.x) {
-    groups_buffer_smem[i] = identity_element;
-  }
-  __syncthreads();
-}
-
-/**
- * Initialize dynamic shared memory:
- * 1. Allocates dynamic shared memory
- * 2. Set every allocated element to be equal to the 'identity element', by default zero.
- */
-extern "C" __device__ const int64_t* init_shared_mem_dynamic(
-    const int64_t* groups_buffer,
-    const int32_t groups_buffer_size) {
-  int64_t* groups_buffer_smem = alloc_shared_mem_dynamic();
-  set_shared_mem_to_identity(groups_buffer_smem, groups_buffer_size);
-  return groups_buffer_smem;
-}
-
-extern "C" __device__ void write_back(int64_t* dest, int64_t* src, const int32_t sz) {
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    memcpy(dest, src, sz);
-  }
-}
-
-extern "C" __device__ void write_back_smem_nop(int64_t* dest,
-                                               int64_t* src,
-                                               const int32_t sz) {}
-
-extern "C" __device__ void agg_from_smem_to_gmem_nop(int64_t* gmem_dest,
-                                                     int64_t* smem_src,
-                                                     const int32_t num_elements) {}
-
-/**
- * Aggregate the result stored into shared memory back into global memory.
- * It also writes back the stored binId, if any, back into global memory.
- * Memory layout assumption: each 64-bit shared memory unit of data is as follows:
- * [0..31: the stored bin ID, to be written back][32..63: the count result, to be
- * aggregated]
- */
-extern "C" __device__ void agg_from_smem_to_gmem_binId_count(int64_t* gmem_dest,
-                                                             int64_t* smem_src,
-                                                             const int32_t num_elements) {
-  __syncthreads();
-#pragma unroll
-  for (int i = threadIdx.x; i < num_elements; i += blockDim.x) {
-    int32_t bin_id = *reinterpret_cast<int32_t*>(smem_src + i);
-    int32_t count_result = *(reinterpret_cast<int32_t*>(smem_src + i) + 1);
-    if (count_result) {  // non-zero count
-      atomicAdd(reinterpret_cast<unsigned int*>(gmem_dest + i) + 1,
-                static_cast<int32_t>(count_result));
-      // writing back the binId, only if count_result is non-zero
-      *reinterpret_cast<unsigned int*>(gmem_dest + i) = static_cast<int32_t>(bin_id);
-    }
-  }
-}
-
-/**
- * Aggregate the result stored into shared memory back into global memory.
- * It also writes back the stored binId, if any, back into global memory.
- * Memory layout assumption: each 64-bit shared memory unit of data is as follows:
- * [0..31: the count result, to be aggregated][32..63: the stored bin ID, to be written
- * back]
- */
-extern "C" __device__ void agg_from_smem_to_gmem_count_binId(int64_t* gmem_dest,
-                                                             int64_t* smem_src,
-                                                             const int32_t num_elements) {
-  __syncthreads();
-#pragma unroll
-  for (int i = threadIdx.x; i < num_elements; i += blockDim.x) {
-    int32_t count_result = *reinterpret_cast<int32_t*>(smem_src + i);
-    int32_t bin_id = *(reinterpret_cast<int32_t*>(smem_src + i) + 1);
-    if (count_result) {  // non-zero count
-      atomicAdd(reinterpret_cast<unsigned int*>(gmem_dest + i),
-                static_cast<int32_t>(count_result));
-      // writing back the binId, only if count_result is non-zero
-      *(reinterpret_cast<unsigned int*>(gmem_dest + i) + 1) =
-          static_cast<int32_t>(bin_id);
-    }
-  }
+  return shared_groups_buffer;
 }
 
 #define init_group_by_buffer_gpu_impl init_group_by_buffer_gpu
@@ -158,6 +92,7 @@ __device__ int64_t dw_sm_cycle_start[128];  // Set from host before launching th
 // TODO(Saman): make this cycle budget something constant in codegen level
 __device__ int64_t dw_cycle_budget = 0;  // Set from host before launching the kernel
 __device__ int32_t dw_abort = 0;         // TBD: set from host (async)
+__device__ int32_t runtime_interrupt_flag = 0;
 
 __inline__ __device__ uint32_t get_smid(void) {
   uint32_t ret;
@@ -166,13 +101,13 @@ __inline__ __device__ uint32_t get_smid(void) {
 }
 
 /*
- * The main objective of this funciton is to return true, if any of the following two
- * scnearios happen:
+ * The main objective of this function is to return true, if any of the following two
+ * scenarios happen:
  * 1. receives a host request for aborting the kernel execution
  * 2. kernel execution takes longer clock cycles than it was initially allowed
  * The assumption is that all (or none) threads within a block return true for the
  * watchdog, and the first thread within each block compares the recorded clock cycles for
- * its occupying SM with the allowed budget. It also assumess that all threads entering
+ * its occupying SM with the allowed budget. It also assumes that all threads entering
  * this function are active (no critical edge exposure)
  * NOTE: dw_cycle_budget, dw_abort, and dw_sm_cycle_start[] are all variables in global
  * memory scope.
@@ -219,6 +154,10 @@ extern "C" __device__ bool dynamic_watchdog() {
   }
   __syncthreads();
   return dw_should_terminate;
+}
+
+extern "C" __device__ bool check_interrupt() {
+  return (runtime_interrupt_flag == 1) ? true : false;
 }
 
 template <typename T = unsigned long long>
@@ -274,8 +213,7 @@ extern "C" __device__ int64_t* get_matching_group_value(int64_t* groups_buffer,
                                                         const int64_t* key,
                                                         const uint32_t key_count,
                                                         const uint32_t key_width,
-                                                        const uint32_t row_size_quad,
-                                                        const int64_t* init_vals) {
+                                                        const uint32_t row_size_quad) {
   switch (key_width) {
     case 4:
       return get_matching_group_value(groups_buffer,
@@ -300,25 +238,30 @@ __device__ int32_t get_matching_group_value_columnar_slot(int64_t* groups_buffer
                                                           const uint32_t h,
                                                           const T* key,
                                                           const uint32_t key_count) {
-  uint32_t off = h;
-  {
-    const uint64_t old =
-        atomicCAS(reinterpret_cast<T*>(groups_buffer + off), get_empty_key<T>(), *key);
-    if (old == get_empty_key<T>()) {
-      for (size_t i = 0; i < key_count; ++i) {
-        groups_buffer[off] = key[i];
-        off += entry_count;
-      }
-      return h;
+  const T empty_key = get_empty_key<T>();
+  const uint64_t old =
+      atomicCAS(reinterpret_cast<T*>(groups_buffer + h), empty_key, *key);
+  // the winner thread proceeds with writing the rest fo the keys
+  if (old == empty_key) {
+    uint32_t offset = h + entry_count;
+    for (size_t i = 1; i < key_count; ++i) {
+      *reinterpret_cast<T*>(groups_buffer + offset) = key[i];
+      offset += entry_count;
     }
   }
-  __syncthreads();
-  off = h;
-  for (size_t i = 0; i < key_count; ++i) {
-    if (groups_buffer[off] != key[i]) {
-      return -1;
+
+  __threadfence();
+  // for all threads except the winning thread, memory content of the keys
+  // related to the hash offset are checked again. In case of a complete match
+  // the hash offset is returned, otherwise -1 is returned
+  if (old != empty_key) {
+    uint32_t offset = h;
+    for (uint32_t i = 0; i < key_count; ++i) {
+      if (*reinterpret_cast<T*>(groups_buffer + offset) != key[i]) {
+        return -1;
+      }
+      offset += entry_count;
     }
-    off += entry_count;
   }
   return h;
 }
@@ -380,7 +323,7 @@ extern "C" __device__ int64_t* get_matching_group_value_columnar(
 }
 
 #include "GroupByRuntime.cpp"
-#include "JoinHashTableQueryRuntime.cpp"
+#include "JoinHashTable/Runtime/JoinHashTableQueryRuntime.cpp"
 #include "MurmurHash.cpp"
 #include "TopKRuntime.cpp"
 
@@ -408,9 +351,7 @@ __device__ int64_t atomicMin64(int64_t* address, int64_t val) {
   return old;
 }
 
-// As of 20160418, CUDA 8.0EA only defines `atomicAdd(double*, double)` for compute
-// capability >= 6.0.
-#if CUDA_VERSION < 8000 || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 600)
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 600)
 __device__ double atomicAdd(double* address, double val) {
   unsigned long long int* address_as_ull = (unsigned long long int*)address;
   unsigned long long int old = *address_as_ull, assumed;
@@ -487,11 +428,21 @@ __device__ double atomicMin(float* address, float val) {
 }
 
 extern "C" __device__ uint64_t agg_count_shared(uint64_t* agg, const int64_t val) {
-  return static_cast<uint64_t>(atomicAdd(reinterpret_cast<uint32_t*>(agg), 1UL));
+  return static_cast<uint64_t>(atomicAdd(reinterpret_cast<uint32_t*>(agg), 1U));
+}
+
+extern "C" __device__ uint64_t agg_count_if_shared(uint64_t* agg, const int64_t cond) {
+  return cond ? static_cast<uint64_t>(atomicAdd(reinterpret_cast<uint32_t*>(agg), 1U))
+              : static_cast<uint64_t>(*(reinterpret_cast<uint32_t*>(agg)));
 }
 
 extern "C" __device__ uint32_t agg_count_int32_shared(uint32_t* agg, const int32_t val) {
-  return atomicAdd(agg, 1UL);
+  return atomicAdd(agg, 1U);
+}
+
+extern "C" __device__ uint32_t agg_count_if_int32_shared(uint32_t* agg,
+                                                         const int32_t cond) {
+  return cond ? atomicAdd(agg, 1U) : *agg;
 }
 
 extern "C" __device__ uint64_t agg_count_double_shared(uint64_t* agg, const double val) {
@@ -518,6 +469,41 @@ extern "C" __device__ void agg_sum_double_shared(int64_t* agg, const double val)
   atomicAdd(reinterpret_cast<double*>(agg), val);
 }
 
+extern "C" __device__ int64_t agg_sum_if_shared(int64_t* agg,
+                                                const int64_t val,
+                                                const int8_t cond) {
+  static_assert(sizeof(int64_t) == sizeof(unsigned long long));
+  if (cond) {
+    return atomicAdd(reinterpret_cast<unsigned long long*>(agg), val);
+  }
+  return *agg;
+}
+
+extern "C" __device__ int32_t agg_sum_if_int32_shared(int32_t* agg,
+                                                      const int32_t val,
+                                                      const int8_t cond) {
+  if (cond) {
+    return atomicAdd(agg, val);
+  }
+  return *agg;
+}
+
+extern "C" __device__ void agg_sum_if_float_shared(int32_t* agg,
+                                                   const float val,
+                                                   const int8_t cond) {
+  if (cond) {
+    atomicAdd(reinterpret_cast<float*>(agg), val);
+  }
+}
+
+extern "C" __device__ void agg_sum_if_double_shared(int64_t* agg,
+                                                    const double val,
+                                                    const int8_t cond) {
+  if (cond) {
+    atomicAdd(reinterpret_cast<double*>(agg), val);
+  }
+}
+
 extern "C" __device__ void agg_max_shared(int64_t* agg, const int64_t val) {
   atomicMax64(agg, val);
 }
@@ -542,6 +528,188 @@ extern "C" __device__ void agg_min_int32_shared(int32_t* agg, const int32_t val)
   atomicMin(agg, val);
 }
 
+#if CUDA_VERSION > 10000 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+__device__ void atomicMax16(int16_t* agg, const int16_t val) {
+  unsigned short int* address_as_us = reinterpret_cast<unsigned short int*>(agg);
+  unsigned short int old = *address_as_us, assumed;
+
+  do {
+    assumed = old;
+    old = atomicCAS(address_as_us,
+                    assumed,
+                    static_cast<unsigned short>(max(static_cast<short int>(val),
+                                                    static_cast<short int>(assumed))));
+  } while (assumed != old);
+}
+#else
+__device__ void atomicMax16(int16_t* agg, const int16_t val) {
+  // properly align the input pointer:
+  unsigned int* base_address_u32 =
+      reinterpret_cast<unsigned int*>(reinterpret_cast<size_t>(agg) & ~0x3);
+
+  unsigned int old_value = *base_address_u32;
+  unsigned int swap_value, compare_value;
+  do {
+    compare_value = old_value;
+    swap_value =
+        (reinterpret_cast<size_t>(agg) & 0x2)
+            ? static_cast<unsigned int>(max(static_cast<int16_t>(old_value >> 16), val))
+                      << 16 |
+                  (old_value & 0xFFFF)
+            : (old_value & 0xFFFF0000) |
+                  static_cast<unsigned int>(
+                      max(static_cast<int16_t>(old_value & 0xFFFF), val));
+    old_value = atomicCAS(base_address_u32, compare_value, swap_value);
+  } while (old_value != compare_value);
+}
+#endif
+
+__device__ void atomicMax8(int8_t* agg, const int8_t val) {
+  // properly align the input pointer:
+  unsigned int* base_address_u32 =
+      reinterpret_cast<unsigned int*>(reinterpret_cast<size_t>(agg) & ~0x3);
+
+  // __byte_perm(unsigned int A, unsigned int B, unsigned int s):
+  // if s == 0x3214 returns {A[31..24], A[23..16], A[15..8], B[7..0]}
+  // if s == 0x3240 returns {A[31..24], A[23..16], B[7...0], A[7..0]}
+  // if s == 0x3410 returns {A[31..24], B[7....0], A[15..8], A[7..0]}
+  // if s == 0x4210 returns {B[7....0], A[23..16], A[15..8], A[7..0]}
+  constexpr unsigned int byte_permutations[] = {0x3214, 0x3240, 0x3410, 0x4210};
+  unsigned int old_value = *base_address_u32;
+  unsigned int swap_value, compare_value;
+  do {
+    compare_value = old_value;
+    auto max_value = static_cast<unsigned int>(
+        // compare val with its corresponding bits in the compare_value
+        max(val,
+            static_cast<int8_t>(__byte_perm(
+                compare_value, 0, (reinterpret_cast<size_t>(agg) & 0x3) | 0x4440))));
+    swap_value = __byte_perm(
+        compare_value, max_value, byte_permutations[reinterpret_cast<size_t>(agg) & 0x3]);
+    old_value = atomicCAS(base_address_u32, compare_value, swap_value);
+  } while (compare_value != old_value);
+}
+
+#if CUDA_VERSION > 10000 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+__device__ void atomicMin16(int16_t* agg, const int16_t val) {
+  unsigned short int* address_as_us = reinterpret_cast<unsigned short int*>(agg);
+  unsigned short int old = *address_as_us, assumed;
+
+  do {
+    assumed = old;
+    old = atomicCAS(address_as_us,
+                    assumed,
+                    static_cast<unsigned short>(min(static_cast<short int>(val),
+                                                    static_cast<short int>(assumed))));
+  } while (assumed != old);
+}
+#else
+__device__ void atomicMin16(int16_t* agg, const int16_t val) {
+  // properly align the input pointer:
+  unsigned int* base_address_u32 =
+      reinterpret_cast<unsigned int*>(reinterpret_cast<size_t>(agg) & ~0x3);
+
+  unsigned int old_value = *base_address_u32;
+  unsigned int swap_value, compare_value;
+  do {
+    compare_value = old_value;
+    swap_value =
+        (reinterpret_cast<size_t>(agg) & 0x2)
+            ? static_cast<unsigned int>(min(static_cast<int16_t>(old_value >> 16), val))
+                      << 16 |
+                  (old_value & 0xFFFF)
+            : (old_value & 0xFFFF0000) |
+                  static_cast<unsigned int>(
+                      min(static_cast<int16_t>(old_value & 0xFFFF), val));
+    old_value = atomicCAS(base_address_u32, compare_value, swap_value);
+  } while (old_value != compare_value);
+}
+#endif
+
+__device__ void atomicMin16SkipVal(int16_t* agg,
+                                   const int16_t val,
+                                   const int16_t skip_val) {
+  // properly align the input pointer:
+  unsigned int* base_address_u32 =
+      reinterpret_cast<unsigned int*>(reinterpret_cast<size_t>(agg) & ~0x3);
+
+  unsigned int old_value = *base_address_u32;
+  unsigned int swap_value, compare_value;
+  do {
+    compare_value = old_value;
+    int16_t selected_old_val = (reinterpret_cast<size_t>(agg) & 0x2)
+                                   ? static_cast<int16_t>(old_value >> 16)
+                                   : static_cast<int16_t>(old_value & 0xFFFF);
+
+    swap_value =
+        (reinterpret_cast<size_t>(agg) & 0x2)
+            ? static_cast<unsigned int>(
+                  selected_old_val == skip_val ? val : min(selected_old_val, val))
+                      << 16 |
+                  (old_value & 0xFFFF)
+            : (old_value & 0xFFFF0000) |
+                  static_cast<unsigned int>(
+                      selected_old_val == skip_val ? val : min(selected_old_val, val));
+    old_value = atomicCAS(base_address_u32, compare_value, swap_value);
+  } while (old_value != compare_value);
+}
+
+__device__ void atomicMin8(int8_t* agg, const int8_t val) {
+  // properly align the input pointer:
+  unsigned int* base_address_u32 =
+      reinterpret_cast<unsigned int*>(reinterpret_cast<size_t>(agg) & ~0x3);
+
+  constexpr unsigned int byte_permutations[] = {0x3214, 0x3240, 0x3410, 0x4210};
+  unsigned int old_value = *base_address_u32;
+  unsigned int swap_value, compare_value;
+  do {
+    compare_value = old_value;
+    auto min_value = static_cast<unsigned int>(
+        min(val,
+            static_cast<int8_t>(__byte_perm(
+                compare_value, 0, (reinterpret_cast<size_t>(agg) & 0x3) | 0x4440))));
+    swap_value = __byte_perm(
+        compare_value, min_value, byte_permutations[reinterpret_cast<size_t>(agg) & 0x3]);
+    old_value = atomicCAS(base_address_u32, compare_value, swap_value);
+  } while (compare_value != old_value);
+}
+
+__device__ void atomicMin8SkipVal(int8_t* agg, const int8_t val, const int8_t skip_val) {
+  // properly align the input pointer:
+  unsigned int* base_address_u32 =
+      reinterpret_cast<unsigned int*>(reinterpret_cast<size_t>(agg) & ~0x3);
+
+  constexpr unsigned int byte_permutations[] = {0x3214, 0x3240, 0x3410, 0x4210};
+  unsigned int old_value = *base_address_u32;
+  unsigned int swap_value, compare_value;
+  do {
+    compare_value = old_value;
+    int8_t selected_old_val = static_cast<int8_t>(
+        __byte_perm(compare_value, 0, (reinterpret_cast<size_t>(agg) & 0x3) | 0x4440));
+    auto min_value = static_cast<unsigned int>(
+        selected_old_val == skip_val ? val : min(val, selected_old_val));
+    swap_value = __byte_perm(
+        compare_value, min_value, byte_permutations[reinterpret_cast<size_t>(agg) & 0x3]);
+    old_value = atomicCAS(base_address_u32, compare_value, swap_value);
+  } while (compare_value != old_value);
+}
+
+extern "C" __device__ void agg_max_int16_shared(int16_t* agg, const int16_t val) {
+  return atomicMax16(agg, val);
+}
+
+extern "C" __device__ void agg_max_int8_shared(int8_t* agg, const int8_t val) {
+  return atomicMax8(agg, val);
+}
+
+extern "C" __device__ void agg_min_int16_shared(int16_t* agg, const int16_t val) {
+  return atomicMin16(agg, val);
+}
+
+extern "C" __device__ void agg_min_int8_shared(int8_t* agg, const int8_t val) {
+  return atomicMin8(agg, val);
+}
+
 extern "C" __device__ void agg_min_double_shared(int64_t* agg, const double val) {
   atomicMin(reinterpret_cast<double*>(agg), val);
 }
@@ -554,6 +722,43 @@ extern "C" __device__ void agg_id_shared(int64_t* agg, const int64_t val) {
   *agg = val;
 }
 
+extern "C" __device__ int8_t* agg_id_varlen_shared(int8_t* varlen_buffer,
+                                                   const int64_t offset,
+                                                   const int8_t* value,
+                                                   const int64_t size_bytes) {
+  for (auto i = 0; i < size_bytes; i++) {
+    varlen_buffer[offset + i] = value[i];
+  }
+  return &varlen_buffer[offset];
+}
+
+extern "C" __device__ int32_t checked_single_agg_id_shared(int64_t* agg,
+                                                           const int64_t val,
+                                                           const int64_t null_val) {
+  unsigned long long int* address_as_ull = reinterpret_cast<unsigned long long int*>(agg);
+  unsigned long long int old = *address_as_ull, assumed;
+
+  if (val == null_val) {
+    return 0;
+  }
+
+  do {
+    if (static_cast<int64_t>(old) != null_val) {
+      if (static_cast<int64_t>(old) != val) {
+        // see Execute::ERR_SINGLE_VALUE_FOUND_MULTIPLE_VALUES
+        return 15;
+      } else {
+        break;
+      }
+    }
+
+    assumed = old;
+    old = atomicCAS(address_as_ull, assumed, val);
+  } while (assumed != old);
+
+  return 0;
+}
+
 #define DEF_AGG_ID_INT_SHARED(n)                                            \
   extern "C" __device__ void agg_id_int##n##_shared(int##n##_t* agg,        \
                                                     const int##n##_t val) { \
@@ -563,18 +768,102 @@ extern "C" __device__ void agg_id_shared(int64_t* agg, const int64_t val) {
 DEF_AGG_ID_INT_SHARED(32)
 DEF_AGG_ID_INT_SHARED(16)
 DEF_AGG_ID_INT_SHARED(8)
+
 #undef DEF_AGG_ID_INT_SHARED
 
 extern "C" __device__ void agg_id_double_shared(int64_t* agg, const double val) {
   *agg = *(reinterpret_cast<const int64_t*>(&val));
 }
 
+extern "C" __device__ int32_t checked_single_agg_id_double_shared(int64_t* agg,
+                                                                  const double val,
+                                                                  const double null_val) {
+  unsigned long long int* address_as_ull = reinterpret_cast<unsigned long long int*>(agg);
+  unsigned long long int old = *address_as_ull, assumed;
+
+  if (val == null_val) {
+    return 0;
+  }
+
+  do {
+    if (static_cast<int64_t>(old) != __double_as_longlong(null_val)) {
+      if (static_cast<int64_t>(old) != __double_as_longlong(val)) {
+        // see Execute::ERR_SINGLE_VALUE_FOUND_MULTIPLE_VALUES
+        return 15;
+      } else {
+        break;
+      }
+    }
+
+    assumed = old;
+    old = atomicCAS(address_as_ull, assumed, __double_as_longlong(val));
+  } while (assumed != old);
+
+  return 0;
+}
+
 extern "C" __device__ void agg_id_double_shared_slow(int64_t* agg, const double* val) {
   *agg = *(reinterpret_cast<const int64_t*>(val));
 }
 
+extern "C" __device__ int32_t
+checked_single_agg_id_double_shared_slow(int64_t* agg,
+                                         const double* valp,
+                                         const double null_val) {
+  unsigned long long int* address_as_ull = reinterpret_cast<unsigned long long int*>(agg);
+  unsigned long long int old = *address_as_ull, assumed;
+  double val = *valp;
+
+  if (val == null_val) {
+    return 0;
+  }
+
+  do {
+    if (static_cast<int64_t>(old) != __double_as_longlong(null_val)) {
+      if (static_cast<int64_t>(old) != __double_as_longlong(val)) {
+        // see Execute::ERR_SINGLE_VALUE_FOUND_MULTIPLE_VALUES
+        return 15;
+      } else {
+        break;
+      }
+    }
+
+    assumed = old;
+    old = atomicCAS(address_as_ull, assumed, __double_as_longlong(val));
+  } while (assumed != old);
+
+  return 0;
+}
+
 extern "C" __device__ void agg_id_float_shared(int32_t* agg, const float val) {
   *agg = __float_as_int(val);
+}
+
+extern "C" __device__ int32_t checked_single_agg_id_float_shared(int32_t* agg,
+                                                                 const float val,
+                                                                 const float null_val) {
+  int* address_as_ull = reinterpret_cast<int*>(agg);
+  int old = *address_as_ull, assumed;
+
+  if (val == null_val) {
+    return 0;
+  }
+
+  do {
+    if (old != __float_as_int(null_val)) {
+      if (old != __float_as_int(val)) {
+        // see Execute::ERR_SINGLE_VALUE_FOUND_MULTIPLE_VALUES
+        return 15;
+      } else {
+        break;
+      }
+    }
+
+    assumed = old;
+    old = atomicCAS(address_as_ull, assumed, __float_as_int(val));
+  } while (assumed != old);
+
+  return 0;
 }
 
 #define DEF_SKIP_AGG(base_agg_func)                             \
@@ -589,12 +878,14 @@ extern "C" __device__ void agg_id_float_shared(int32_t* agg, const float val) {
 #define DATA_T int64_t
 #define ADDR_T uint64_t
 DEF_SKIP_AGG(agg_count)
+DEF_SKIP_AGG(agg_count_if)
 #undef DATA_T
 #undef ADDR_T
 
 #define DATA_T int32_t
 #define ADDR_T uint32_t
 DEF_SKIP_AGG(agg_count_int32)
+DEF_SKIP_AGG(agg_count_if_int32)
 #undef DATA_T
 #undef ADDR_T
 
@@ -604,6 +895,38 @@ extern "C" __device__ void agg_max_int32_skip_val_shared(int32_t* agg,
                                                          const int32_t skip_val) {
   if (val != skip_val) {
     agg_max_int32_shared(agg, val);
+  }
+}
+
+extern "C" __device__ void agg_max_int16_skip_val_shared(int16_t* agg,
+                                                         const int16_t val,
+                                                         const int16_t skip_val) {
+  if (val != skip_val) {
+    agg_max_int16_shared(agg, val);
+  }
+}
+
+extern "C" __device__ void agg_min_int16_skip_val_shared(int16_t* agg,
+                                                         const int16_t val,
+                                                         const int16_t skip_val) {
+  if (val != skip_val) {
+    atomicMin16SkipVal(agg, val, skip_val);
+  }
+}
+
+extern "C" __device__ void agg_max_int8_skip_val_shared(int8_t* agg,
+                                                        const int8_t val,
+                                                        const int8_t skip_val) {
+  if (val != skip_val) {
+    agg_max_int8_shared(agg, val);
+  }
+}
+
+extern "C" __device__ void agg_min_int8_skip_val_shared(int8_t* agg,
+                                                        const int8_t val,
+                                                        const int8_t skip_val) {
+  if (val != skip_val) {
+    atomicMin8SkipVal(agg, val, skip_val);
   }
 }
 
@@ -641,6 +964,13 @@ extern "C" __device__ int32_t agg_sum_int32_skip_val_shared(int32_t* agg,
   return 0;
 }
 
+extern "C" __device__ int32_t agg_sum_if_int32_skip_val_shared(int32_t* agg,
+                                                               const int32_t val,
+                                                               const int32_t skip_val,
+                                                               const int8_t cond) {
+  return cond ? agg_sum_int32_skip_val_shared(agg, val, skip_val) : *agg;
+}
+
 __device__ int64_t atomicSum64SkipVal(int64_t* address,
                                       const int64_t val,
                                       const int64_t skip_val) {
@@ -657,6 +987,13 @@ extern "C" __device__ int64_t agg_sum_skip_val_shared(int64_t* agg,
     return atomicSum64SkipVal(agg, val, skip_val);
   }
   return 0;
+}
+
+extern "C" __device__ int64_t agg_sum_if_skip_val_shared(int64_t* agg,
+                                                         const int64_t val,
+                                                         const int64_t skip_val,
+                                                         const int8_t cond) {
+  return cond ? agg_sum_skip_val_shared(agg, val, skip_val) : *agg;
 }
 
 __device__ int64_t atomicMin64SkipVal(int64_t* address,
@@ -772,6 +1109,15 @@ extern "C" __device__ void agg_sum_float_skip_val_shared(int32_t* agg,
   }
 }
 
+extern "C" __device__ void agg_sum_if_float_skip_val_shared(int32_t* agg,
+                                                            const float val,
+                                                            const float skip_val,
+                                                            const int8_t cond) {
+  if (cond) {
+    agg_sum_float_skip_val_shared(agg, val, skip_val);
+  }
+}
+
 __device__ void atomicSumDblSkipVal(double* address,
                                     const double val,
                                     const double skip_val) {
@@ -787,6 +1133,15 @@ extern "C" __device__ void agg_sum_double_skip_val_shared(int64_t* agg,
                                                           const double skip_val) {
   if (__double_as_longlong(val) != __double_as_longlong(skip_val)) {
     atomicSumDblSkipVal(reinterpret_cast<double*>(agg), val, skip_val);
+  }
+}
+
+extern "C" __device__ void agg_sum_if_double_skip_val_shared(int64_t* agg,
+                                                             const double val,
+                                                             const double skip_val,
+                                                             const int8_t cond) {
+  if (cond) {
+    agg_sum_double_skip_val_shared(agg, val, skip_val);
   }
 }
 
@@ -820,31 +1175,16 @@ extern "C" __device__ void agg_min_double_skip_val_shared(int64_t* agg,
   }
 }
 
-__device__ double atomicMaxDblSkipVal(double* address,
-                                      double val,
-                                      const double skip_val) {
-  unsigned long long int* address_as_ull = (unsigned long long int*)address;
-  unsigned long long int old = *address_as_ull;
-  unsigned long long int skip_val_as_ull = *((unsigned long long int*)&skip_val);
-  unsigned long long int assumed;
-
-  do {
-    assumed = old;
-    old = atomicCAS(address_as_ull,
-                    assumed,
-                    assumed == skip_val_as_ull
-                        ? *((unsigned long long int*)&val)
-                        : __double_as_longlong(max(val, __longlong_as_double(assumed))));
-  } while (assumed != old);
-
-  return __longlong_as_double(old);
-}
-
 extern "C" __device__ void agg_max_double_skip_val_shared(int64_t* agg,
                                                           const double val,
                                                           const double skip_val) {
-  if (val != skip_val) {
-    atomicMaxDblSkipVal(reinterpret_cast<double*>(agg), val, skip_val);
+  if (__double_as_longlong(val) != __double_as_longlong(skip_val)) {
+    double old = __longlong_as_double(atomicExch(
+        reinterpret_cast<unsigned long long int*>(agg), __double_as_longlong(-DBL_MAX)));
+    atomicMax(reinterpret_cast<double*>(agg),
+              __double_as_longlong(old) == __double_as_longlong(skip_val)
+                  ? val
+                  : fmax(old, val));
   }
 }
 
@@ -867,33 +1207,94 @@ extern "C" __device__ bool slotEmptyKeyCAS(int64_t* slot,
   }
 }
 
+extern "C" __device__ bool slotEmptyKeyCAS_int32(int32_t* slot,
+                                                 int32_t new_val,
+                                                 int32_t init_val) {
+  unsigned int* slot_address = reinterpret_cast<unsigned int*>(slot);
+  unsigned int compare_value = static_cast<unsigned int>(init_val);
+  unsigned int swap_value = static_cast<unsigned int>(new_val);
+
+  const unsigned int old_value = atomicCAS(slot_address, compare_value, swap_value);
+  return old_value == compare_value;
+}
+
+extern "C" __device__ bool slotEmptyKeyCAS_int16(int16_t* slot,
+                                                 int16_t new_val,
+                                                 int16_t init_val) {
+  unsigned int* base_slot_address =
+      reinterpret_cast<unsigned int*>(reinterpret_cast<size_t>(slot) & ~0x3);
+  unsigned int old_value = *base_slot_address;
+  unsigned int swap_value, compare_value;
+  do {
+    compare_value = old_value;
+    // exit criteria: if init_val does not exist in the slot (some other thread has
+    // succeeded)
+    if (static_cast<unsigned int>(init_val) !=
+        __byte_perm(
+            compare_value, 0, (reinterpret_cast<size_t>(slot) & 0x2 ? 0x3244 : 0x4410))) {
+      return false;
+    }
+    swap_value = __byte_perm(compare_value,
+                             static_cast<unsigned int>(new_val),
+                             (reinterpret_cast<size_t>(slot) & 0x2) ? 0x5410 : 0x3254);
+    old_value = atomicCAS(base_slot_address, compare_value, swap_value);
+  } while (compare_value != old_value);
+  return true;
+}
+
+extern "C" __device__ bool slotEmptyKeyCAS_int8(int8_t* slot,
+                                                int8_t new_val,
+                                                int8_t init_val) {
+  // properly align the slot address:
+  unsigned int* base_slot_address =
+      reinterpret_cast<unsigned int*>(reinterpret_cast<size_t>(slot) & ~0x3);
+  constexpr unsigned int byte_permutations[] = {0x3214, 0x3240, 0x3410, 0x4210};
+  unsigned int old_value = *base_slot_address;
+  unsigned int swap_value, compare_value;
+  do {
+    compare_value = old_value;
+    // exit criteria: if init_val does not exist in the slot (some other thread has
+    // succeeded)
+    if (static_cast<unsigned int>(init_val) !=
+        __byte_perm(compare_value, 0, (reinterpret_cast<size_t>(slot) & 0x3) | 0x4440)) {
+      return false;
+    }
+    swap_value = __byte_perm(compare_value,
+                             static_cast<unsigned int>(new_val),
+                             byte_permutations[reinterpret_cast<size_t>(slot) & 0x3]);
+    old_value = atomicCAS(base_slot_address, compare_value, swap_value);
+  } while (compare_value != old_value);
+  return true;
+}
+
 #include "../Utils/ChunkIter.cpp"
 #include "DateTruncate.cpp"
 #include "ExtractFromTime.cpp"
 #define EXECUTE_INCLUDE
 #include "ArrayOps.cpp"
 #include "DateAdd.cpp"
+#include "GeoOps.cpp"
 #include "StringFunctions.cpp"
 #undef EXECUTE_INCLUDE
 #include "../Utils/Regexp.cpp"
 #include "../Utils/StringLike.cpp"
 
-extern "C" __device__ uint64_t string_decode(int8_t* chunk_iter_, int64_t pos) {
+extern "C" __device__ StringView string_decode(int8_t* chunk_iter_, int64_t pos) {
   // TODO(alex): de-dup, the x64 version is basically identical
-  ChunkIter* chunk_iter = reinterpret_cast<ChunkIter*>(chunk_iter_);
+  auto chunk_iter = reinterpret_cast<ChunkIter*>(chunk_iter_);
   VarlenDatum vd;
   bool is_end;
   ChunkIter_get_nth(chunk_iter, pos, false, &vd, &is_end);
-  return vd.is_null ? 0
-                    : (reinterpret_cast<uint64_t>(vd.pointer) & 0xffffffffffff) |
-                          (static_cast<uint64_t>(vd.length) << 48);
+  // CHECK(!is_end); <--- this is the difference (re: above comment)
+  return vd.is_null ? StringView{nullptr, 0u}
+                    : StringView{reinterpret_cast<char const*>(vd.pointer), vd.length};
 }
 
 extern "C" __device__ void linear_probabilistic_count(uint8_t* bitmap,
                                                       const uint32_t bitmap_bytes,
                                                       const uint8_t* key_bytes,
                                                       const uint32_t key_len) {
-  const uint32_t bit_pos = MurmurHash1(key_bytes, key_len, 0) % (bitmap_bytes * 8);
+  const uint32_t bit_pos = MurmurHash3(key_bytes, key_len, 0) % (bitmap_bytes * 8);
   const uint32_t word_idx = bit_pos / 32;
   const uint32_t bit_idx = bit_pos % 32;
   atomicOr(((uint32_t*)bitmap) + word_idx, 1 << bit_idx);
@@ -902,47 +1303,43 @@ extern "C" __device__ void linear_probabilistic_count(uint8_t* bitmap,
 extern "C" __device__ void agg_count_distinct_bitmap_gpu(int64_t* agg,
                                                          const int64_t val,
                                                          const int64_t min_val,
+                                                         const int64_t bucket_size,
                                                          const int64_t base_dev_addr,
                                                          const int64_t base_host_addr,
                                                          const uint64_t sub_bitmap_count,
                                                          const uint64_t bitmap_bytes) {
-  const uint64_t bitmap_idx = val - min_val;
-  const uint32_t byte_idx = bitmap_idx >> 3;
-  const uint32_t word_idx = byte_idx >> 2;
-  const uint32_t byte_word_idx = byte_idx & 3;
-  const int64_t host_addr = *agg;
-  uint32_t* bitmap = (uint32_t*)(base_dev_addr + host_addr - base_host_addr +
-                                 (threadIdx.x & (sub_bitmap_count - 1)) * bitmap_bytes);
-  switch (byte_word_idx) {
-    case 0:
-      atomicOr(&bitmap[word_idx], 1 << (bitmap_idx & 7));
-      break;
-    case 1:
-      atomicOr(&bitmap[word_idx], 1 << ((bitmap_idx & 7) + 8));
-      break;
-    case 2:
-      atomicOr(&bitmap[word_idx], 1 << ((bitmap_idx & 7) + 16));
-      break;
-    case 3:
-      atomicOr(&bitmap[word_idx], 1 << ((bitmap_idx & 7) + 24));
-      break;
-    default:
-      break;
+  constexpr unsigned bitmap_element_size = 8 * sizeof(uint32_t);
+  auto bitmap_idx = static_cast<uint64_t>(val - min_val);
+  if (1 < bucket_size) {
+    bitmap_idx /= static_cast<uint64_t>(bucket_size);
   }
+  uint64_t const word_idx = bitmap_idx / bitmap_element_size;
+  uint32_t const bit_idx = bitmap_idx % bitmap_element_size;
+  int64_t const agg_offset = *agg - base_host_addr;
+  int64_t const thread_offset = (threadIdx.x & (sub_bitmap_count - 1)) * bitmap_bytes;
+  auto* bitmap = reinterpret_cast<uint32_t*>(base_dev_addr + agg_offset + thread_offset);
+  atomicOr(bitmap + word_idx, 1u << bit_idx);
 }
 
 extern "C" __device__ void agg_count_distinct_bitmap_skip_val_gpu(
     int64_t* agg,
     const int64_t val,
     const int64_t min_val,
+    const int64_t bucket_size,
     const int64_t skip_val,
     const int64_t base_dev_addr,
     const int64_t base_host_addr,
     const uint64_t sub_bitmap_count,
     const uint64_t bitmap_bytes) {
   if (val != skip_val) {
-    agg_count_distinct_bitmap_gpu(
-        agg, val, min_val, base_dev_addr, base_host_addr, sub_bitmap_count, bitmap_bytes);
+    agg_count_distinct_bitmap_gpu(agg,
+                                  val,
+                                  min_val,
+                                  bucket_size,
+                                  base_dev_addr,
+                                  base_host_addr,
+                                  sub_bitmap_count,
+                                  bitmap_bytes);
   }
 }
 
@@ -965,24 +1362,40 @@ extern "C" __device__ void force_sync() {
 }
 
 extern "C" __device__ void sync_warp() {
-#if (CUDA_VERSION >= 9000)
   __syncwarp();
-#endif
 }
 
 /**
  * Protected warp synchornization to make sure all (or none) threads within a warp go
  * through a synchronization barrier. thread_pos: the current thread position to be used
  * for a memory access row_count: maximum number of rows to be processed The function
- * performs warp sync iff all 32 threads within that warp will process valid data NOTE: it
- * currently assumes that warp size is 32.
+ * performs warp sync iff all 32 threads within that warp will process valid data NOTE:
+ * it currently assumes that warp size is 32.
  */
 extern "C" __device__ void sync_warp_protected(int64_t thread_pos, int64_t row_count) {
-#if (CUDA_VERSION >= 9000)
   // only syncing if NOT within the same warp as those threads experiencing the critical
   // edge
   if ((((row_count - 1) | 0x1F) - thread_pos) >= 32) {
     __syncwarp();
   }
-#endif
+}
+
+extern "C" __device__ void sync_threadblock() {
+  __syncthreads();
+}
+
+/*
+ * Currently, we just use this function for handling non-grouped aggregates
+ * with COUNT queries (with GPU shared memory used). Later, we should generate code for
+ * this depending on the type of aggregate functions.
+ * TODO: we should use one contiguous global memory buffer, rather than current default
+ * behaviour of multiple buffers, each for one aggregate. Once that's resolved, we can
+ * do much cleaner than this function
+ */
+extern "C" __device__ void write_back_non_grouped_agg(int64_t* input_buffer,
+                                                      int64_t* output_buffer,
+                                                      const int32_t agg_idx) {
+  if (threadIdx.x == agg_idx) {
+    agg_sum_shared(output_buffer, input_buffer[agg_idx]);
+  }
 }

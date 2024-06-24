@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,9 +14,9 @@
  * limitations under the License.
  */
 
-/*
+/**
  * @file    JsonAccessors.h
- * @author  Alex Suhan <alex@mapd.com>
+ * @brief
  *
  * Checked json field retrieval.
  *
@@ -25,8 +25,10 @@
 #ifndef QUERYENGINE_JSONACCESSORS_H
 #define QUERYENGINE_JSONACCESSORS_H
 
-#include <glog/logging.h>
+#include <iostream>
+
 #include <rapidjson/document.h>
+#include "Logger/Logger.h"
 
 inline const rapidjson::Value& field(const rapidjson::Value& obj,
                                      const char field[]) noexcept {

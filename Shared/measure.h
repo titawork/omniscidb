@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,8 +20,9 @@
 #include <chrono>
 #include <iomanip>
 #include <sstream>
+#include <type_traits>
 
-#include <glog/logging.h>
+#include "Logger/Logger.h"
 
 extern bool g_enable_debug_timer;
 
@@ -49,6 +50,9 @@ typename TypeR::rep timer_stop(Type clock_begin) {
       std::chrono::duration_cast<TypeR>(std::chrono::steady_clock::now() - clock_begin);
   return duration.count();
 }
+
+const auto timer_stop_microseconds =
+    timer_stop<std::chrono::steady_clock::time_point, std::chrono::microseconds>;
 
 template <typename Type = std::chrono::steady_clock::time_point,
           typename TypeR = std::chrono::milliseconds>

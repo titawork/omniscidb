@@ -1,12 +1,11 @@
-
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -15,15 +14,15 @@
  * limitations under the License.
  */
 
-#include "../Import/Importer.h"
-#include "../Parser/parser.h"
+#include "../ImportExport/Importer.h"
 #include "../QueryEngine/ArrowResultSet.h"
 #include "../QueryEngine/Descriptors/RelAlgExecutionDescriptor.h"
 #include "../QueryEngine/Execute.h"
 #include "../QueryRunner/QueryRunner.h"
+#include "../Shared/DateTimeParser.h"
 #include "../SqliteConnector/SqliteConnector.h"
+#include "TestHelpers.h"
 
-#include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <boost/algorithm/string.hpp>
 #include <boost/program_options.hpp>
@@ -33,22 +32,23 @@
 #define BASE_PATH "./tmp"
 #endif
 
+#ifdef _WIN32
+#define timegm _mkgmtime
+#endif
+
 using namespace std;
 
+using QR = QueryRunner::QueryRunner;
 namespace {
 
-std::unique_ptr<Catalog_Namespace::SessionInfo> g_session;
-bool g_hoist_literals{true};
-
 inline void run_ddl_statement(const std::string query_str) {
-  QueryRunner::run_ddl_statement(query_str, g_session);
+  QR::get()->runDDLStatement(query_str);
 }
 
 std::shared_ptr<ResultSet> run_multiple_agg(const string& query_str,
                                             const ExecutorDeviceType device_type,
                                             const bool allow_loop_joins) {
-  return QueryRunner::run_multiple_agg(
-      query_str, g_session, device_type, g_hoist_literals, allow_loop_joins);
+  return QR::get()->runSQL(query_str, device_type, true, allow_loop_joins);
 }
 
 std::shared_ptr<ResultSet> run_multiple_agg(const string& query_str,
@@ -67,8 +67,7 @@ T v(const TargetValue& r) {
 
 bool skip_tests(const ExecutorDeviceType device_type) {
 #ifdef HAVE_CUDA
-  return device_type == ExecutorDeviceType::GPU &&
-         !g_session->getCatalog().getDataMgr().gpusPresent();
+  return device_type == ExecutorDeviceType::GPU && !QR::get()->gpusPresent();
 #else
   return device_type == ExecutorDeviceType::GPU;
 #endif
@@ -87,207 +86,229 @@ class SQLiteComparator {
   void query(const std::string& query_string) { connector_.query(query_string); }
 
   void compare(const std::string& query_string, const ExecutorDeviceType device_type) {
-    const auto mapd_results = run_multiple_agg(query_string, device_type);
-    compare_impl(mapd_results.get(), query_string, device_type, false);
+    const auto omnisci_results = run_multiple_agg(query_string, device_type);
+    compare_impl(omnisci_results.get(), query_string, device_type, false);
   }
 
   void compare_arrow_output(const std::string& query_string,
                             const std::string& sqlite_query_string,
                             const ExecutorDeviceType device_type) {
-    const auto results = QueryRunner::run_select_query(
-        query_string, g_session, device_type, g_hoist_literals, true);
-    const auto arrow_mapd_results = result_set_arrow_loopback(results);
-    compare_impl(arrow_mapd_results.get(), sqlite_query_string, device_type, false);
+    const auto results = QR::get()->runSQL(query_string, device_type, true, true);
+    const auto arrow_omnisci_results = result_set_arrow_loopback(nullptr, results);
+    compare_impl(
+        arrow_omnisci_results.get(), sqlite_query_string, device_type, false, true);
   }
 
   void compare(const std::string& query_string,
                const std::string& sqlite_query_string,
                const ExecutorDeviceType device_type) {
-    const auto mapd_results = run_multiple_agg(query_string, device_type);
-    compare_impl(mapd_results.get(), sqlite_query_string, device_type, false);
+    const auto omnisci_results = run_multiple_agg(query_string, device_type);
+    compare_impl(omnisci_results.get(), sqlite_query_string, device_type, false);
   }
 
   // added to deal with time shift for now testing
   void compare_timstamp_approx(const std::string& query_string,
                                const ExecutorDeviceType device_type) {
-    const auto mapd_results = run_multiple_agg(query_string, device_type);
-    compare_impl(mapd_results.get(), query_string, device_type, true);
+    const auto omnisci_results = run_multiple_agg(query_string, device_type);
+    compare_impl(omnisci_results.get(), query_string, device_type, true);
   }
 
  private:
-  template <class MapDResults>
-  void compare_impl(const MapDResults* mapd_results,
+  template <class RESULT_SET>
+  void compare_impl(const RESULT_SET* omnisci_results,
                     const std::string& sqlite_query_string,
                     const ExecutorDeviceType device_type,
-                    bool timestamp_approx) {
+                    const bool timestamp_approx,
+                    const bool is_arrow = false) {
+    auto const errmsg = ExecutorDeviceType::CPU == device_type
+                            ? "CPU: " + sqlite_query_string
+                            : "GPU: " + sqlite_query_string;
     connector_.query(sqlite_query_string);
-    ASSERT_EQ(connector_.getNumRows(), mapd_results->rowCount());
+    ASSERT_EQ(connector_.getNumRows(), omnisci_results->rowCount()) << errmsg;
     const int num_rows{static_cast<int>(connector_.getNumRows())};
-    if (mapd_results->definitelyHasNoRows()) {
-      ASSERT_EQ(0, num_rows);
+    if (omnisci_results->definitelyHasNoRows()) {
+      ASSERT_EQ(0, num_rows) << errmsg;
       return;
     }
     if (!num_rows) {
       return;
     }
-    CHECK_EQ(connector_.getNumCols(), mapd_results->colCount());
+    CHECK_EQ(connector_.getNumCols(), omnisci_results->colCount()) << errmsg;
     const int num_cols{static_cast<int>(connector_.getNumCols())};
     for (int row_idx = 0; row_idx < num_rows; ++row_idx) {
-      const auto crt_row = mapd_results->getNextRow(true, true);
-      CHECK(!crt_row.empty());
-      CHECK_EQ(static_cast<size_t>(num_cols), crt_row.size());
+      const auto crt_row = omnisci_results->getNextRow(true, true);
+      CHECK(!crt_row.empty()) << errmsg;
+      CHECK_EQ(static_cast<size_t>(num_cols), crt_row.size()) << errmsg;
       for (int col_idx = 0; col_idx < num_cols; ++col_idx) {
         const auto ref_col_type = connector_.columnTypes[col_idx];
-        const auto mapd_variant = crt_row[col_idx];
-        const auto scalar_mapd_variant = boost::get<ScalarTargetValue>(&mapd_variant);
-        CHECK(scalar_mapd_variant);
-        const auto mapd_ti = mapd_results->getColType(col_idx);
-        const auto mapd_type = mapd_ti.get_type();
-        checkTypeConsistency(ref_col_type, mapd_ti);
+        const auto omnisci_variant = crt_row[col_idx];
+        const auto scalar_omnisci_variant =
+            boost::get<ScalarTargetValue>(&omnisci_variant);
+        CHECK(scalar_omnisci_variant) << errmsg;
+        auto omnisci_ti = omnisci_results->getColType(col_idx);
+        const auto omnisci_type = omnisci_ti.get_type();
+        checkTypeConsistency(ref_col_type, omnisci_ti);
         const bool ref_is_null = connector_.isNull(row_idx, col_idx);
-        switch (mapd_type) {
+        switch (omnisci_type) {
+          case kTINYINT:
           case kSMALLINT:
           case kINT:
           case kBIGINT: {
-            const auto mapd_as_int_p = boost::get<int64_t>(scalar_mapd_variant);
-            ASSERT_NE(nullptr, mapd_as_int_p);
-            const auto mapd_val = *mapd_as_int_p;
+            const auto omnisci_as_int_p = boost::get<int64_t>(scalar_omnisci_variant);
+            ASSERT_NE(nullptr, omnisci_as_int_p);
+            const auto omnisci_val = *omnisci_as_int_p;
             if (ref_is_null) {
-              ASSERT_EQ(inline_int_null_val(mapd_ti), mapd_val);
+              ASSERT_EQ(inline_int_null_val(omnisci_ti), omnisci_val) << errmsg;
             } else {
               const auto ref_val = connector_.getData<int64_t>(row_idx, col_idx);
-              ASSERT_EQ(ref_val, mapd_val);
+              ASSERT_EQ(ref_val, omnisci_val) << errmsg;
             }
             break;
           }
           case kTEXT:
           case kCHAR:
           case kVARCHAR: {
-            const auto mapd_as_str_p = boost::get<NullableString>(scalar_mapd_variant);
-            ASSERT_NE(nullptr, mapd_as_str_p);
-            const auto mapd_str_notnull = boost::get<std::string>(mapd_as_str_p);
-            if (ref_is_null) {
-              CHECK(!mapd_str_notnull);
+            const auto omnisci_as_str_p =
+                boost::get<NullableString>(scalar_omnisci_variant);
+            ASSERT_NE(nullptr, omnisci_as_str_p) << errmsg;
+            const auto omnisci_str_notnull = boost::get<std::string>(omnisci_as_str_p);
+            const auto ref_val = connector_.getData<std::string>(row_idx, col_idx);
+            if (omnisci_str_notnull) {
+              const auto omnisci_val = *omnisci_str_notnull;
+              ASSERT_EQ(ref_val, omnisci_val) << errmsg;
             } else {
-              CHECK(mapd_str_notnull);
-              const auto ref_val = connector_.getData<std::string>(row_idx, col_idx);
-              const auto mapd_val = *mapd_str_notnull;
-              ASSERT_EQ(ref_val, mapd_val);
+              // not null but no data, so val is empty string
+              const auto omnisci_val = "";
+              ASSERT_EQ(ref_val, omnisci_val) << errmsg;
             }
             break;
           }
           case kNUMERIC:
           case kDECIMAL:
           case kDOUBLE: {
-            const auto mapd_as_double_p = boost::get<double>(scalar_mapd_variant);
-            ASSERT_NE(nullptr, mapd_as_double_p);
-            const auto mapd_val = *mapd_as_double_p;
+            const auto omnisci_as_double_p = boost::get<double>(scalar_omnisci_variant);
+            ASSERT_NE(nullptr, omnisci_as_double_p) << errmsg;
+            const auto omnisci_val = *omnisci_as_double_p;
             if (ref_is_null) {
-              ASSERT_EQ(inline_fp_null_val(SQLTypeInfo(kDOUBLE, false)), mapd_val);
+              ASSERT_EQ(inline_fp_null_val(SQLTypeInfo(kDOUBLE, false)), omnisci_val)
+                  << errmsg;
             } else {
               const auto ref_val = connector_.getData<double>(row_idx, col_idx);
-              ASSERT_TRUE(approx_eq(ref_val, mapd_val));
+              ASSERT_TRUE(approx_eq(ref_val, omnisci_val)) << errmsg;
             }
             break;
           }
           case kFLOAT: {
-            const auto mapd_as_float_p = boost::get<float>(scalar_mapd_variant);
-            ASSERT_NE(nullptr, mapd_as_float_p);
-            const auto mapd_val = *mapd_as_float_p;
+            const auto omnisci_as_float_p = boost::get<float>(scalar_omnisci_variant);
+            ASSERT_NE(nullptr, omnisci_as_float_p) << errmsg;
+            const auto omnisci_val = *omnisci_as_float_p;
             if (ref_is_null) {
-              if (inline_fp_null_val(SQLTypeInfo(kFLOAT, false)) != mapd_val) {
-                CHECK(false);
-              }
+              ASSERT_EQ(inline_fp_null_val(SQLTypeInfo(kFLOAT, false)), omnisci_val)
+                  << errmsg;
             } else {
               const auto ref_val = connector_.getData<float>(row_idx, col_idx);
-              if (!approx_eq(ref_val, mapd_val)) {
-                CHECK(false);
-              }
+              ASSERT_TRUE(approx_eq(ref_val, omnisci_val)) << errmsg;
             }
             break;
           }
           case kTIMESTAMP:
           case kDATE: {
-            const auto mapd_as_int_p = boost::get<int64_t>(scalar_mapd_variant);
-            CHECK(mapd_as_int_p);
-            const auto mapd_val = *mapd_as_int_p;
+            const auto omnisci_as_int_p = boost::get<int64_t>(scalar_omnisci_variant);
+            const auto ref_val = connector_.getData<std::string>(row_idx, col_idx);
+            CHECK(omnisci_as_int_p);
+            const auto omnisci_val = *omnisci_as_int_p;
+            time_t nsec = 0;
+            const int dimen = omnisci_ti.get_dimension();
+
             if (ref_is_null) {
-              CHECK_EQ(inline_int_null_val(mapd_ti), mapd_val);
+              CHECK_EQ(inline_int_null_val(omnisci_ti), omnisci_val) << errmsg;
             } else {
-              struct tm tm_struct {
-                0
-              };
-              const auto ref_val = connector_.getData<std::string>(row_idx, col_idx);
-              const auto end_str =
-                  strptime(ref_val.c_str(),
-                           mapd_type == kTIMESTAMP ? "%Y-%m-%d %H:%M:%S" : "%Y-%m-%d",
-                           &tm_struct);
-              if (end_str != nullptr) {
-                ASSERT_EQ(0, *end_str);
-                ASSERT_EQ(ref_val.size(), static_cast<size_t>(end_str - ref_val.c_str()));
+              auto temp_ref_value = dateTimeParseOptional<kTIMESTAMP>(ref_val, dimen);
+              if (!temp_ref_value) {
+                temp_ref_value = dateTimeParseOptional<kDATE>(ref_val, dimen);
               }
+              CHECK(temp_ref_value) << ref_val;
+              nsec = temp_ref_value.value();
               if (timestamp_approx) {
                 // approximate result give 10 second lee way
-                ASSERT_NEAR(*mapd_as_int_p, timegm(&tm_struct), 10);
+                ASSERT_NEAR(*omnisci_as_int_p, nsec, dimen > 0 ? 10 * pow(10, dimen) : 10)
+                    << errmsg;
               } else {
-                ASSERT_EQ(*mapd_as_int_p, timegm(&tm_struct));
+                struct tm tm_struct {
+                  0
+                };
+#ifdef _WIN32
+                auto ret_code = gmtime_s(&tm_struct, &nsec);
+                CHECK(ret_code == 0) << "Error code returned " << ret_code;
+#else
+                gmtime_r(&nsec, &tm_struct);
+#endif
+                if (is_arrow && omnisci_type == kDATE) {
+                  ASSERT_EQ(*omnisci_as_int_p, timegm(&tm_struct) * kMilliSecsPerSec)
+                      << errmsg;
+                } else {
+                  ASSERT_EQ(*omnisci_as_int_p, dimen > 0 ? nsec : timegm(&tm_struct))
+                      << errmsg;
+                }
               }
             }
             break;
           }
           case kBOOLEAN: {
-            const auto mapd_as_int_p = boost::get<int64_t>(scalar_mapd_variant);
-            CHECK(mapd_as_int_p);
-            const auto mapd_val = *mapd_as_int_p;
+            const auto omnisci_as_int_p = boost::get<int64_t>(scalar_omnisci_variant);
+            CHECK(omnisci_as_int_p) << errmsg;
+            const auto omnisci_val = *omnisci_as_int_p;
             if (ref_is_null) {
-              CHECK_EQ(inline_int_null_val(mapd_ti), mapd_val);
+              CHECK_EQ(inline_int_null_val(omnisci_ti), omnisci_val) << errmsg;
             } else {
               const auto ref_val = connector_.getData<std::string>(row_idx, col_idx);
               if (ref_val == "t") {
-                ASSERT_EQ(1, *mapd_as_int_p);
+                ASSERT_EQ(1, *omnisci_as_int_p) << errmsg;
               } else {
-                CHECK_EQ("f", ref_val);
-                ASSERT_EQ(0, *mapd_as_int_p);
+                CHECK_EQ("f", ref_val) << errmsg;
+                ASSERT_EQ(0, *omnisci_as_int_p) << errmsg;
               }
             }
             break;
           }
           case kTIME: {
-            const auto mapd_as_int_p = boost::get<int64_t>(scalar_mapd_variant);
-            CHECK(mapd_as_int_p);
-            const auto mapd_val = *mapd_as_int_p;
+            const auto omnisci_as_int_p = boost::get<int64_t>(scalar_omnisci_variant);
+            CHECK(omnisci_as_int_p) << errmsg;
+            const auto omnisci_val = *omnisci_as_int_p;
             if (ref_is_null) {
-              CHECK_EQ(inline_int_null_val(mapd_ti), mapd_val);
+              CHECK_EQ(inline_int_null_val(omnisci_ti), omnisci_val) << errmsg;
             } else {
               const auto ref_val = connector_.getData<std::string>(row_idx, col_idx);
               std::vector<std::string> time_tokens;
               boost::split(time_tokens, ref_val, boost::is_any_of(":"));
-              ASSERT_EQ(size_t(3), time_tokens.size());
+              ASSERT_EQ(size_t(3), time_tokens.size()) << errmsg;
               ASSERT_EQ(boost::lexical_cast<int64_t>(time_tokens[0]) * 3600 +
                             boost::lexical_cast<int64_t>(time_tokens[1]) * 60 +
                             boost::lexical_cast<int64_t>(time_tokens[2]),
-                        *mapd_as_int_p);
+                        *omnisci_as_int_p)
+                  << errmsg;
             }
             break;
           }
           default:
-            CHECK(false);
+            CHECK(false) << errmsg;
         }
       }
     }
   }
 
  private:
-  static void checkTypeConsistency(const int ref_col_type, const SQLTypeInfo& mapd_ti) {
+  static void checkTypeConsistency(const int ref_col_type,
+                                   const SQLTypeInfo& omnisci_ti) {
     if (ref_col_type == SQLITE_NULL) {
-      // TODO(alex): re-enable the check that mapd_ti is nullable,
-      // got invalidated because of outer joins
+      // TODO(alex): re-enable the check that omnisci_ti is nullable,
+      //             got invalidated because of outer joins
       return;
     }
-    if (mapd_ti.is_integer()) {
+    if (omnisci_ti.is_integer()) {
       CHECK_EQ(SQLITE_INTEGER, ref_col_type);
-    } else if (mapd_ti.is_fp() || mapd_ti.is_decimal()) {
-      CHECK_EQ(SQLITE_FLOAT, ref_col_type);
+    } else if (omnisci_ti.is_fp() || omnisci_ti.is_decimal()) {
+      CHECK(ref_col_type == SQLITE_FLOAT || ref_col_type == SQLITE_INTEGER);
     } else {
       CHECK_EQ(SQLITE_TEXT, ref_col_type);
     }
@@ -717,10 +738,10 @@ TEST(Select, DISABLED_TopK_LIMIT_OFFSET_DifferentOrders) {
 }
 
 int main(int argc, char* argv[]) {
-  google::InitGoogleLogging(argv[0]);
+  TestHelpers::init_logger_stderr_only(argc, argv);
   ::testing::InitGoogleTest(&argc, argv);
 
-  g_session.reset(QueryRunner::get_session(BASE_PATH));
+  QR::init(BASE_PATH);
 
   int err{0};
   err = create_and_populate_tables();
@@ -735,6 +756,6 @@ int main(int argc, char* argv[]) {
   }
 
   drop_tables();
-  g_session.reset(nullptr);
+  QR::reset();
   return err;
 }

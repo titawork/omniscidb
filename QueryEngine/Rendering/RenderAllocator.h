@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,13 +14,12 @@
  * limitations under the License.
  */
 
-#ifndef QUERYENGINE_RENDERALLOCATOR_H
-#define QUERYENGINE_RENDERALLOCATOR_H
+#pragma once
 
 #ifdef HAVE_CUDA
 #include <cuda.h>
 #else
-#include "../Shared/nocuda.h"
+#include "Shared/nocuda.h"
 #endif  // HAVE_CUDA
 
 #include <cstdlib>
@@ -28,6 +27,8 @@
 #include <mutex>
 #include <stdexcept>
 #include <vector>
+
+#include "DataMgr/Allocators/DeviceAllocator.h"
 
 namespace QueryRenderer {
 class JSONLocation;
@@ -48,28 +49,22 @@ class StreamingTopNNotSupportedInRenderQuery : public std::runtime_error {
       : std::runtime_error("Streaming-Top-N not supported in Render Query") {}
 };
 
-enum class RAExecutionPolicy { Host, Device };
-
-class RenderAllocator {
+class RenderAllocator : public Allocator {
  public:
   RenderAllocator(int8_t* preallocated_ptr,
                   const size_t preallocated_size,
-                  const size_t device_id,
-                  const unsigned block_size_x,
-                  const unsigned grid_size_x,
-                  const RAExecutionPolicy execution_policy = RAExecutionPolicy::Device);
+                  const size_t device_id);
 
-  int8_t* alloc(const size_t bytes);
+  int8_t* alloc(const size_t bytes) final;
 
   void markChunkComplete();
 
   size_t getCurrentChunkOffset() const;
   size_t getCurrentChunkSize() const;
   size_t getAllocatedSize() const;
+  size_t getPeakAllocatedSize() const;
 
   int8_t* getBasePtr() const;
-
-  RAExecutionPolicy getExecutionPolicy() const;
 
  private:
   int8_t* preallocated_ptr_;
@@ -77,17 +72,14 @@ class RenderAllocator {
   const size_t device_id_;
   size_t crt_chunk_offset_bytes_;
   size_t crt_allocated_bytes_;
+  size_t peak_allocated_bytes_;
 
   std::unique_ptr<std::mutex> alloc_mtx_ptr_;
-
-  RAExecutionPolicy execution_policy_;
 };
 
 class RenderAllocatorMap {
  public:
-  RenderAllocatorMap(::QueryRenderer::QueryRenderManager* render_manager,
-                     const unsigned block_size_x,
-                     const unsigned grid_size_x);
+  RenderAllocatorMap(::QueryRenderer::QueryRenderManager* render_manager);
   ~RenderAllocatorMap();
 
   RenderAllocator* getRenderAllocator(size_t device_id);
@@ -103,14 +95,4 @@ class RenderAllocatorMap {
  private:
   ::QueryRenderer::QueryRenderManager* render_manager_;
   std::vector<RenderAllocator> render_allocator_map_;
-
-  // NOTE(adb): Duplicating the CheckedAllocDeleter here since this header is included in
-  // multiple Cuda files. Including the checked_alloc header is currently problematic for
-  // nvcc.
-  struct HostBufferDeleter {
-    void operator()(void* p) { free(p); }
-  };
-  using HostBufPtrType = std::unique_ptr<int8_t, HostBufferDeleter>;
-  HostBufPtrType host_render_buffer_;
 };
-#endif  // QUERYENGINE_RENDERALLOCATOR_H

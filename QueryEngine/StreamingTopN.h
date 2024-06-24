@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,11 +16,9 @@
 
 /**
  * @file    StreamingTopN.h
- * @author  Minggang Yu <miyu@mapd.com>
  * @brief   Streaming Top N algorithm.
  *
- * Copyright (c) 2017 MapD Technologies, Inc.  All rights reserved.
- **/
+ */
 
 #ifndef QUERYENGINE_STREAMINGTOPN_H
 #define QUERYENGINE_STREAMINGTOPN_H
@@ -43,8 +41,6 @@ std::vector<int8_t> get_rows_copy_from_heaps(const int64_t* heaps,
 }  // namespace streaming_top_n
 
 struct RelAlgExecutionUnit;
-bool use_streaming_top_n(const RelAlgExecutionUnit& ra_exe_unit,
-                         const bool output_columnar);
 
 namespace Analyzer {
 class Expr;

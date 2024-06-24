@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,7 +18,7 @@
 
 #include <memory>
 
-#include "../Shared/unreachable.h"
+#include "Logger/Logger.h"
 
 const Parser::SharedDictionaryDef compress_reference_path(
     Parser::SharedDictionaryDef cur_node,
@@ -58,7 +58,7 @@ const Parser::SharedDictionaryDef compress_reference_path(
 
 // Make sure the dependency of shared dictionaries does not form a cycle
 void validate_shared_dictionary_order(
-    const Parser::CreateTableStmt* stmt,
+    const Parser::CreateTableBaseStmt* stmt,
     const Parser::SharedDictionaryDef* shared_dict_def,
     const std::vector<Parser::SharedDictionaryDef>& shared_dict_defs,
     const std::list<ColumnDescriptor>& columns) {
@@ -127,7 +127,7 @@ const Parser::CompressDef* get_compression_for_column(
 
 // Validate shared dictionary directive against the list of columns seen so far.
 void validate_shared_dictionary(
-    const Parser::CreateTableStmt* stmt,
+    const Parser::CreateTableBaseStmt* stmt,
     const Parser::SharedDictionaryDef* shared_dict_def,
     const std::list<ColumnDescriptor>& columns,
     const std::vector<Parser::SharedDictionaryDef>& shared_dict_defs_so_far,
@@ -151,28 +151,43 @@ void validate_shared_dictionary(
         "Column " + col_qualified_name +
         " shouldn't specify an encoding, it borrows it from the referenced column");
   }
-  const auto foreign_td =
-      catalog.getMetadataForTable(shared_dict_def->get_foreign_table());
-  if (!foreign_td && table_name->compare(shared_dict_def->get_foreign_table())) {
-    throw std::runtime_error("Table " + shared_dict_def->get_foreign_table() +
-                             " doesn't exist");
+
+  // NOTE(Misiu): Unfortunately we have overloaded the term "foreign table" here.  In
+  // SharedDictionaryDef the "foreign table" is a table that is sharing a dictionary
+  // which it did not create.  This is different from an FSI (HeavyConnect) "foreign
+  // table" which is a specific type of table who's data is stored outside of the database
+  // system. Currently string dictionaries have some unique handling in FSI (they are
+  // populated lazily) so we cannot share them with non-foreign (non-FSI) tables.
+  const auto foreign_table_name = shared_dict_def->get_foreign_table();
+  const auto foreign_td = catalog.getMetadataForTable(foreign_table_name);
+  if (!foreign_td && table_name->compare(foreign_table_name)) {
+    throw std::runtime_error("Table " + foreign_table_name + " doesn't exist");
   }
 
-  if (foreign_td) {
+  if (foreign_td) {                      // Dictionary is shared with another table
+    if (foreign_td->isForeignTable()) {  // FSI foreign table
+      // The 'create foreign table' syntax does not support sharing dictionaries, so we
+      // only have to worry about foreign tables being the target of sharing, not the
+      // source.
+      throw std::runtime_error(
+          "Attempting to share dictionary with foreign table " + foreign_table_name +
+          ".  Foreign table dictionaries cannot currently be shared.");
+    }
     const auto reference_columns =
         catalog.getAllColumnMetadataForTable(foreign_td->tableId, false, false, false);
     const auto reference_cd_ptr =
         lookup_column(shared_dict_def->get_foreign_column(), reference_columns);
-    const auto reference_col_qualified_name =
-        reference_cd_ptr->columnName + "." + shared_dict_def->get_foreign_column();
     if (!reference_cd_ptr) {
-      throw std::runtime_error("Column " + reference_col_qualified_name +
-                               " doesn't exist");
+      throw std::runtime_error("Could not find referenced column " +
+                               shared_dict_def->get_foreign_column() + " in table " +
+                               foreign_td->tableName);
     }
     if (!reference_cd_ptr->columnType.is_string() ||
         reference_cd_ptr->columnType.get_compression() != kENCODING_DICT) {
-      throw std::runtime_error("Column " + reference_col_qualified_name +
-                               " must be a dictionary encoded string");
+      const auto reference_col_qualified_name =
+          reference_cd_ptr->columnName + "." + shared_dict_def->get_foreign_column();
+      throw std::runtime_error("Referenced column " + reference_col_qualified_name +
+                               " must be a dictionary encoded string column");
     }
   } else {
     // The dictionary is to be shared within table

@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,8 +18,11 @@
 #define COLUMN_DESCRIPTOR_H
 
 #include <cassert>
+#include <optional>
 #include <string>
+#include "../Shared/StringTransform.h"
 #include "../Shared/sqltypes.h"
+#include "../Shared/toString.h"
 
 /**
  * @type ColumnDescriptor
@@ -39,12 +42,15 @@ struct ColumnDescriptor {
   std::string virtualExpr;
   bool isDeletedCol;
   bool isGeoPhyCol{false};
+  std::optional<std::string> default_value;
+  int32_t db_id;
 
   ColumnDescriptor() : isSystemCol(false), isVirtualCol(false), isDeletedCol(false) {}
   ColumnDescriptor(const int tableId,
                    const int columnId,
                    const std::string& columnName,
-                   const SQLTypeInfo columnType)
+                   const SQLTypeInfo columnType,
+                   int32_t db_id)
       : tableId(tableId)
       , columnId(columnId)
       , columnName(columnName)
@@ -52,9 +58,47 @@ struct ColumnDescriptor {
       , columnType(columnType)
       , isSystemCol(false)
       , isVirtualCol(false)
-      , isDeletedCol(false) {}
+      , isDeletedCol(false)
+      , db_id(db_id) {}
   ColumnDescriptor(const bool isGeoPhyCol) : ColumnDescriptor() {
     this->isGeoPhyCol = isGeoPhyCol;
+  }
+
+  std::string toString() const {
+    return ::typeName(this) + "(tableId=" + ::toString(tableId) +
+           ", columnId=" + ::toString(columnId) +
+           ", columnName=" + ::toString(columnName) +
+           ", columnType=" + ::toString(columnType) +
+           ", defaultValue=" + ::toString(default_value) +
+           ", db_id=" + ::toString(db_id) + ")";
+  }
+
+  std::string getDefaultValueLiteral() const {
+    // some preprocessing of strings, arrays and especially arrays of strings
+    CHECK(default_value.has_value());
+    if (columnType.is_string() || columnType.is_geometry() || columnType.is_time()) {
+      return "\'" + default_value.value() + "\'";
+    } else if (columnType.is_array()) {
+      auto value = default_value.value();
+      CHECK(value.front() == '{' && value.back() == '}');
+      value = value.substr(1, value.length() - 2);
+      if (columnType.is_string_array() || is_datetime(columnType.get_subtype())) {
+        auto elements = split(value, ", ");
+        value = "ARRAY[";
+        for (size_t i = 0; i < elements.size(); ++i) {
+          value += "'" + elements[i] + "'";
+          if (i != elements.size() - 1) {
+            value += ", ";
+          }
+        }
+        value += "]";
+      } else {
+        value = "ARRAY[" + value + "]";
+      }
+      return value;
+    } else {
+      return default_value.value();
+    }
   }
 };
 

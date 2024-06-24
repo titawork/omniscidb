@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@
 
 #ifdef EXECUTE_INCLUDE
 
-extern "C" NEVER_INLINE DEVICE int32_t
+extern "C" RUNTIME_EXPORT NEVER_INLINE DEVICE int32_t
 char_length_encoded(const char* str, const int32_t str_len) {  // assumes utf8
   int32_t i = 0, char_count = 0;
   while (i < str_len) {
@@ -32,7 +32,7 @@ char_length_encoded(const char* str, const int32_t str_len) {  // assumes utf8
   return char_count;
 }
 
-extern "C" NEVER_INLINE DEVICE int32_t
+extern "C" RUNTIME_EXPORT NEVER_INLINE DEVICE int32_t
 char_length_encoded_nullable(const char* str,
                              const int32_t str_len,
                              const int32_t int_null) {  // assumes utf8

@@ -1,5 +1,5 @@
 /*
- * Copyright 2018 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,12 +14,17 @@
  * limitations under the License.
  */
 
-/*
+/**
  * @file ChunkAccessorTable.cpp
- * @author Simon Eves <simon.eves@mapd.com>
+ * @brief
+ *
  */
 
 #include "ChunkAccessorTable.h"
+#include <exception>
+#include <memory>
+#include "Catalog/Catalog.h"
+#include "DataMgr/Chunk/Chunk.h"
 
 ChunkAccessorTable getChunkAccessorTable(const Catalog_Namespace::Catalog& cat,
                                          const TableDescriptor* td,
@@ -64,12 +69,12 @@ ChunkAccessorTable getChunkAccessorTable(const Catalog_Namespace::Catalog& cat,
                                     chunkKey,
                                     Data_Namespace::CPU_LEVEL,
                                     0,
-                                    chunkMetaIt->second.numBytes,
-                                    chunkMetaIt->second.numElements);
+                                    chunkMetaIt->second->numBytes,
+                                    chunkMetaIt->second->numElements);
       CHECK(chunk);
 
       // the size
-      size_t chunkSize = chunkMetaIt->second.numElements;
+      size_t chunkSize = chunkMetaIt->second->numElements;
 
       // and an iterator
       ChunkIter chunkIt = chunk->begin_iterator(chunkMetaIt->second);

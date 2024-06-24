@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,14 +24,18 @@
 
 #include <string>
 
-llvm::Function* query_template(llvm::Module*,
-                               const size_t aggr_col_count,
-                               const bool hoist_literals,
-                               const bool is_estimate_query);
-llvm::Function* query_group_by_template(llvm::Module*,
-                                        const bool hoist_literals,
-                                        const QueryMemoryDescriptor& query_mem_desc,
-                                        const ExecutorDeviceType,
-                                        const bool check_scan_limit);
+std::tuple<llvm::Function*, llvm::CallInst*> query_template(
+    llvm::Module*,
+    const size_t aggr_col_count,
+    const bool hoist_literals,
+    const bool is_estimate_query,
+    const GpuSharedMemoryContext& gpu_smem_context);
+std::tuple<llvm::Function*, llvm::CallInst*> query_group_by_template(
+    llvm::Module*,
+    const bool hoist_literals,
+    const QueryMemoryDescriptor& query_mem_desc,
+    const ExecutorDeviceType,
+    const bool check_scan_limit,
+    const GpuSharedMemoryContext& gpu_smem_context);
 
 #endif  // QUERYENGINE_QUERYTEMPLATEGENERATOR_H

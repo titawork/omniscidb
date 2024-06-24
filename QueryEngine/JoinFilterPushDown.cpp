@@ -1,5 +1,5 @@
 /*
- * Copyright 2018 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,7 +24,7 @@ class BindFilterToOutermostVisitor : public DeepCopyVisitor {
   std::shared_ptr<Analyzer::Expr> visitColumnVar(
       const Analyzer::ColumnVar* col_var) const override {
     return makeExpr<Analyzer::ColumnVar>(
-        col_var->get_type_info(), col_var->get_table_id(), col_var->get_column_id(), 0);
+        col_var->get_type_info(), col_var->getColumnKey(), 0);
   }
 };
 
@@ -32,7 +32,9 @@ class CollectInputColumnsVisitor
     : public ScalarExprVisitor<std::unordered_set<InputColDescriptor>> {
   std::unordered_set<InputColDescriptor> visitColumnVar(
       const Analyzer::ColumnVar* col_var) const override {
-    return {InputColDescriptor(col_var->get_column_id(), col_var->get_table_id(), 0)};
+    const auto& column_key = col_var->getColumnKey();
+    return {InputColDescriptor(
+        column_key.column_id, column_key.table_id, column_key.db_id, 0)};
   }
 
  public:
@@ -90,10 +92,10 @@ FilterSelectivity RelAlgExecutor::getFilterSelectivity(
                                   {},
                                   {},
                                   {count_expr.get()},
+                                  {},
                                   nullptr,
-                                  {{}, SortAlgorithm::Default, 0, 0},
+                                  SortInfo(),
                                   0};
-  int32_t error_code{0};
   size_t one{1};
   ResultSetPtr filtered_result;
   const auto table_infos = get_table_infos(input_descs, executor_);
@@ -101,22 +103,9 @@ FilterSelectivity RelAlgExecutor::getFilterSelectivity(
   const size_t total_rows_upper_bound = table_infos.front().info.getNumTuplesUpperBound();
   try {
     ColumnCacheMap column_cache;
-    filtered_result = executor_->executeWorkUnit(&error_code,
-                                                 one,
-                                                 true,
-                                                 table_infos,
-                                                 ra_exe_unit,
-                                                 co,
-                                                 eo,
-                                                 cat_,
-                                                 executor_->getRowSetMemoryOwner(),
-                                                 nullptr,
-                                                 false,
-                                                 column_cache);
+    filtered_result = executor_->executeWorkUnit(
+        one, true, table_infos, ra_exe_unit, co, eo, nullptr, false, column_cache);
   } catch (...) {
-    return {false, 1.0, 0};
-  }
-  if (error_code) {
     return {false, 1.0, 0};
   }
   const auto count_row = filtered_result->getNextRow(false, false);
@@ -157,7 +146,7 @@ std::vector<PushedDownFilterInfo> RelAlgExecutor::selectFiltersToBePushedDown(
 }
 
 ExecutionResult RelAlgExecutor::executeRelAlgQueryWithFilterPushDown(
-    std::vector<RaExecutionDesc>& ed_list,
+    const RaExecutionSequence& seq,
     const CompilationOptions& co,
     const ExecutionOptions& eo,
     RenderInfo* render_info,
@@ -165,42 +154,31 @@ ExecutionResult RelAlgExecutor::executeRelAlgQueryWithFilterPushDown(
   // we currently do not fully support filter push down with
   // multi-step execution and/or with subqueries
   // TODO(Saman): add proper caching to enable filter push down for all cases
-  if (ed_list.size() > 1 || !subqueries_.empty()) {
+  const auto& subqueries = getSubqueries();
+  if (seq.size() > 1 || !subqueries.empty()) {
     if (eo.just_calcite_explain) {
       return ExecutionResult(std::vector<PushedDownFilterInfo>{},
                              eo.find_push_down_candidates);
     }
-    const ExecutionOptions eo_modified{eo.output_columnar_hint,
-                                       eo.allow_multifrag,
-                                       eo.just_explain,
-                                       eo.allow_loop_joins,
-                                       eo.with_watchdog,
-                                       eo.jit_debug,
-                                       eo.just_validate,
-                                       eo.with_dynamic_watchdog,
-                                       eo.dynamic_watchdog_time_limit,
-                                       /*find_push_down_candidates=*/false,
-                                       /*just_calcite_explain=*/false,
-                                       eo.gpu_input_mem_limit_percent};
+    auto eo_modified = eo;
+    eo_modified.find_push_down_candidates = false;
+    eo_modified.just_calcite_explain = false;
 
     // Dispatch the subqueries first
-    for (auto subquery : subqueries_) {
+    for (auto subquery : subqueries) {
       // Execute the subquery and cache the result.
-      RelAlgExecutor ra_executor(executor_, cat_);
-      auto result = ra_executor.executeRelAlgSubQuery(subquery.get(), co, eo_modified);
+      RelAlgExecutor ra_executor(executor_);
+      const auto subquery_ra = subquery->getRelAlg();
+      CHECK(subquery_ra);
+      RaExecutionSequence subquery_seq(subquery_ra, executor_);
+      auto result =
+          ra_executor.executeRelAlgSeq(subquery_seq, co, eo_modified, nullptr, 0);
       subquery->setExecutionResult(std::make_shared<ExecutionResult>(result));
     }
-    return executeRelAlgSeq(ed_list, co, eo_modified, render_info, queue_time_ms);
-  } else {
-    // Dispatch the subqueries first
-    for (auto subquery : subqueries_) {
-      // Execute the subquery and cache the result.
-      RelAlgExecutor ra_executor(executor_, cat_);
-      auto result = ra_executor.executeRelAlgSubQuery(subquery.get(), co, eo);
-      subquery->setExecutionResult(std::make_shared<ExecutionResult>(result));
-    }
-    return executeRelAlgSeq(ed_list, co, eo, render_info, queue_time_ms);
+    return executeRelAlgSeq(seq, co, eo_modified, render_info, queue_time_ms);
   }
+  // else
+  return executeRelAlgSeq(seq, co, eo, render_info, queue_time_ms);
 }
 /**
  * The main purpose of this function is to prevent going through extra overhead of
@@ -214,10 +192,10 @@ bool to_gather_info_for_filter_selectivity(
   }
   // we currently do not support filter push down when there is a self-join involved:
   // TODO(Saman): prevent Calcite from optimizing self-joins to remove this exclusion
-  std::unordered_set<int> table_ids;
+  std::unordered_set<shared::TableKey> table_keys;
   for (auto ti : table_infos) {
-    if (table_ids.find(ti.table_id) == table_ids.end()) {
-      table_ids.insert(ti.table_id);
+    if (table_keys.find(ti.table_key) == table_keys.end()) {
+      table_keys.insert(ti.table_key);
     } else {
       // a self-join is involved
       return false;
@@ -252,7 +230,8 @@ std::vector<PushedDownFilterInfo> find_push_down_filters(
     CHECK_EQ(to_original_rte_idx.size(), input_permutation.size());
     for (size_t i = 0; i < input_permutation.size(); ++i) {
       CHECK_LT(input_permutation[i], to_original_rte_idx.size());
-      CHECK_EQ(to_original_rte_idx[input_permutation[i]], to_original_rte_idx.size());
+      CHECK_EQ(static_cast<size_t>(to_original_rte_idx[input_permutation[i]]),
+               to_original_rte_idx.size());
       to_original_rte_idx[input_permutation[i]] = i;
     }
   } else {
@@ -278,7 +257,7 @@ std::vector<PushedDownFilterInfo> find_push_down_filters(
   }
   for (const auto& kv : filters_per_nesting_level) {
     CHECK_GE(kv.first, 0);
-    CHECK_LT(kv.first, input_size_prefix_sums.size());
+    CHECK_LT(static_cast<size_t>(kv.first), input_size_prefix_sums.size());
     size_t input_prev = (kv.first > 1) ? input_size_prefix_sums[kv.first - 2] : 0;
     size_t input_start = kv.first ? input_size_prefix_sums[kv.first - 1] : 0;
     size_t input_next = input_size_prefix_sums[kv.first];

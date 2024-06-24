@@ -1,5 +1,5 @@
 /*
- * Copyright 2018 OmniSci, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,15 +14,16 @@
  * limitations under the License.
  */
 
-#ifndef BASE_64_H
-#define BASE_64_H
+#pragma once
+
 #include <boost/algorithm/string.hpp>
 #include <boost/archive/iterators/base64_from_binary.hpp>
 #include <boost/archive/iterators/binary_from_base64.hpp>
 #include <boost/archive/iterators/transform_width.hpp>
 #include <string>
 
-namespace mapd {
+namespace shared {
+
 inline std::string decode_base64(const std::string& val, bool trim_nulls) {
   // For some strings, signatature particualary it is important no to trim
   // '\0' characters
@@ -50,5 +51,4 @@ static inline std::string encode_base64(const std::string& val) {
 
 std::string decode_base64_uri(const std::string& value, bool trim_nulls = true);
 
-}  // namespace mapd
-#endif
+}  // namespace shared

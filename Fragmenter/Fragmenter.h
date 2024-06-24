@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,8 +22,9 @@
 #include <map>
 #include <mutex>
 #include "../Catalog/ColumnDescriptor.h"
+#include "../DataMgr/Chunk/Chunk.h"
 #include "../DataMgr/ChunkMetadata.h"
-#include "../Shared/mapd_shared_mutex.h"
+#include "../Shared/heavyai_shared_mutex.h"
 #include "../Shared/types.h"
 
 namespace Data_Namespace {
@@ -45,6 +46,14 @@ enum FragmenterType {
   INSERT_ORDER = 0  // these values persist in catalog.  make explicit
 };
 
+struct InsertChunks {
+  const int table_id;
+  const int db_id;
+  std::map</*column_id=*/int, std::shared_ptr<Chunk_NS::Chunk> > chunks;
+  std::vector<size_t> valid_row_indices; /* specifies which row indices in chunk are valid
+                                            for insertion */
+};
+
 /**
  * @struct InsertData
  * @brief The data to be inserted using the fragment manager.
@@ -63,10 +72,8 @@ struct InsertData {
   size_t numRows;              /// the number of rows being inserted
   std::vector<DataBlockPtr> data;  /// points to the start of the data block per column
                                    /// for the row(s) being inserted
-  int64_t replicate_count =
-      0;  /// count to replicate values of column(s); used only for ALTER ADD column
-  std::vector<bool> bypass;  // bypass corresponding columnIds[]
-  std::map<int, const ColumnDescriptor*> columnDescriptors;
+  std::vector<bool> is_default;    /// data for such columns consist of a single
+                                   /// replicated element (NULL or DEFAULT)
 };
 
 /**
@@ -83,25 +90,24 @@ class FragmentInfo {
       , shadowNumTuples(0)
       , physicalTableId(-1)
       , shard(-1)
-      , mutex_access_inmem_states(new std::mutex)
       , resultSet(nullptr)
       , numTuples(0)
       , synthesizedNumTuplesIsValid(false)
       , synthesizedMetadataIsValid(false) {}
 
-  void setChunkMetadataMap(const std::map<int, ChunkMetadata>& chunkMetadataMap) {
-    this->chunkMetadataMap = chunkMetadataMap;
+  void setChunkMetadataMap(const ChunkMetadataMap& chunk_metadata_map) {
+    this->chunkMetadataMap = chunk_metadata_map;
   }
 
-  void setChunkMetadata(const int col, const ChunkMetadata& chunkMetadata) {
+  void setChunkMetadata(const int col, std::shared_ptr<ChunkMetadata> chunkMetadata) {
     chunkMetadataMap[col] = chunkMetadata;
   }
 
-  const std::map<int, ChunkMetadata>& getChunkMetadataMap() const;
+  const ChunkMetadataMap& getChunkMetadataMap() const;
 
-  const std::map<int, ChunkMetadata>& getChunkMetadataMapPhysical() const {
-    return chunkMetadataMap;
-  }
+  const ChunkMetadataMap& getChunkMetadataMapPhysical() const { return chunkMetadataMap; }
+
+  ChunkMetadataMap getChunkMetadataMapPhysicalCopy() const;
 
   size_t getNumTuples() const;
 
@@ -124,19 +130,17 @@ class FragmentInfo {
   std::vector<int> deviceIds;
   int physicalTableId;
   int shard;
-  std::map<int, ChunkMetadata> shadowChunkMetadataMap;
-  mutable std::shared_ptr<std::mutex> mutex_access_inmem_states;
+  ChunkMetadataMap shadowChunkMetadataMap;
   mutable ResultSet* resultSet;
   mutable std::shared_ptr<std::mutex> resultSetMutex;
 
  private:
   mutable size_t numTuples;
-  mutable std::map<int, ChunkMetadata> chunkMetadataMap;
+  mutable ChunkMetadataMap chunkMetadataMap;
   mutable bool synthesizedNumTuplesIsValid;
   mutable bool synthesizedMetadataIsValid;
 
   friend class InsertOrderFragmenter;
-  mutable std::shared_ptr<std::mutex> updateMutex_{new std::mutex};
   static bool unconditionalVacuum_;
 };
 
@@ -164,7 +168,7 @@ class TableInfo {
   size_t getFragmentNumTuplesUpperBound() const;
 
   std::vector<int> chunkKeyPrefix;
-  std::deque<FragmentInfo> fragments;
+  std::vector<FragmentInfo> fragments;
 
  private:
   mutable size_t numTuples;

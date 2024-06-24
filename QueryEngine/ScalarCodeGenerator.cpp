@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 OmniSci, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,8 +24,11 @@ class UsedColumnExpressions : public ScalarExprVisitor<ScalarCodeGenerator::Colu
   ScalarCodeGenerator::ColumnMap visitColumnVar(
       const Analyzer::ColumnVar* column) const override {
     ScalarCodeGenerator::ColumnMap m;
-    InputColDescriptor input_desc(
-        column->get_column_id(), column->get_table_id(), column->get_rte_idx());
+    const auto& column_key = column->getColumnKey();
+    InputColDescriptor input_desc(column_key.column_id,
+                                  column_key.table_id,
+                                  column_key.db_id,
+                                  column->get_rte_idx());
     m.emplace(input_desc,
               std::static_pointer_cast<Analyzer::ColumnVar>(column->deep_copy()));
     return m;
@@ -49,6 +52,7 @@ llvm::Type* llvm_type_from_sql(const SQLTypeInfo& ti, llvm::LLVMContext& ctx) {
     }
     default: {
       LOG(FATAL) << "Unsupported type";
+      return nullptr;  // satisfy -Wreturn-type
     }
   }
 }
@@ -60,9 +64,11 @@ ScalarCodeGenerator::ColumnMap ScalarCodeGenerator::prepare(const Analyzer::Expr
   const auto used_columns = visitor.visit(expr);
   std::list<std::shared_ptr<const InputColDescriptor>> global_col_ids;
   for (const auto& used_column : used_columns) {
+    const auto& table_key = used_column.first.getScanDesc().getTableKey();
     global_col_ids.push_back(std::make_shared<InputColDescriptor>(
         used_column.first.getColId(),
-        used_column.first.getScanDesc().getTableId(),
+        table_key.table_id,
+        table_key.db_id,
         used_column.first.getScanDesc().getNestLevel()));
   }
   plan_state_->allocateLocalColumnIds(global_col_ids);
@@ -73,7 +79,8 @@ ScalarCodeGenerator::CompiledExpression ScalarCodeGenerator::compile(
     const Analyzer::Expr* expr,
     const bool fetch_columns,
     const CompilationOptions& co) {
-  own_plan_state_ = std::make_unique<PlanState>(false, nullptr);
+  own_plan_state_ = std::make_unique<PlanState>(
+      false, std::vector<InputTableInfo>{}, PlanState::DeletedColumnsMap{}, nullptr);
   plan_state_ = own_plan_state_.get();
   const auto used_columns = prepare(expr);
   std::vector<llvm::Type*> arg_types(plan_state_->global_to_local_col_ids_.size() + 1);
@@ -94,17 +101,18 @@ ScalarCodeGenerator::CompiledExpression ScalarCodeGenerator::compile(
   auto scalar_expr_func = llvm::Function::Create(
       ft, llvm::Function::ExternalLinkage, "scalar_expr", module_.get());
   auto bb_entry = llvm::BasicBlock::Create(ctx, ".entry", scalar_expr_func, 0);
-  own_cgen_state_ = std::make_unique<CgenState>(g_table_infos, false);
+  own_cgen_state_ = std::make_unique<CgenState>(g_table_infos.size(), false);
   own_cgen_state_->module_ = module_.get();
-  own_cgen_state_->row_func_ = scalar_expr_func;
+  own_cgen_state_->row_func_ = own_cgen_state_->current_func_ = scalar_expr_func;
   own_cgen_state_->ir_builder_.SetInsertPoint(bb_entry);
   cgen_state_ = own_cgen_state_.get();
+  AUTOMATIC_IR_METADATA(cgen_state_);
   const auto expr_lvs = codegen(expr, fetch_columns, co);
   CHECK_EQ(expr_lvs.size(), size_t(1));
   cgen_state_->ir_builder_.CreateStore(expr_lvs.front(),
                                        cgen_state_->row_func_->arg_begin());
   cgen_state_->ir_builder_.CreateRet(ll_int<int32_t>(0, ctx));
-  if (co.device_type_ == ExecutorDeviceType::GPU) {
+  if (co.device_type == ExecutorDeviceType::GPU) {
     std::vector<llvm::Type*> wrapper_arg_types(arg_types.size() + 1);
     wrapper_arg_types[0] = llvm::PointerType::get(get_int_type(32, ctx), 0);
     wrapper_arg_types[1] = arg_types[0];
@@ -124,7 +132,9 @@ ScalarCodeGenerator::CompiledExpression ScalarCodeGenerator::compile(
     b.SetInsertPoint(wrapper_bb_entry);
     std::vector<llvm::Value*> loaded_args = {wrapper_scalar_expr_func->arg_begin() + 1};
     for (size_t i = 2; i < wrapper_arg_types.size(); ++i) {
-      loaded_args.push_back(b.CreateLoad(wrapper_scalar_expr_func->arg_begin() + i));
+      auto* value = wrapper_scalar_expr_func->arg_begin() + i;
+      loaded_args.push_back(
+          b.CreateLoad(value->getType()->getPointerElementType(), value));
     }
     auto error_lv = b.CreateCall(scalar_expr_func, loaded_args);
     b.CreateStore(error_lv, wrapper_scalar_expr_func->arg_begin());
@@ -135,11 +145,12 @@ ScalarCodeGenerator::CompiledExpression ScalarCodeGenerator::compile(
 }
 
 std::vector<void*> ScalarCodeGenerator::generateNativeCode(
+    Executor* executor,
     const CompiledExpression& compiled_expression,
     const CompilationOptions& co) {
-  CHECK(module_ && !execution_engine_) << "Invalid code generator state";
+  CHECK(module_ && !execution_engine_.get()) << "Invalid code generator state";
   module_.release();
-  switch (co.device_type_) {
+  switch (co.device_type) {
     case ExecutorDeviceType::CPU: {
       execution_engine_ =
           generateNativeCPUCode(compiled_expression.func, {compiled_expression.func}, co);
@@ -147,10 +158,11 @@ std::vector<void*> ScalarCodeGenerator::generateNativeCode(
     }
     case ExecutorDeviceType::GPU: {
       return generateNativeGPUCode(
-          compiled_expression.func, compiled_expression.wrapper_func, co);
+          executor, compiled_expression.func, compiled_expression.wrapper_func, co);
     }
     default: {
       LOG(FATAL) << "Invalid device type";
+      return {};  // satisfy -Wreturn-type
     }
   }
 }
@@ -160,37 +172,35 @@ std::vector<llvm::Value*> ScalarCodeGenerator::codegenColumn(
     const bool fetch_column,
     const CompilationOptions& co) {
   int arg_idx = plan_state_->getLocalColumnId(column, fetch_column);
-  CHECK_LT(arg_idx, cgen_state_->row_func_->arg_size());
+  CHECK_LT(static_cast<size_t>(arg_idx), cgen_state_->row_func_->arg_size());
   llvm::Value* arg = cgen_state_->row_func_->arg_begin() + arg_idx + 1;
   return {arg};
 }
 
 std::vector<void*> ScalarCodeGenerator::generateNativeGPUCode(
+    Executor* executor,
     llvm::Function* func,
     llvm::Function* wrapper_func,
     const CompilationOptions& co) {
   if (!nvptx_target_machine_) {
-    nvptx_target_machine_ = initializeNVPTXBackend();
+    nvptx_target_machine_ =
+        initializeNVPTXBackend(CudaMgr_Namespace::NvidiaDeviceArch::Kepler);
   }
   if (!cuda_mgr_) {
     cuda_mgr_ = std::make_unique<CudaMgr_Namespace::CudaMgr>(0);
   }
-  const auto& dev_props = cuda_mgr_->getAllDeviceProperties();
-  int block_size = dev_props.front().maxThreadsPerBlock;
   GPUTarget gpu_target;
   gpu_target.nvptx_target_machine = nvptx_target_machine_.get();
   gpu_target.cuda_mgr = cuda_mgr_.get();
-  gpu_target.block_size = block_size;
   gpu_target.cgen_state = cgen_state_;
   gpu_target.row_func_not_inlined = false;
-  const auto gpu_code = CodeGenerator::generateNativeGPUCode(
-      func, wrapper_func, {func, wrapper_func}, co, gpu_target);
-  for (const auto& cached_function : gpu_code.cached_functions) {
-    gpu_compilation_contexts_.emplace_back(std::get<2>(cached_function));
-  }
-  std::vector<void*> native_function_pointers;
-  for (const auto& cached_function : gpu_code.cached_functions) {
-    native_function_pointers.push_back(std::get<0>(cached_function));
-  }
-  return native_function_pointers;
+  gpu_compilation_context_ =
+      CodeGenerator::generateNativeGPUCode(executor,
+                                           func,
+                                           wrapper_func,
+                                           {func, wrapper_func},
+                                           /*is_gpu_smem_used=*/false,
+                                           co,
+                                           gpu_target);
+  return gpu_compilation_context_->getNativeFunctionPointers();
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,12 @@
 
 #ifndef SHARED_LIKELY
 #define SHARED_LIKELY
+
+#ifdef _MSC_VER
+#define LIKELY(x) (x)
+#define UNLIKELY(x) (x)
+#else
 #define LIKELY(x) (__builtin_expect((x), 1))
 #define UNLIKELY(x) (__builtin_expect((x), 0))
+#endif
 #endif  // SHARED_LIKELY

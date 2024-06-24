@@ -1,26 +1,27 @@
-OmniSciDB (formerly MapD Core)
+HeavyDB (formerly OmniSciDB)
 ==============================
 
-OmniSciDB is an in-memory, column store, SQL relational database designed from the ground up to run on GPUs.
+HeavyDB is an open source SQL-based, relational, columnar database engine that leverages the full performance and parallelism of modern hardware (both CPUs and GPUs) to enable querying of multi-billion row datasets in milliseconds, without the need for indexing, pre-aggregation, or downsampling.  HeavyDB can be run on hybrid CPU/GPU systems (Nvidia GPUs are currently supported), as well as on CPU-only systems featuring X86, Power, and ARM (experimental support) architectures. To achieve maximum performance, HeavyDB features multi-tiered caching of data between storage, CPU memory, and GPU memory, and an innovative Just-In-Time (JIT) query compilation framework.
+
+For usage info, see the [product documentation](https://docs.heavy.ai/), and for more details about the system's internal architecture, check out the [developer documentation](https://heavyai.github.io/heavydb/). Further technical discussion can be found on the [HEAVY.AI Community Forum](https://community.heavy.ai).
 
 The repository includes a number of third party packages provided under separate licenses. Details about these packages and their respective licenses is at [ThirdParty/licenses/index.md](ThirdParty/licenses/index.md).
 
 # Downloads and Installation Instructions
 
-OmniSci provides pre-built binaries for Linux for stable releases of the project:
+HEAVY.AI provides pre-built binaries for Linux for stable releases of the project:
 
-| Distro | Package type | CPU/GPU | Link | Docs |
+| Distro | Package type | CPU/GPU | Repository | Docs |
 | --- | --- | --- | --- | --- |
-| CentOS | RPM | CPU | https://releases.omnisci.com/os/yum/stable/cpu | https://www.omnisci.com/docs/latest/4_centos7-yum-cpu-os-recipe.html |
-| CentOS | RPM | GPU | https://releases.omnisci.com/os/yum/stable/cuda | https://www.omnisci.com/docs/latest/4_centos7-yum-gpu-os-recipe.html |
-| Ubuntu | DEB | CPU | deb https://releases.omnisci.com/os/apt/ stable cpu | https://www.omnisci.com/docs/latest/4_ubuntu-apt-cpu-os-recipe.html |
-| Ubuntu | DEB | GPU | deb https://releases.omnisci.com/os/apt/ stable cuda | https://www.omnisci.com/docs/latest/4_ubuntu-apt-gpu-os-recipe.html |
-| * | tarball | CPU | https://releases.omnisci.com/os/tar/omnisci-os-latest-Linux-x86_64-cpu.tar.gz |  |
-| * | tarball | GPU | https://releases.omnisci.com/os/tar/omnisci-os-latest-Linux-x86_64-cuda.tar.gz |  |
-
+| CentOS | RPM | CPU | https://releases.heavy.ai/os/yum/stable/cpu |  https://docs.heavy.ai/installation-and-configuration/installation/installing-on-centos/centos-yum-gpu-ee |
+| CentOS | RPM | GPU | https://releases.heavy.ai/os/yum/stable/cuda | https://docs.heavy.ai/installation-and-configuration/installation/installing-on-centos/centos-yum-gpu-ee |
+| Ubuntu | DEB | CPU | https://releases.heavy.ai/os/apt/dists/stable/cpu | https://docs.heavy.ai/installation-and-configuration/installation/installing-on-ubuntu/centos-yum-gpu-ee |
+| Ubuntu | DEB | GPU | https://releases.heavy.ai/os/apt/dists/stable/cuda | https://docs.heavy.ai/installation-and-configuration/installation/installing-on-ubuntu/centos-yum-gpu-ee |
+| * | tarball | CPU | https://releases.heavy.ai/os/tar/heavyai-os-latest-Linux-x86_64-cpu.tar.gz |  |
+| * | tarball | GPU | https://releases.heavy.ai/os/tar/heavyai-os-latest-Linux-x86_64.tar.gz |  |
 ***
 
-# Developing OmniSciDB: Table of Contents
+# Developing HeavyDB: Table of Contents
 
 - [Links](#links)
 - [License](#license)
@@ -34,13 +35,14 @@ OmniSci provides pre-built binaries for Linux for stable releases of the project
 
 # Links
 
-- [Documentation](https://www.omnisci.com/docs/latest/)
-- [Release Notes](https://www.omnisci.com/docs/latest/7_0_release.html)
-- [Community Forum](https://community.omnisci.com)
-- [OmniSci Homepage](https://www.omnisci.com)
-- [OmniSci Blog](https://www.omnisci.com/blog/)
-- [OmniSci Downloads](https://www.omnisci.com/platform/downloads/)
-- [Doxygen-generated documentation](http://doxygen.omnisci.com/)
+- [Developer Documentation](https://heavyai.github.io/heavydb/)
+- [Doxygen-generated Documentation](http://doxygen.mapd.com/)
+- [Product Documentation](https://docs.heavy.ai/)
+- [Release Notes](https://docs.heavy.ai/overview/release-notes)
+- [Community Forum](https://community.heavy.ai)
+- [HEAVY.AI Homepage](https://www.heavy.ai)
+- [HEAVY.AI Blog](https://www.heavy.ai/blog/)
+- [HEAVY.AI Downloads](https://www.heavy.ai/platform/downloads/)
 
 # License
 
@@ -50,13 +52,13 @@ The repository includes a number of third party packages provided under separate
 
 # Contributing
 
-In order to clarify the intellectual property license granted with Contributions from any person or entity, OmniSci must have a Contributor License Agreement ("CLA") on file that has been signed by each Contributor, indicating agreement to the [Contributor License Agreement](CLA.txt). After making a pull request, a bot will notify you if a signed CLA is required and provide instructions for how to sign it. Please read the agreement carefully before signing and keep a copy for your records.
+In order to clarify the intellectual property license granted with Contributions from any person or entity, HEAVY.AI must have a Contributor License Agreement ("CLA") on file that has been signed by each Contributor, indicating agreement to the [Contributor License Agreement](CLA.txt). After making a pull request, a bot will notify you if a signed CLA is required and provide instructions for how to sign it. Please read the agreement carefully before signing and keep a copy for your records.
 
 # Building
 
-If this is your first time building OmniSciDB, install the dependencies mentioned in the [Dependencies](#dependencies) section below.
+If this is your first time building HeavyDB, install the dependencies mentioned in the [Dependencies](#dependencies) section below.
 
-OmniSciDB uses CMake for its build system.
+HeavyDB uses CMake for its build system.
 
     mkdir build
     cd build
@@ -69,27 +71,23 @@ The following `cmake`/`ccmake` options can enable/disable different features:
                                  Options are `Debug`, `Release`, `RelWithDebInfo`, `MinSizeRel`, and unset.
 - `-DENABLE_ASAN=off` - Enable address sanitizer. Default is `off`.
 - `-DENABLE_AWS_S3=on` - Enable AWS S3 support, if available. Default is `on`.
-- `-DENABLE_CALCITE_DELETE_PATH=on` - Enable Calcite Delete Path. Default is `on`.
-- `-DENABLE_CALCITE_UPDATE_PATH=on` - Enable Calcite Update Path. Default is `on`.
 - `-DENABLE_CUDA=off` - Disable CUDA. Default is `on`.
 - `-DENABLE_CUDA_KERNEL_DEBUG=off` - Enable debugging symbols for CUDA kernels. Will dramatically reduce kernel performance. Default is `off`.
 - `-DENABLE_DECODERS_BOUNDS_CHECKING=off` - Enable bounds checking for column decoding. Default is `off`.
 - `-DENABLE_FOLLY=on` - Use Folly. Default is `on`.
 - `-DENABLE_IWYU=off` - Enable include-what-you-use. Default is `off`.
 - `-DENABLE_JIT_DEBUG=off` - Enable debugging symbols for the JIT. Default is `off`.
+- `-DENABLE_ONLY_ONE_ARCH=off` - Compile GPU code only for the host machine's architecture, speeding up compilation. Default is `off`.
 - `-DENABLE_PROFILER=off` - Enable google perftools. Default is `off`.
 - `-DENABLE_STANDALONE_CALCITE=off` - Require standalone Calcite server. Default is `off`.
 - `-DENABLE_TESTS=on` - Build unit tests. Default is `on`.
 - `-DENABLE_TSAN=off` - Enable thread sanitizer. Default is `off`.
 - `-DENABLE_CODE_COVERAGE=off` - Enable code coverage symbols (clang only). Default is `off`.
-- `-DENALBE_JAVA_REMOTE_DEBUG=on` - Enable Java Remote Debug. Default is `off`.
-- `-DMAPD_DOCS_DOWNLOAD=on` - Download the latest master build of the documentation / `docs.mapd.com`. Default is `off`.
-                              **Note:** this is a >50MB download.
-- `-DPREFER_STATIC_LIBS=off` - Static link dependencies, if available. Default is `off`.
+- `-DPREFER_STATIC_LIBS=off` - Static link dependencies, if available. Default is `off`. Only works on CentOS.
 
 # Testing
 
-OmniSciDB uses [Google Test](https://github.com/google/googletest) as its main testing framework. Tests reside under the [Tests](Tests) directory.
+HeavyDB uses [Google Test](https://github.com/google/googletest) as its main testing framework. Tests reside under the [Tests](Tests) directory.
 
 The `sanity_tests` target runs the most common tests. If using Makefiles to build, the tests may be run using:
 
@@ -118,7 +116,7 @@ Finally run the tests:
 
 We use a TSAN suppressions file to ignore warnings in third party libraries. Source the suppressions file by adding it to your `TSAN_OPTIONS` env:
 
-    export TSAN_OPTIONS="suppressions=/path/to/mapd/config/tsan.suppressions"
+    export TSAN_OPTIONS="suppressions=/path/to/heavydb/config/tsan.suppressions"
 
 Finally run the tests:
 
@@ -126,9 +124,9 @@ Finally run the tests:
 
 # Generating Packages
 
-OmniSciDB uses [CPack](https://cmake.org/cmake/help/latest/manual/cpack.1.html) to generate packages for distribution. Packages generated on CentOS with static linking enabled can be used on most other recent Linux distributions.
+HeavyDB uses [CPack](https://cmake.org/cmake/help/latest/manual/cpack.1.html) to generate packages for distribution. Packages generated on CentOS with static linking enabled can be used on most other recent Linux distributions.
 
-To generate packages on CentOS (assuming starting from top level of the omniscidb repository):
+To generate packages on CentOS (assuming starting from top level of the heavydb repository):
 
     mkdir build-package && cd build-package
     cmake -DPREFER_STATIC_LIBS=on -DCMAKE_BUILD_TYPE=release ..
@@ -143,17 +141,15 @@ The last command generates a `.tar.gz` package. The `TGZ` can be replaced with, 
 
 # Using
 
-The [`startomnisci`](startomnisci) wrapper script may be used to start OmniSciDB in a testing environment. This script performs the following tasks:
+The [`startheavy`](startheavy) wrapper script may be used to start HeavyDB in a testing environment. This script performs the following tasks:
 
 - initializes the `data` storage directory via `initdb`, if required
-- starts the main OmniSciDB server, `omnisci_server`
-- starts the OmniSci web server, `omnisci_web_server`, for serving OmniSci Immerse
+- starts the main HeavyDB server, `heavydb`
 - offers to download and import a sample dataset, using the `insert_sample_data` script
-- attempts to open OmniSci Immerse in your web browser
 
-Assuming you are in the `build` directory, and it is a subdirectory of the `omniscidb` repository, `startomnisci` may be run by:
+Assuming you are in the `build` directory, and it is a subdirectory of the `heavydb` repository, `startheavy` may be run by:
 
-    ../startomnisci
+    ../startheavy
 
 ## Starting Manually
 
@@ -163,29 +159,19 @@ Initialize the `data` storage directory. This command only needs to be run once.
 
     mkdir data && ./bin/initdb data
 
-Start the OmniSciDB server:
+Start the HeavyDB server:
 
-    ./bin/omnisci_server
-
-In a new terminal, start the OmniSci web server:
-
-    ./bin/omnisci_web_server
+    ./bin/heavydb
 
 If desired, insert a sample dataset by running the `insert_sample_data` script in a new terminal:
 
     ../insert_sample_data
 
-You can now start using the database. The `omnisql` utility may be used to interact with the database from the command line:
+You can now start using the database. The `heavysql` utility may be used to interact with the database from the command line:
 
-    ./bin/omnisql -p HyperInteractive
+    ./bin/heavysql -p HyperInteractive
 
-where `HyperInteractive` is the default password. The default user `mapd` is assumed if not provided.
-
-You can also interact with the database using the web-based OmniSci Immerse frontend by visiting the web server's default port of `6273`:
-
-[http://localhost:6273](http://localhost:6273)
-
-Note: usage of OmniSci Immerse is governed by a separate license agreement, provided under `EULA-CE.txt`. The version bundled with this project may only be used for non-commercial purposes.
+where `HyperInteractive` is the default password. The default user `admin` is assumed if not provided.
 
 # Code Style
 
@@ -205,7 +191,7 @@ A [`.clang-tidy`](https://clang.llvm.org/extra/clang-tidy/) configuration is pro
 
 `clang-tidy` requires all generated files to exist before running. The easiest way to accomplish this is to simply run a full build before running `clang-tidy`. A build target which runs `clang-tidy` is provided. To use:
 
-    make clang-tidy
+    make run-clang-tidy
 
 Note: `clang-tidy` may make invalid or overly verbose changes to the source code. It is recommended to first commit your changes, then run `clang-tidy` and review its recommended changes before amending them to your commit.
 
@@ -213,26 +199,24 @@ Note: the `clang-tidy` target uses the `run-clang-tidy.py` script provided with 
 
 # Dependencies
 
-OmniSciDB has the following dependencies:
+HeavyDB has the following dependencies:
 
 | Package | Min Version | Required |
 | ------- | ----------- | -------- |
-| [CMake](https://cmake.org/) | 3.3 | yes |
-| [LLVM](http://llvm.org/) | 4.0 (8.0 recommended) | yes |
-| [GCC](http://gcc.gnu.org/) | 6.1 | no, if building with clang |
-| [Go](https://golang.org/) | 1.6 | yes |
-| [Boost](http://www.boost.org/) | 1.65.0 | yes |
+| [CMake](https://cmake.org/) | 3.16 | yes |
+| [LLVM](http://llvm.org/) | 9.0 | yes |
+| [GCC](http://gcc.gnu.org/) | 8.4.0 | no, if building with clang |
+| [Go](https://golang.org/) | 1.12 | yes |
+| [Boost](http://www.boost.org/) | 1.72.0 | yes |
 | [OpenJDK](http://openjdk.java.net/) | 1.7 | yes |
-| [CUDA](http://nvidia.com/cuda) | 9.0 | yes, if compiling with GPU support |
+| [CUDA](http://nvidia.com/cuda) | 11.0 | yes, if compiling with GPU support |
 | [gperftools](https://github.com/gperftools/gperftools) | | yes |
-| [gdal](http://gdal.org/) | 2.3 | yes |
-| [Arrow](https://arrow.apache.org/) | 0.11.0 | yes |
-
-Dependencies for `omnisci_web_server` and other Go utils are in [`ThirdParty/go`](ThirdParty/go). See [`ThirdParty/go/src/mapd/vendor/README.md`](ThirdParty/go/src/mapd/vendor/README.md) for instructions on how to add new deps.
+| [gdal](http://gdal.org/) | 2.4.2 | yes |
+| [Arrow](https://arrow.apache.org/) | 3.0.0 | yes |
 
 ## CentOS 7
 
-OmniSciDB requires a number of dependencies which are not provided in the common CentOS/RHEL package repositories. A prebuilt package containing all these dependencies is provided for CentOS 7 (x86_64).
+HeavyDB requires a number of dependencies which are not provided in the common CentOS/RHEL package repositories. A prebuilt package containing all these dependencies is provided for CentOS 7 (x86_64).
 
 Use the [scripts/mapd-deps-prebuilt.sh](scripts/mapd-deps-prebuilt.sh) build script to install prebuilt dependencies.
 
@@ -286,11 +270,11 @@ The [scripts/mapd-deps-centos.sh](scripts/mapd-deps-centos.sh) script is used to
 
 ## Ubuntu
 
-Most build dependencies required by OmniSciDB are available via APT. Certain dependencies such as Thrift, Blosc, and Folly must be built as they either do not exist in the default repositories or have outdated versions. A prebuilt package containing all these dependencies is provided for Ubuntu 18.04 (x86_64). The dependencies will be installed to `/usr/local/mapd-deps/` by default; see the Environment Variables section below for how to add these dependencies to your environment.
+Most build dependencies required by HeavyDB are available via APT. Certain dependencies such as Thrift, Blosc, and Folly must be built as they either do not exist in the default repositories or have outdated versions. A prebuilt package containing all these dependencies is provided for Ubuntu 18.04 (x86_64). The dependencies will be installed to `/usr/local/mapd-deps/` by default; see the Environment Variables section below for how to add these dependencies to your environment.
 
 ### Ubuntu 16.04
 
-OmniSciDB requires a newer version of Boost than the version which is provided by Ubuntu 16.04. The [scripts/mapd-deps-ubuntu1604.sh](scripts/mapd-deps-ubuntu1604.sh) build script will compile and install a newer version of Boost into the `/usr/local/mapd-deps/` directory.
+HeavyDB requires a newer version of Boost than the version which is provided by Ubuntu 16.04. The [scripts/mapd-deps-ubuntu1604.sh](scripts/mapd-deps-ubuntu1604.sh) build script will compile and install a newer version of Boost into the `/usr/local/mapd-deps/` directory.
 
 ### Ubuntu 18.04
 
@@ -299,15 +283,6 @@ Use the [scripts/mapd-deps-prebuilt.sh](scripts/mapd-deps-prebuilt.sh) build scr
 These dependencies will be installed to a directory under `/usr/local/mapd-deps`. The `mapd-deps-prebuilt.sh` script above will generate a script named `mapd-deps.sh` containing the environment variables which need to be set. Simply source this file in your current session (or symlink it to `/etc/profile.d/mapd-deps.sh`) in order to activate it:
 
     source /usr/local/mapd-deps/mapd-deps.sh
-
-Some installs of Ubuntu 18.04 may fail while building with a message similar to:
-
-    java.security.InvalidAlgorithmParameterException: the trustAnchors parameter must be non-empty
-
-This is a known issue in 18.04 which will be resolved in [Ubuntu 18.04.1](https://bugs.launchpad.net/ubuntu/+source/ca-certificates-java/+bug/1739631). To resolve on 18.04:
-
-    sudo rm /etc/ssl/certs/java/cacerts
-    sudo update-ca-certificates -f
 
 ### Environment Variables
 
@@ -333,13 +308,9 @@ The [scripts/mapd-deps-ubuntu.sh](scripts/mapd-deps-ubuntu.sh) and [scripts/mapd
 
 ## Arch
 
-[scripts/mapd-deps-arch.sh](scripts/mapd-deps-arch.sh) is provided that will use [yay](https://aur.archlinux.org/packages/yay/) to install packages from the [Arch User Repository](https://wiki.archlinux.org/index.php/Arch_User_Repository) and a custom PKGBUILD script for Apache Arrow. If you don't have yay yet, install it first: https://github.com/Jguer/yay#installation
+[scripts/mapd-deps-arch.sh](scripts/mapd-deps-arch.sh) is provided that will use [yay](https://aur.archlinux.org/packages/yay/) to install packages from the [Arch User Repository](https://wiki.archlinux.org/index.php/Arch_User_Repository) and custom PKGBUILD scripts for a few packages listed below. If you don't have `yay` yet, install it first: https://github.com/Jguer/yay#installation
 
-Note: Apache Arrow, while available in the AUR, requires a few custom build flags in order to be used with Core. A custom PKGBUILD for it is included.
-
-Note: packages aws-sdk-cpp and folly, while available in the AUR, are not supported while for building Core on Arch. If these packages are installed, support for them should be disabled when building Core. To do so, use the following options when running CMake:
-
-    cmake -DENABLE_FOLLY=off -DENABLE_AWS_S3=off ..
+### Package Version Requirements:
 
 ### CUDA
 

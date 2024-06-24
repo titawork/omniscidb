@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,7 +16,8 @@
 
 /*
  * @file ChunkIter.cpp
- * @author Wei Hong <wei@mapd.com>
+ * @brief
+ *
  */
 
 #include "ChunkIter.h"
@@ -148,7 +149,7 @@ DEVICE void ChunkIter_get_next(ChunkIter* it,
                                bool uncompress,
                                VarlenDatum* result,
                                bool* is_end) {
-  if (it->current_pos >= it->end_pos) {
+  if (!it || it->current_pos >= it->end_pos) {
     *is_end = true;
     result->length = 0;
     result->pointer = NULL;
@@ -183,7 +184,11 @@ DEVICE void ChunkIter_get_nth(ChunkIter* it,
                               bool uncompress,
                               VarlenDatum* result,
                               bool* is_end) {
-  if (static_cast<size_t>(n) >= it->num_elems || n < 0) {
+  if (FlatBufferManager::isFlatBuffer(it)) {
+    VarlenArray_get_nth(reinterpret_cast<int8_t*>(it), n, uncompress, result, is_end);
+    return;
+  }
+  if (!it || static_cast<size_t>(n) >= it->num_elems || n < 0) {
     *is_end = true;
     result->length = 0;
     result->pointer = NULL;
@@ -214,7 +219,11 @@ DEVICE void ChunkIter_get_nth(ChunkIter* it,
 
 // @brief get nth element in Chunk.  Does not change ChunkIter state
 DEVICE void ChunkIter_get_nth(ChunkIter* it, int n, ArrayDatum* result, bool* is_end) {
-  if (static_cast<size_t>(n) >= it->num_elems || n < 0) {
+  if (FlatBufferManager::isFlatBuffer(it)) {
+    VarlenArray_get_nth(reinterpret_cast<int8_t*>(it), n, result, is_end);
+    return;
+  }
+  if (!it || static_cast<size_t>(n) >= it->num_elems || n < 0) {
     *is_end = true;
     result->length = 0;
     result->pointer = NULL;
@@ -228,7 +237,12 @@ DEVICE void ChunkIter_get_nth(ChunkIter* it, int n, ArrayDatum* result, bool* is
     int8_t* current_pos = it->start_pos + n * it->skip_size;
     result->length = static_cast<size_t>(it->skip_size);
     result->pointer = current_pos;
-    result->is_null = false;  // TODO: add a check for a NULL fixlen array
+    bool is_null = false;
+    if (!it->type_info.get_notnull()) {
+      // Nulls can only be recognized when iterating over a !notnull-typed chunk
+      is_null = it->type_info.is_null_fixlen_array(result->pointer, result->length);
+    }
+    result->is_null = is_null;
   } else {
     int8_t* current_pos = it->start_pos + n * sizeof(ArrayOffsetT);
     int8_t* next_pos = current_pos + sizeof(ArrayOffsetT);
@@ -247,4 +261,84 @@ DEVICE void ChunkIter_get_nth(ChunkIter* it, int n, ArrayDatum* result, bool* is
       result->is_null = false;
     }
   }
+}
+
+// @brief get nth varlen array element in Chunk.  Does not change ChunkIter state
+DEVICE void ChunkIter_get_nth_varlen(ChunkIter* it,
+                                     int n,
+                                     ArrayDatum* result,
+                                     bool* is_end) {
+  if (FlatBufferManager::isFlatBuffer(it)) {
+    VarlenArray_get_nth(reinterpret_cast<int8_t*>(it), n, result, is_end);
+    return;
+  }
+  *is_end = (!it || static_cast<size_t>(n) >= it->num_elems || n < 0);
+
+  if (!*is_end) {
+    int8_t* current_pos = it->start_pos + n * sizeof(ArrayOffsetT);
+    int8_t* next_pos = current_pos + sizeof(ArrayOffsetT);
+    ArrayOffsetT offset = *(ArrayOffsetT*)current_pos;
+    ArrayOffsetT next_offset = *(ArrayOffsetT*)next_pos;
+
+    if (next_offset >= 0) {
+      // Previous array may have been NULL, remove offset negativity
+      if (offset < 0) {
+        offset = -offset;
+      }
+      result->length = static_cast<size_t>(next_offset - offset);
+      result->pointer = it->second_buf + offset;
+      result->is_null = false;
+      return;
+    }
+  }
+  // Encoded NULL array or out of bounds
+  result->length = 0;
+  result->pointer = NULL;
+  result->is_null = true;
+}
+
+// @brief get nth varlen notnull array element in Chunk.  Does not change ChunkIter state
+DEVICE void ChunkIter_get_nth_varlen_notnull(ChunkIter* it,
+                                             int n,
+                                             ArrayDatum* result,
+                                             bool* is_end) {
+  *is_end = (static_cast<size_t>(n) >= it->num_elems || n < 0);
+
+  int8_t* current_pos = it->start_pos + n * sizeof(ArrayOffsetT);
+  int8_t* next_pos = current_pos + sizeof(ArrayOffsetT);
+  ArrayOffsetT offset = *(ArrayOffsetT*)current_pos;
+  ArrayOffsetT next_offset = *(ArrayOffsetT*)next_pos;
+
+  result->length = static_cast<size_t>(next_offset - offset);
+  result->pointer = it->second_buf + offset;
+  result->is_null = false;
+}
+
+// @brief get nth point coord array in Chunk.  Does not change ChunkIter state
+// Custom iterator for point coord arrays:
+// int8_t[16] representing uncompressed double[2] coords
+// int8_t[8] representing 32-bit compressed int32_t[2] coords
+DEVICE void ChunkIter_get_nth_point_coords(ChunkIter* it,
+                                           int n,
+                                           ArrayDatum* result,
+                                           bool* is_end) {
+  if (!it || static_cast<size_t>(n) >= it->num_elems || n < 0) {
+    *is_end = true;
+    result->length = 0;
+    result->pointer = NULL;
+    result->is_null = true;
+    return;
+  }
+  *is_end = false;
+
+  assert(it->skip_size > 0);
+  int8_t* current_pos = it->start_pos + n * it->skip_size;
+  result->length = static_cast<size_t>(it->skip_size);
+  result->pointer = current_pos;
+  bool is_null = false;
+  if (!it->type_info.get_notnull()) {
+    // Nulls can only be recognized when iterating over a !notnull-typed chunk
+    is_null = it->type_info.is_null_point_coord_array(result->pointer, result->length);
+  }
+  result->is_null = is_null;
 }

@@ -1,4 +1,5 @@
-/* * Copyright 2017 MapD Technologies, Inc.
+/*
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,18 +18,26 @@
 #define QUERYENGINE_EXPRESSIONRANGE_H
 
 #include "../Analyzer/Analyzer.h"
-#include "../Shared/unreachable.h"
 
 #include <boost/multiprecision/cpp_int.hpp>  //#include <boost/none.hpp>
 #include <boost/optional.hpp>
 
-typedef boost::multiprecision::number<
+using checked_int64_t = boost::multiprecision::number<
     boost::multiprecision::cpp_int_backend<64,
                                            64,
                                            boost::multiprecision::signed_magnitude,
                                            boost::multiprecision::checked,
-                                           void>>
-    checked_int64_t;
+                                           void>>;
+
+// set the min / max bit to 15 instead of 16 (minus sign bit, 15 = 16 - 1)
+// to check a valid positive int16_t range: 0 ~ 32,767, not 0 ~ 65,535
+// (similar to check negative int16_t value range: -32,768 ~ 0, not -65,535 ~ 0)
+using checked_int16_t = boost::multiprecision::number<
+    boost::multiprecision::cpp_int_backend<15,
+                                           15,
+                                           boost::multiprecision::signed_magnitude,
+                                           boost::multiprecision::checked,
+                                           void>>;
 
 enum class ExpressionRangeType { Invalid, Integer, Float, Double, Null };
 
@@ -132,6 +141,8 @@ class ExpressionRange {
 
   void setHasNulls() { has_nulls_ = true; }
 
+  void setNulls(bool n) { has_nulls_ = n; }
+
   ExpressionRange operator+(const ExpressionRange& other) const;
   ExpressionRange operator-(const ExpressionRange& other) const;
   ExpressionRange operator*(const ExpressionRange& other) const;
@@ -139,6 +150,28 @@ class ExpressionRange {
   ExpressionRange operator||(const ExpressionRange& other) const;
 
   bool operator==(const ExpressionRange& other) const;
+
+  static bool typeSupportsRange(const SQLTypeInfo& ti);
+
+  std::string toString() const {
+    std::ostringstream oss;
+    switch (type_) {
+      case ExpressionRangeType::Integer:
+        oss << has_nulls_ << "|" << std::to_string(int_min_) << "|"
+            << std::to_string(int_max_);
+        break;
+      case ExpressionRangeType::Float:
+      case ExpressionRangeType::Double:
+        oss << has_nulls_ << "|" << std::to_string(fp_min_) << "|"
+            << std::to_string(fp_max_);
+        break;
+      default:
+        oss << "INVALID";
+        break;
+    }
+    oss << "|" << std::to_string(bucket_);
+    return oss.str();
+  }
 
  private:
   ExpressionRange(const int64_t int_min_in,
@@ -296,6 +329,12 @@ void apply_fp_qual(const Datum const_datum,
                    const SQLTypes const_type,
                    const SQLOps sql_op,
                    ExpressionRange& qual_range);
+void apply_hpt_qual(const Datum const_datum,
+                    const SQLTypes const_type,
+                    const int32_t const_dimen,
+                    const int32_t col_dimen,
+                    const SQLOps sql_op,
+                    ExpressionRange& qual_range);
 
 ExpressionRange apply_simple_quals(
     const Analyzer::ColumnVar*,

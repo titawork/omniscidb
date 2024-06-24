@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,13 +14,13 @@
  * limitations under the License.
  */
 
-#include <glog/logging.h>
 #include <cassert>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include "Logger/Logger.h"
 #include "cuda.h"
 
 template <typename TimeT = std::chrono::milliseconds>
@@ -65,7 +65,7 @@ int main(int argc, char** argv) {
   // Get kernel function
   checkCudaErrors(cuModuleGetFunction(&function, cudaModule, "kernel"));
 
-  int64_t N = 1000000000L;
+  int64_t N = 1000000000LL;
   int8_t* byte_stream_col_0 = new int8_t[N];
   memset(byte_stream_col_0, 42, N);
 

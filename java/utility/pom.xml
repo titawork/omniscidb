@@ -16,7 +16,7 @@
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <maven.compiler.source>1.8</maven.compiler.source>
     <maven.compiler.target>1.8</maven.compiler.target>
-    <thrift.version>0.9.3</thrift.version>
+    <thrift.version>0.17.0</thrift.version>
   </properties>
   <dependencies>
     <dependency>
@@ -25,13 +25,13 @@
       <version>1.0-SNAPSHOT</version>
     </dependency>
     <dependency>
-      <groupId>com.omnisci</groupId>
-      <artifactId>omnisci-jdbc</artifactId>
+      <groupId>ai.heavy</groupId>
+      <artifactId>heavyai-jdbc</artifactId>
       <version>${omnisci.release.version}</version>
     </dependency>
     <dependency>
       <groupId>com.mapd</groupId>
-      <artifactId>mapdcommon</artifactId>
+      <artifactId>heavydbcommon</artifactId>
       <version>${omnisci.release.version}</version>
     </dependency>
     <dependency>
@@ -46,25 +46,38 @@
     </dependency>
     <dependency>
       <groupId>org.slf4j</groupId>
-      <artifactId>slf4j-log4j12</artifactId>
-      <version>1.7.12</version>
+      <artifactId>slf4j-api</artifactId>
+      <version>1.7.32</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.logging.log4j</groupId>
+      <artifactId>log4j-slf4j-impl</artifactId>
+      <version>2.17.1</version>
     </dependency>
     <!-- PostGIS Needed to help import geo types -->
     <dependency>
-      <groupId>postgresql</groupId>
+      <groupId>org.postgresql</groupId>
       <artifactId>postgresql</artifactId>
-      <version>9.1-901.jdbc4</version>
+      <version>42.2.20</version>
+      <scope>provided</scope>
     </dependency>
     <dependency>
-      <groupId>org.postgis</groupId>
+      <groupId>net.postgis</groupId>
       <artifactId>postgis-jdbc</artifactId>
-      <version>1.3.3</version>
+      <version>2.5.0</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>net.postgis</groupId>
+      <artifactId>postgis-geometry</artifactId>
+      <version>2.5.0</version>
+      <scope>provided</scope>
     </dependency>
 
     <dependency>
       <groupId>junit</groupId>
       <artifactId>junit</artifactId>
-      <version>4.11</version>
+      <version>4.13.1</version>
       <scope>test</scope>
       <type>jar</type>
     </dependency>
@@ -76,12 +89,13 @@
     <dependency>
       <groupId>org.xerial</groupId>
       <artifactId>sqlite-jdbc</artifactId>
-      <version>3.15.1</version>
+      <version>3.30.1</version>
     </dependency>
     <dependency>
       <groupId>com.unboundid</groupId>
       <artifactId>unboundid-ldapsdk</artifactId>
       <version>4.0.6</version>
+      <scope>test</scope>
     </dependency>
   </dependencies>
   <build>
@@ -106,11 +120,15 @@
       </plugin>
       <plugin>
         <artifactId>maven-assembly-plugin</artifactId>
+        <version>3.3.0</version>
         <configuration>
           <archive>
             <manifest>
               <mainClass>com.mapd.dashboard.DashboardTest</mainClass>
             </manifest>
+            <manifestEntries>
+              <Multi-Release>true</Multi-Release>
+            </manifestEntries>
           </archive>
           <descriptorRefs>
             <descriptorRef>jar-with-dependencies</descriptorRef>

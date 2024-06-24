@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,15 +23,14 @@ llvm::Value* Executor::spillDoubleElement(llvm::Value* elem_val, llvm::Type* ele
 }
 
 bool Executor::isArchMaxwell(const ExecutorDeviceType dt) const {
-  return dt == ExecutorDeviceType::GPU &&
-         catalog_->getDataMgr().getCudaMgr()->isArchMaxwell();
+  return dt == ExecutorDeviceType::GPU && cudaMgr()->isArchMaxwell();
 }
 
-bool GroupByAndAggregate::needsUnnestDoublePatch(llvm::Value* val_ptr,
+bool GroupByAndAggregate::needsUnnestDoublePatch(llvm::Value const* val_ptr,
                                                  const std::string& agg_base_name,
                                                  const bool threads_share_memory,
                                                  const CompilationOptions& co) const {
-  return (executor_->isArchMaxwell(co.device_type_) && threads_share_memory &&
+  return (executor_->isArchMaxwell(co.device_type) && threads_share_memory &&
           llvm::isa<llvm::AllocaInst>(val_ptr) &&
           val_ptr->getType() ==
               llvm::Type::getDoublePtrTy(executor_->cgen_state_->context_) &&

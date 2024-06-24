@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -39,12 +39,13 @@ struct DictDescriptor {
   int refcount;
   bool dictIsTemp;
   std::shared_ptr<StringDictionary> stringDict;
+  std::shared_ptr<std::mutex> string_dict_mutex;
   DictDescriptor(DictRef dict_ref,
                  const std::string& name,
                  int nbits,
                  bool shared,
                  const int rc,
-                 std::string& fname,
+                 const std::string& fname,
                  bool temp)
       : dictRef(dict_ref)
       , dictName(name)
@@ -53,7 +54,8 @@ struct DictDescriptor {
       , dictFolderPath(fname)
       , refcount(rc)
       , dictIsTemp(temp)
-      , stringDict(nullptr) {}
+      , stringDict(nullptr)
+      , string_dict_mutex(std::make_shared<std::mutex>()) {}
 
   DictDescriptor(int db_id,
                  int dict_id,
@@ -61,7 +63,7 @@ struct DictDescriptor {
                  int nbits,
                  bool shared,
                  const int rc,
-                 std::string& fname,
+                 const std::string& fname,
                  bool temp)
       : dictName(name)
       , dictNBits(nbits)
@@ -69,7 +71,8 @@ struct DictDescriptor {
       , dictFolderPath(fname)
       , refcount(rc)
       , dictIsTemp(temp)
-      , stringDict(nullptr) {
+      , stringDict(nullptr)
+      , string_dict_mutex(std::make_shared<std::mutex>()) {
     dictRef.dbId = db_id;
     dictRef.dictId = dict_id;
   }

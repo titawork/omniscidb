@@ -10,36 +10,52 @@ crypto++ | [Boost](<http://www.cryptopp.com/License.txt>) | Signature verificati
 CUDA | [NVIDIA EULA](<http://docs.nvidia.com/cuda/eula/index.html#redistribution-rights>) | GPU access |
 double-conversion | [BSD-like](<https://github.com/google/double-conversion/blob/master/COPYING>) | Folly |
 EGL, KHR | [MIT]() | Rendering Support |
+fmt | [MIT](https://github.com/fmtlib/fmt/blob/master/LICENSE.rst) | Folly |
 Folly | [Apache](https://github.com/facebook/folly/blob/master/LICENSE) | Multiple |
-glbinding | [MIT](<https://github.com/cginternals/glbinding/blob/master/LICENSE>) | OpenGL management |
 gflags | [BSD-like](<https://github.com/gflags/gflags/blob/master/COPYING.txt>) | Folly |
 glog | [BSD-like](<https://github.com/google/glog/blob/master/COPYING>) | C++ logging |
 cpp-jwt | [MIT](<https://github.com/arun11299/cpp-jwt/blob/master/LICENSE>) | Elliptical Curve Digital Signature |
 libcurl | [MIT](<https://curl.haxx.se/docs/copyright.html>) | AWS metadata download |
 libldap | varies, [OpenLDAP](<http://www.openldap.org/software/release/license.html>) | LDAP support; provided by OS (dynamic linked) |
+libnuma | [LGPL](<https://github.com/numactl/numactl/blob/master/LICENSE.LGPL2.1>) | Optane support, dynamic linked
 libpng | [libpng](<http://libpng.org/pub/png/src/libpng-LICENSE.txt>) | Render encoding / transport |
 linenoise | [BSD](<https://github.com/antirez/linenoise/blob/master/LICENSE>) | CLI |
 LLVM | [LLVM](<http://llvm.org/releases/3.9.1/LICENSE.TXT>) | JIT |
+memkind | [BSD](<https://github.com/memkind/memkind/blob/master/COPYING>) | Optane support
 muparserx | [BSD](<https://github.com/beltoforion/muparserx/blob/master/License.txt>) | Expression string parsing |
 ncurses | [X11](<http://invisible-island.net/ncurses/ncurses.faq.html#who_owns_it>) | CLI/password entry |
 PicoSHA2 | [MIT](<https://github.com/okdshin/PicoSHA2/blob/master/LICENSE>) | SHA256 Library |
 rapidjson | [MIT](<https://github.com/miloyip/rapidjson/blob/master/license.txt>) | JSON parsing |
+robin_hood | [MIT](<https://github.com/martinus/robin-hood-hashing/blob/master/LICENSE>) | Unordered Map and Set |
 SQLite | [Public Domain](<https://www.sqlite.org/copyright.html>) | Catalog management |
+TBB | [Apache-2.0](https://raw.githubusercontent.com/oneapi-src/oneTBB/tbb_2020/LICENSE) | Threadpool support |
+TimeGM | [BSD](<https://cdn.netbsd.org/pub/pkgsrc/current/pkgsrc/pkgtools/libnbcompat/files/timegm.c>) | Date/time support |
+Uber H3 | [Apache-2.0](https://github.com/uber/h3/blob/master/LICENSE) | H3 index encoding/decoding |
 Xorg | [MIT](<https://www.x.org/releases/X11R7.7/doc/xorg-docs/License.html>) | OpenGL rendering |
 zlib | [zlib](<http://zlib.net/zlib_license.html>) | PNG support |
 --- | --- | --- |
-glslang | [BSD BSD-like MIT](https://github.com/KhronosGroup/glslang/blob/master/LICENSE.txt) | Rendering support 
+glslang | [BSD BSD-like MIT](https://github.com/KhronosGroup/glslang/blob/master/LICENSE.txt) | Rendering support
 spirv-tools | [Apache-2.0](https://github.com/KhronosGroup/SPIRV-Tools/blob/master/LICENSE) | Rendering support
 spirv-cross | [Apache-2.0](https://github.com/KhronosGroup/SPIRV-Cross/blob/master/LICENSE) | Rendering support
+Vulkan Loader | [Apache-2.0](https://github.com/KhronosGroup/Vulkan-Loader/blob/main/LICENSE.txt) | Rendering support
+Vulkan Memory Allocator | [MIT](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/blob/master/LICENSE.txt) | Rendering support
+GLM | [MIT](https://github.com/g-truc/glm/blob/master/copying.txt) | Rendering support
+GLFW | [zlib](https://github.com/glfw/glfw/blob/master/LICENSE.md) | Rendering tools
+ImGui | [MIT](https://github.com/ocornut/imgui/blob/master/LICENSE.txt) | Rendering tools
+ImPlot | [MIT](https://github.com/epezent/implot/blob/master/LICENSE) | Rendering tools
 --- | --- | --- |
 gdal | [MIT](<http://svn.osgeo.org/gdal/trunk/gdal/LICENSE.TXT>) | GDAL, Geospatial import |
+hdf5 | [BSD](<https://github.com/HDFGroup/hdf5/blob/develop/COPYING>) | GDAL, netcdf import |
 libexpat | [MIT](<https://github.com/LuaDist/libexpat/blob/master/COPYING>) | GDAL, KML import |
 libkml | [BSD](<https://github.com/google/libkml/blob/master/LICENSE>) | GDAL, KML import |
 minizip | [zlib](<http://zlib.net/zlib_license.html>) | GDAL, zip support |
+netcdf-c | [BSD](<https://github.com/Unidata/netcdf-c/blob/main/COPYRIGHT>) | GDAL, netcdf import |
+oneDAL | [Apache-2.0](https://github.com/oneapi-src/oneDAL/blob/master/LICENSE) | ML support
 pcre | [BSD](<http://www.pcre.org/licence.txt>) | GDAL, KML import |
 proj4 | [MIT](<http://proj4.org/license.html>) | GDAL, Geospatial reprojection |
 shapelib | [MIT](<http://shapelib.maptools.org/license.html>) | GDAL, Shapefile import |
 uriparser | [BSD](<https://sourceforge.net/p/uriparser/git/ci/master/tree/COPYING>) | GDAL, KML import |
+pdal | [BSD](https://raw.githubusercontent.com/PDAL/PDAL/master/LICENSE.txt) | Point cloud import |
 --- | --- | --- |
 generate\_cert (Go) | [BSD](<https://github.com/golang/go/blob/master/LICENSE>) | HTTPS certificate generator |
 gorilla/context | [BSD](<https://github.com/gorilla/context/blob/master/LICENSE>) | HTTP session handlers |
@@ -59,7 +75,9 @@ dgrijalva/jwt-go | [MIT](<https://github.com/dgrijalva/jwt-go/blob/master/LICENS
 --- | --- | --- |
 Apache commons-cli | [Apache](<https://github.com/apache/commons-cli/blob/trunk/LICENSE.txt>) | CLI flags handler |
 Apache commons-math3 | [Apache](<https://github.com/apache/commons-math/blob/master/LICENSE.txt>) | Math functions |
+Apache commons-text | [Apache](<https://github.com/apache/commons-text/blob/master/LICENSE.txt>) | String parsing functions |
 slf4j-log4j12 | [MIT](<http://www.slf4j.org/license.html>) | Java logging |
+Google Gson | [Apache](<https://github.com/google/gson/blob/master/LICENSE>) | Java JSON parsing |
 Xerial sqlite-jdbc | [Apache](<https://github.com/xerial/sqlite-jdbc/blob/master/LICENSE>) | Catalog connector/reader |
 --- | --- | --- |
 bitshuffle | [MIT](<https://github.com/Blosc/c-blosc/blob/master/LICENSES/BITSHUFFLE.txt>) | Compression support |
@@ -100,7 +118,6 @@ gorilla/websocket | [BSD-2-Clause](<https://github.com/gorilla/websocket/blob/ma
 grpc-ecosystem/go-grpc-middleware | [Apache-2.0](<https://github.com/grpc-ecosystem/go-grpc-middleware/blob/master/LICENSE>) | Distributed consensus |
 grpc-ecosystem/go-grpc-prometheus | [Apache-2.0](<https://github.com/grpc-ecosystem/go-grpc-prometheus/blob/master/LICENSE>) | Distributed consensus |
 grpc-ecosystem/grpc-gateway | [BSD-3-Clause](<https://github.com/grpc-ecosystem/grpc-gateway/blob/master/LICENSE.txt>) | Distributed consensus |
-hashicorp/hcl | [MPL-2.0](<https://github.com/hashicorp/hcl/blob/master/LICENSE>) | Distributed consensus |
 Jeffail/gabs | [MIT](<https://github.com/Jeffail/gabs/blob/master/LICENSE>) | Distributed consensus |
 jonboulle/clockwork | [Apache-2.0](<https://github.com/jonboulle/clockwork/blob/master/LICENSE>) | Distributed consensus |
 kr/pretty | [MIT](<https://github.com/kr/pretty/blob/master/License>) | Distributed consensus |
@@ -138,3 +155,13 @@ go-yaml/yaml | [MIT](<https://github.com/go-yaml/yaml/blob/v2/LICENSE.libyaml>) 
 uber-go/atomic | [MIT](<https://github.com/uber-go/atomic/blob/master/LICENSE.txt>) | Distributed consensus |
 uber-go/multierr | [MIT](<https://github.com/uber-go/multierr/blob/master/LICENSE.txt>) | Distributed consensus |
 uber-go/zap | [MIT](<https://github.com/uber-go/zap/blob/master/LICENSE.txt>) | Distributed consensus |
+--- | --- | --- |
+geos | [LGPLv2.1](<https://github.com/libgeos/geos/blob/master/COPYING>) | Geo support, dynamic linked |
+--- | --- | --- |
+Canonical Raft | [LGPLv3](<https://github.com/canonical/raft/blob/master/LICENSE>) | Distributed consensus |
+libuv | [MIT](<https://github.com/libuv/libuv/blob/v1.x/LICENSE>) | Distributed consensus |
+--- | --- | --- |
+STB | [MIT](https://github.com/nothings/stb/blob/master/LICENSE) | Image file utils
+--- | --- | --- |
+| poly2tri  | [BSD](https://github.com/greenm01/poly2tri/blob/master/LICENSE) | GDAL, Polygon triangulation  |
+| kdtree-cpp | [BSD-3-Clause](https://github.com/cdalitz/kdtree-cpp/blob/master/LICENSE) | Cross-Section 2D |

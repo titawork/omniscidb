@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 OmniSci, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,8 +18,10 @@
 
 #define BOOST_STACKTRACE_GNU_SOURCE_NOT_REQUIRED 1
 
+#include "Shared/StringTransform.h"
+#include "Shared/boost_stacktrace.hpp"
+
 #include <boost/algorithm/string.hpp>
-#include <boost/stacktrace.hpp>
 
 std::string getCurrentStackTrace(uint32_t num_frames_to_skip,
                                  const char* stop_at_this_frame,
@@ -77,6 +79,10 @@ std::string getCurrentStackTrace(uint32_t num_frames_to_skip,
     }
 
     // add to string
+    frame_string = strip(frame_string);
+    if (frame_string.empty()) {
+      continue;
+    }
     stack_trace += frame_string + std::string("\n");
   }
 

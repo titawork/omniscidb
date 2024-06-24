@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -183,7 +183,7 @@ TEST(SetGetTest, MultiKeyRandom) {
     *gv = std::accumulate(
         key.begin(), key.end(), 100, [](int64_t x, int64_t y) { return x + y; });
   }
-  for (const auto key : keys) {
+  for (const auto& key : keys) {
     auto gv = get_group_value(gb,
                               groups_buffer_entry_count,
                               &key[0],

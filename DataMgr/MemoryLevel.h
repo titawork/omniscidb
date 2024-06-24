@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,6 +19,6 @@
 
 namespace Data_Namespace {
 enum MemoryLevel { DISK_LEVEL = 0, CPU_LEVEL = 1, GPU_LEVEL = 2 };
-}
+}  // namespace Data_Namespace
 
 #endif  // MEMORYLEVEL_H

@@ -1,3 +1,6 @@
+#include <cuda.h>
+CUstream getQueryEngineCudaStreamForDevice(int device_num);
+
 #include "BufferCompaction.h"
 #include "GpuMemUtils.h"
 #include "GpuRtConstants.h"
@@ -10,6 +13,8 @@
 #include <thrust/host_vector.h>
 #include <thrust/sort.h>
 
+#define checkCudaErrors(err) CHECK_EQ(err, CUDA_SUCCESS)
+
 #define FORCE_CPU_VERSION
 #include "BufferEntryUtils.h"
 #undef FORCE_CPU_VERSION
@@ -18,6 +23,7 @@ namespace {
 
 template <class K, class V, class I>
 std::vector<uint32_t> do_radix_sort(const ExecutorDeviceType device_type,
+                                    const int device_id,
                                     ThrustAllocator& thrust_allocator,
                                     const int8_t* groupby_buffer,
                                     V dev_oe_col_buffer_begin,
@@ -32,11 +38,13 @@ std::vector<uint32_t> do_radix_sort(const ExecutorDeviceType device_type,
   }
   if (oe.is_desc) {
     if (device_type == ExecutorDeviceType::GPU) {
-      thrust::sort_by_key(thrust::device(thrust_allocator),
+      auto qe_cuda_stream = getQueryEngineCudaStreamForDevice(device_id);
+      thrust::sort_by_key(thrust::cuda::par(thrust_allocator).on(qe_cuda_stream),
                           dev_oe_col_buffer_begin,
                           dev_oe_col_buffer_end,
                           dev_idx_buff_begin,
                           thrust::greater<int64_t>());
+      checkCudaErrors(cuStreamSynchronize(qe_cuda_stream));
     } else {
       thrust::sort_by_key(dev_oe_col_buffer_begin,
                           dev_oe_col_buffer_end,
@@ -45,10 +53,12 @@ std::vector<uint32_t> do_radix_sort(const ExecutorDeviceType device_type,
     }
   } else {
     if (device_type == ExecutorDeviceType::GPU) {
-      thrust::sort_by_key(thrust::device(thrust_allocator),
+      auto qe_cuda_stream = getQueryEngineCudaStreamForDevice(device_id);
+      thrust::sort_by_key(thrust::cuda::par(thrust_allocator).on(qe_cuda_stream),
                           dev_oe_col_buffer_begin,
                           dev_oe_col_buffer_end,
                           dev_idx_buff_begin);
+      checkCudaErrors(cuStreamSynchronize(qe_cuda_stream));
     } else {
       thrust::sort_by_key(
           dev_oe_col_buffer_begin, dev_oe_col_buffer_end, dev_idx_buff_begin);
@@ -103,11 +113,11 @@ thrust::device_ptr<T> get_device_copy_ptr(const thrust::host_vector<T>& host_vec
   const auto host_vec_bytes = host_vec.size() * sizeof(T);
   T* dev_ptr = reinterpret_cast<T*>(
       thrust_allocator.allocateScopedBuffer(align_to_int64(host_vec_bytes)));
-  copy_to_gpu(thrust_allocator.getDataMgr(),
-              reinterpret_cast<CUdeviceptr>(dev_ptr),
-              &host_vec[0],
-              host_vec_bytes,
-              thrust_allocator.getDeviceId());
+  copy_to_nvidia_gpu(thrust_allocator.getDataMgr(),
+                     reinterpret_cast<CUdeviceptr>(dev_ptr),
+                     &host_vec[0],
+                     host_vec_bytes,
+                     thrust_allocator.getDeviceId());
   return thrust::device_ptr<T>(dev_ptr);
 }
 
@@ -145,7 +155,7 @@ std::vector<uint32_t> baseline_sort_fp(const ExecutorDeviceType device_type,
 
   auto is_negative =
       float_argument_input ? [](const int64_t v) -> bool { return (v & (1 << 31)) != 0; }
-  : [](const int64_t v) -> bool { return v < 0; };
+                           : [](const int64_t v) -> bool { return v < 0; };
 
   for (size_t i = start; i < layout.entry_count; i += step, ++oe_col_buffer_idx) {
     if (!is_empty_entry<K>(i, groupby_buffer, layout.row_bytes) &&
@@ -170,6 +180,7 @@ std::vector<uint32_t> baseline_sort_fp(const ExecutorDeviceType device_type,
     const auto dev_pos_oe_col_buffer =
         get_device_copy_ptr(pos_oe_col_buffer, thrust_allocator);
     pos_result = do_radix_sort<K>(device_type,
+                                  device_id,
                                   thrust_allocator,
                                   groupby_buffer,
                                   dev_pos_oe_col_buffer,
@@ -182,6 +193,7 @@ std::vector<uint32_t> baseline_sort_fp(const ExecutorDeviceType device_type,
   } else {
     CHECK(device_type == ExecutorDeviceType::CPU);
     pos_result = do_radix_sort<K>(device_type,
+                                  device_id,
                                   thrust_allocator,
                                   groupby_buffer,
                                   pos_oe_col_buffer.begin(),
@@ -199,6 +211,7 @@ std::vector<uint32_t> baseline_sort_fp(const ExecutorDeviceType device_type,
     const auto dev_neg_oe_col_buffer =
         get_device_copy_ptr(neg_oe_col_buffer, thrust_allocator);
     neg_result = do_radix_sort<K>(device_type,
+                                  device_id,
                                   thrust_allocator,
                                   groupby_buffer,
                                   dev_neg_oe_col_buffer,
@@ -211,6 +224,7 @@ std::vector<uint32_t> baseline_sort_fp(const ExecutorDeviceType device_type,
   } else {
     CHECK(device_type == ExecutorDeviceType::CPU);
     neg_result = do_radix_sort<K>(device_type,
+                                  device_id,
                                   thrust_allocator,
                                   groupby_buffer,
                                   neg_oe_col_buffer.begin(),
@@ -270,6 +284,7 @@ std::vector<uint32_t> baseline_sort_int(const ExecutorDeviceType device_type,
         get_device_copy_ptr(notnull_oe_col_buffer, thrust_allocator);
     notnull_result =
         do_radix_sort<K>(device_type,
+                         device_id,
                          thrust_allocator,
                          groupby_buffer,
                          dev_notnull_oe_col_buffer,
@@ -282,6 +297,7 @@ std::vector<uint32_t> baseline_sort_int(const ExecutorDeviceType device_type,
   } else {
     CHECK(device_type == ExecutorDeviceType::CPU);
     notnull_result = do_radix_sort<K>(device_type,
+                                      device_id,
                                       thrust_allocator,
                                       groupby_buffer,
                                       notnull_oe_col_buffer.begin(),
@@ -314,9 +330,9 @@ thrust::host_vector<int64_t> collect_order_entry_column(
   const auto entry_ti = get_compact_type(layout.oe_target_info);
   const bool float_argument_input = takes_float_argument(layout.oe_target_info);
   const auto step_bytes = layout.row_bytes * step;
+  const auto col_bytes = float_argument_input ? entry_ti.get_size() : layout.col_bytes;
   for (size_t i = start; i < layout.entry_count; i += step) {
-    auto val1 = read_int_from_buff(crt_group_ptr1,
-                                   layout.col_bytes > 0 ? layout.col_bytes : sizeof(K));
+    auto val1 = read_int_from_buff(crt_group_ptr1, col_bytes > 0 ? col_bytes : sizeof(K));
     if (crt_group_ptr2) {
       const auto val2 = read_int_from_buff(crt_group_ptr2, 8);
       const auto avg_val = pair_to_double({val1, val2}, entry_ti, float_argument_input);
@@ -384,6 +400,7 @@ std::vector<uint32_t> baseline_sort(const ExecutorDeviceType device_type,
     thrust::sequence(dev_idx_buff, dev_idx_buff + oe_col_buffer.size(), start, step);
     const auto dev_oe_col_buffer = get_device_copy_ptr(oe_col_buffer, thrust_allocator);
     return do_radix_sort<K>(device_type,
+                            device_id,
                             thrust_allocator,
                             groupby_buffer,
                             dev_oe_col_buffer,
@@ -398,6 +415,7 @@ std::vector<uint32_t> baseline_sort(const ExecutorDeviceType device_type,
   thrust::host_vector<uint32_t> host_idx_buff(oe_col_buffer.size());
   thrust::sequence(host_idx_buff.begin(), host_idx_buff.end(), start, step);
   return do_radix_sort<K>(device_type,
+                          device_id,
                           thrust_allocator,
                           groupby_buffer,
                           oe_col_buffer.begin(),

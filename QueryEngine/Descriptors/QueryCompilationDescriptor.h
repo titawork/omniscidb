@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 OmniSci, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,15 +16,39 @@
 
 /**
  * @file    QueryCompilationDescriptor.h
- * @author  Alex Baden <alex.baden@mapd.com>
  * @brief   Container for compilation results and assorted options for a single execution
  * unit.
+ *
  */
 
 #pragma once
 
-#include "../ColumnFetcher.h"
-#include "../Execute.h"
+#include "QueryEngine/CgenState.h"
+#include "QueryEngine/ColumnFetcher.h"
+#include "QueryEngine/GpuSharedMemoryContext.h"
+#include "QueryEngine/PlanState.h"
+
+class CompilationContext;
+
+struct CompilationResult {
+  std::shared_ptr<CompilationContext> generated_code;
+  std::unordered_map<int, CgenState::LiteralValues> literal_values;
+  bool output_columnar;
+  std::string llvm_ir;
+  GpuSharedMemoryContext gpu_smem_context;
+
+ public:
+  std::string toString() const {
+    auto result = ::typeName(this) + "{";
+    result += ::toString(generated_code);
+    result += ", literal_values=" + ::toString(literal_values);
+    result += ", toString(output_columnar=" + ::toString(output_columnar);
+    result += ", llvm_ir='''\n" + ::toString(llvm_ir) + "\n'''";
+    result += ", " + ::toString(gpu_smem_context);
+    result += "}";
+    return result;
+  };
+};
 
 class QueryCompilationDescriptor {
  public:
@@ -39,6 +63,7 @@ class QueryCompilationDescriptor {
       const bool has_cardinality_estimation,
       const RelAlgExecutionUnit& ra_exe_unit,
       const std::vector<InputTableInfo>& table_infos,
+      const PlanState::DeletedColumnsMap& deleted_cols_map,
       const ColumnFetcher& column_fetcher,
       const CompilationOptions& co,
       const ExecutionOptions& eo,
@@ -66,8 +91,18 @@ class QueryCompilationDescriptor {
   bool hoistLiterals() const { return hoist_literals_; }
   int8_t getMinByteWidth() const { return actual_min_byte_width_; }
 
+  std::string toString() const {
+    auto result = ::typeName(this) + "{";
+    result += ::toString(compilation_result_);
+    result += ", " + ::toString(compilation_device_type_);
+    result += ", " + ::toString(hoist_literals_);
+    result += ", " + ::toString(actual_min_byte_width_);
+    result += "}";
+    return result;
+  };
+
  private:
-  Executor::CompilationResult compilation_result_;
+  CompilationResult compilation_result_;
   ExecutorDeviceType compilation_device_type_;
   bool hoist_literals_;
   int8_t actual_min_byte_width_;

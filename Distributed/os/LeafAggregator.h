@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,13 +18,14 @@
 #define LEAFAGGREGATOR_H
 
 #include "../AggregatedResult.h"
+#include "Catalog/Catalog.h"
 #include "DataMgr/MemoryLevel.h"
 #include "LeafHostInfo.h"
 #include "QueryEngine/CompilationOptions.h"
 #include "QueryEngine/TargetMetaInfo.h"
-#include "gen-cpp/MapD.h"
+#include "gen-cpp/Heavy.h"
 
-#include <glog/logging.h>
+#include "Logger/Logger.h"
 
 namespace Catalog_Namespace {
 class SessionInfo;
@@ -38,7 +39,8 @@ class LeafAggregator {
 
   AggregatedResult execute(const Catalog_Namespace::SessionInfo& parent_session_info,
                            const std::string& query_ra,
-                           const ExecutionOptions& eo) {
+                           const ExecutionOptions& eo,
+                           const bool is_update_delete) {
     CHECK(false);
     return {nullptr, {}};
   }
@@ -48,7 +50,7 @@ class LeafAggregator {
     CHECK(false);
   }
 
-  std::vector<TQueryResult> forwardQueryToLeaves(
+  std::map<size_t, TQueryResult> forwardQueryToLeaves(
       const Catalog_Namespace::SessionInfo& parent_session_info,
       const std::string& query_str) {
     CHECK(false);
@@ -69,9 +71,10 @@ class LeafAggregator {
     CHECK(false);
   }
 
-  void checkpointLeaf(const Catalog_Namespace::SessionInfo& parent_session_info,
-                      const int32_t db_id,
-                      const int32_t table_id) {
+  void checkpointLeafShardsWithAutoRollback(
+      const Catalog_Namespace::SessionInfo& parent_session_info,
+      const int32_t db_id,
+      const int32_t table_id) {
     CHECK(false);
   }
 
@@ -89,6 +92,21 @@ class LeafAggregator {
     CHECK(false);
   }
 
+  std::vector<Catalog_Namespace::TableEpochInfo> getLeafTableEpochs(
+      const Catalog_Namespace::SessionInfo& parent_session_info,
+      const int32_t db_id,
+      const int32_t table_id) {
+    CHECK(false);
+    return {};
+  }
+
+  void setLeafTableEpochs(
+      const Catalog_Namespace::SessionInfo& parent_session_info,
+      const int32_t db_id,
+      const std::vector<Catalog_Namespace::TableEpochInfo>& table_epochs) {
+    CHECK(false);
+  }
+
   void connect(const Catalog_Namespace::SessionInfo& parent_session_info,
                const std::string& user,
                const std::string& passwd,
@@ -98,7 +116,17 @@ class LeafAggregator {
 
   void disconnect(const TSessionId session) { CHECK(false); }
 
-  void interrupt(const TSessionId session) { CHECK(false); }
+  void switch_database(const TSessionId session, const std::string& dbname) {
+    CHECK(false);
+  }
+
+  void clone_session(const TSessionId session1, const TSessionId session2) {
+    CHECK(false);
+  };
+
+  void interrupt(const TSessionId query_session, const TSessionId interrupt_session) {
+    CHECK(false);
+  }
 
   void set_execution_mode(const TSessionId session, const TExecuteMode::type mode) {
     CHECK(false);
@@ -126,6 +154,25 @@ class LeafAggregator {
   void clear_leaf_cpu_memory(const TSessionId session) { CHECK(false); }
 
   void clear_leaf_gpu_memory(const TSessionId session) { CHECK(false); }
+
+  void set_cur_session(const TSessionId parent_session,
+                       const std::string& start_time_str,
+                       const std::string& label) {
+    CHECK(false);
+  }
+
+  void invalidate_cur_session(const TSessionId parent_session,
+                              const std::string& start_time_str,
+                              const std::string& label) {
+    CHECK(false);
+  }
+
+  std::vector<size_t> query_get_outer_fragment_counts(
+      const Catalog_Namespace::SessionInfo& parent_session_info,
+      std::string& sql_query) {
+    CHECK(false);
+    return {};
+  }
 };
 
 #endif  // LEAFAGGREGATOR_H

@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,16 +15,13 @@
  */
 
 #include "../RenderAllocator.h"
-#include <glog/logging.h>
 #include "../../GpuInitGroups.h"
+#include "Logger/Logger.h"
 
 RenderAllocator::RenderAllocator(int8_t* preallocated_ptr,
                                  const size_t preallocated_size,
-                                 const size_t device_id,
-                                 const unsigned block_size_x,
-                                 const unsigned grid_size_x,
-                                 const RAExecutionPolicy execution_policy)
-    : preallocated_size_(preallocated_size), device_id_(device_id) {
+                                 const size_t device_id)
+    : preallocated_size_{preallocated_size}, device_id_{device_id} {
   CHECK(false);
 }
 
@@ -57,15 +54,8 @@ int8_t* RenderAllocator::getBasePtr() const {
   return nullptr;
 }
 
-RAExecutionPolicy RenderAllocator::getExecutionPolicy() const {
-  CHECK(false);
-  return RAExecutionPolicy::Host;
-}
-
 RenderAllocatorMap::RenderAllocatorMap(
-    ::QueryRenderer::QueryRenderManager* render_manager,
-    const unsigned block_size_x,
-    const unsigned grid_size_x) {
+    ::QueryRenderer::QueryRenderManager* render_manager) {
   CHECK(false);
 }
 

@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,15 +19,19 @@
 
 #include <cstdint>
 #include <ctime>
+/* `../` is required for UDFCompiler */
 #include "../Shared/funcannotations.h"
 
 static constexpr int64_t kNanoSecsPerSec = 1000000000;
 static constexpr int64_t kMicroSecsPerSec = 1000000;
 static constexpr int64_t kMilliSecsPerSec = 1000;
+static constexpr int64_t kMilliSecsPerMin = 60000;
+static constexpr int64_t kMilliSecsPerHour = 3600000;
+static constexpr int64_t kMilliSecsPerDay = 86400000;
 static constexpr int64_t kSecsPerMin = 60;
 static constexpr int64_t kMinsPerHour = 60;
 static constexpr int64_t kHoursPerDay = 24;
-static constexpr int64_t kSecPerHour = 3600;
+static constexpr int64_t kSecsPerHour = 3600;
 static constexpr int64_t kSecsPerDay = 86400;
 static constexpr int64_t kSecsPerQuarterDay = 21600;
 static constexpr int32_t kDaysPerWeek = 7;
@@ -66,6 +70,10 @@ static constexpr uint32_t kUSecsPerDay = 86400;
 static constexpr uint32_t kEpochOffsetYear1900 = 2208988800;
 static constexpr uint32_t kSecsJanToMar1900 = 5097600;
 
+// Number of days from March 1 to Jan 1.
+constexpr unsigned MARJAN = 31 + 30 + 31 + 30 + 31 + 31 + 30 + 31 + 30 + 31;
+constexpr unsigned JANMAR = 31 + 28;  // leap day handled separately
+
 enum ExtractField {
   kYEAR,
   kQUARTER,
@@ -82,15 +90,33 @@ enum ExtractField {
   kDOY,
   kEPOCH,
   kQUARTERDAY,
-  kWEEK
+  kWEEK,
+  kWEEK_SUNDAY,
+  kWEEK_SATURDAY,
+  kDATEEPOCH,
+  kUNKNOWN_FIELD
 };
 
-// Shared by DateTruncate
-DEVICE int32_t extract_dow(const int64_t lcltime);
+DEVICE int64_t ExtractFromTime(ExtractField field, const int64_t timeval);
 
-DEVICE tm gmtime_r_newlib(const int64_t lcltime, tm& res);
+// Return floor(dividend / divisor).
+// Assumes 0 < divisor.
+DEVICE inline int64_t floor_div(int64_t const dividend, int64_t const divisor) {
+  return (dividend < 0 ? dividend - (divisor - 1) : dividend) / divisor;
+}
 
-extern "C" DEVICE NEVER_INLINE int64_t ExtractFromTime(ExtractField field,
-                                                       const int64_t timeval);
+// Return remainer r of dividend / divisor, where 0 <= r < divisor.
+// Assumes 0 < divisor.
+// The uint64_t casts are potential optimizations, since unsigned integer division is
+// faster on some architectures than signed division. However in the case when
+// dividend == std::numeric_limits<int64_t>::min() then it is uniquely required.
+// Additionally this avoids architecture-dependent behavior of % when numerator < 0.
+DEVICE inline int64_t unsigned_mod(int64_t const dividend, int64_t const divisor) {
+  if (dividend < 0) {
+    int64_t const mod = static_cast<int64_t>(uint64_t(-dividend) % uint64_t(divisor));
+    return mod ? divisor - mod : int64_t(0);
+  }
+  return static_cast<int64_t>(uint64_t(dividend) % uint64_t(divisor));
+}
 
 #endif  // QUERYENGINE_EXTRACTFROMTIME_H

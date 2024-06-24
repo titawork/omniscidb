@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,7 +20,6 @@
 #include "DictRef.h"
 #include "LeafHostInfo.h"
 
-#include <glog/logging.h>
 #include <memory>
 #include <mutex>
 
@@ -71,13 +70,20 @@ class StringDictionaryClient {
     return std::vector<int32_t>{};
   };
 
+  template <class String>
+  void get_bulk(std::vector<int32_t>& string_ids, const std::vector<String>& strings);
+
+  template <class String>
   void get_or_add_bulk(std::vector<int32_t>& string_ids,
-                       const std::vector<std::string>& strings) {
+                       const std::vector<String>& strings) {
     CHECK(false);
   };
 
+  template <class String>
   void get_or_add_bulk_array(std::vector<std::vector<int32_t>>& string_ids_array,
-                             const std::vector<std::vector<std::string>>& strings_array);
+                             const std::vector<std::vector<String>>& strings_array) {
+    CHECK(false);
+  }
 
   void populate_string_ids(std::vector<int32_t>& dest_ids,
                            const DictRef dest_dict_ref,

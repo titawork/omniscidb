@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,11 +19,13 @@
 
 llvm::Value* CodeGenerator::codegenUnnest(const Analyzer::UOper* uoper,
                                           const CompilationOptions& co) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   return codegen(uoper->get_operand(), true, co).front();
 }
 
 llvm::Value* CodeGenerator::codegenArrayAt(const Analyzer::BinOper* array_at,
                                            const CompilationOptions& co) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   const auto arr_expr = array_at->get_left_operand();
   const auto idx_expr = array_at->get_right_operand();
   const auto& idx_ti = idx_expr->get_type_info();
@@ -65,12 +67,19 @@ llvm::Value* CodeGenerator::codegenArrayAt(const Analyzer::BinOper* array_at,
 
 llvm::Value* CodeGenerator::codegen(const Analyzer::CardinalityExpr* expr,
                                     const CompilationOptions& co) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   const auto arr_expr = expr->get_arg();
   const auto& array_ti = arr_expr->get_type_info();
   CHECK(array_ti.is_array());
   const auto& elem_ti = array_ti.get_elem_type();
   auto arr_lv = codegen(arr_expr, true, co);
   std::string fn_name("array_size");
+
+  if (auto alloca = llvm::dyn_cast<llvm::AllocaInst>(arr_lv.front())) {
+    if (alloca->getAllocatedType()->isStructTy()) {
+      throw std::runtime_error("Unsupported type used in 'cardinality'");
+    }
+  }
 
   std::vector<llvm::Value*> array_size_args{
       arr_lv.front(),
@@ -88,16 +97,30 @@ llvm::Value* CodeGenerator::codegen(const Analyzer::CardinalityExpr* expr,
 std::vector<llvm::Value*> CodeGenerator::codegenArrayExpr(
     Analyzer::ArrayExpr const* array_expr,
     CompilationOptions const& co) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   using ValueVector = std::vector<llvm::Value*>;
   ValueVector argument_list;
   auto& ir_builder(cgen_state_->ir_builder_);
 
   const auto& return_type = array_expr->get_type_info();
+  auto coord_compression = (return_type.get_compression() == kENCODING_GEOINT);
+  if (coord_compression) {
+    CHECK(array_expr->isLocalAlloc() && array_expr->getElementCount() == 2);
+  }
   for (size_t i = 0; i < array_expr->getElementCount(); i++) {
     const auto arg = array_expr->getElement(i);
     const auto arg_lvs = codegen(arg, true, co);
     if (arg_lvs.size() == 1) {
-      argument_list.push_back(arg_lvs.front());
+      if (coord_compression) {
+        // Compress double coords on the fly
+        auto mult = cgen_state_->llFp(2147483647.0 / (i == 0 ? 180.0 : 90.0));
+        auto c = ir_builder.CreateCast(llvm::Instruction::CastOps::FPToSI,
+                                       ir_builder.CreateFMul(arg_lvs.front(), mult),
+                                       get_int_type(32, cgen_state_->context_));
+        argument_list.push_back(c);
+      } else {
+        argument_list.push_back(arg_lvs.front());
+      }
     } else {
       throw std::runtime_error(
           "Unexpected argument count during array[] code generation.");
@@ -111,53 +134,76 @@ std::vector<llvm::Value*> CodeGenerator::codegenArrayExpr(
   auto* array_type = get_int_array_type(
       array_element_size_bytes * 8, array_expr->getElementCount(), cgen_state_->context_);
 
-  llvm::Value* allocated_target_buffer =
-      cgen_state_->emitExternalCall("allocate_varlen_buffer",
-                                    llvm::Type::getInt8PtrTy(cgen_state_->context_),
-                                    {cgen_state_->llInt(array_expr->getElementCount()),
-                                     cgen_state_->llInt(array_element_size_bytes)});
-  cgen_state_->emitExternalCall(
-      "register_buffer_with_executor_rsm",
-      llvm::Type::getVoidTy(cgen_state_->context_),
-      {cgen_state_->llInt(reinterpret_cast<int64_t>(executor())),
-       allocated_target_buffer});
+  if (array_expr->isNull()) {
+    return {llvm::ConstantPointerNull::get(
+                llvm::PointerType::get(get_int_type(64, cgen_state_->context_), 0)),
+            cgen_state_->llInt(0)};
+  }
+
+  if (0 == array_expr->getElementCount()) {
+    llvm::Constant* dead_const = cgen_state_->llInt(0xdead);
+    llvm::Value* dead_pointer = llvm::ConstantExpr::getIntToPtr(
+        dead_const, llvm::PointerType::get(get_int_type(64, cgen_state_->context_), 0));
+    return {dead_pointer, cgen_state_->llInt(0)};
+  }
+
+  llvm::Value* allocated_target_buffer;
+  if (array_expr->isLocalAlloc()) {
+    allocated_target_buffer = ir_builder.CreateAlloca(array_type);
+  } else {
+    if (co.device_type == ExecutorDeviceType::GPU) {
+      throw QueryMustRunOnCpu();
+    }
+
+    allocated_target_buffer =
+        cgen_state_->emitExternalCall("allocate_varlen_buffer",
+                                      llvm::Type::getInt8PtrTy(cgen_state_->context_),
+                                      {cgen_state_->llInt(array_expr->getElementCount()),
+                                       cgen_state_->llInt(array_element_size_bytes)});
+    cgen_state_->emitExternalCall(
+        "register_buffer_with_executor_rsm",
+        llvm::Type::getVoidTy(cgen_state_->context_),
+        {cgen_state_->llInt(reinterpret_cast<int64_t>(executor())),
+         allocated_target_buffer});
+  }
   llvm::Value* casted_allocated_target_buffer =
       ir_builder.CreatePointerCast(allocated_target_buffer, array_type->getPointerTo());
 
   for (size_t i = 0; i < array_expr->getElementCount(); i++) {
     auto* element = argument_list[i];
-    auto* element_ptr =
-        ir_builder.CreateGEP(array_type,
-                             casted_allocated_target_buffer,
-                             {cgen_state_->llInt(0), cgen_state_->llInt(i)});
+    auto* element_ptr = ir_builder.CreateGEP(
+        array_type,
+        casted_allocated_target_buffer,
+        std::vector<llvm::Value*>{cgen_state_->llInt(0), cgen_state_->llInt(i)});
 
-    if (is_member_of_typeset<kTINYINT,
-                             kSMALLINT,
-                             kINT,
-                             kBIGINT,
-                             kTIMESTAMP,
-                             kDATE,
-                             kTIME,
-                             kNUMERIC,
-                             kDECIMAL,
-                             kINTERVAL_DAY_TIME,
-                             kINTERVAL_YEAR_MONTH,
-                             kVARCHAR,
-                             kTEXT,
-                             kCHAR>(return_type.get_elem_type())) {
-      auto sign_extended_element = ir_builder.CreateSExt(element, array_index_type);
-      ir_builder.CreateStore(sign_extended_element, element_ptr);
-    } else if (is_member_of_typeset<kBOOLEAN>(return_type.get_elem_type())) {
-      auto byte_casted_bit = ir_builder.CreateIntCast(element, array_index_type, true);
+    const auto& elem_ti = return_type.get_elem_type();
+    if (elem_ti.is_boolean()) {
+      const auto byte_casted_bit =
+          ir_builder.CreateIntCast(element, array_index_type, true);
       ir_builder.CreateStore(byte_casted_bit, element_ptr);
-    } else if (is_member_of_typeset<kFLOAT>(return_type.get_elem_type())) {
-      auto float_element_ptr = ir_builder.CreatePointerCast(
-          element_ptr, llvm::Type::getFloatPtrTy(cgen_state_->context_));
-      ir_builder.CreateStore(element, float_element_ptr);
-    } else if (is_member_of_typeset<kDOUBLE>(return_type.get_elem_type())) {
-      auto double_element_ptr = ir_builder.CreatePointerCast(
-          element_ptr, llvm::Type::getDoublePtrTy(cgen_state_->context_));
-      ir_builder.CreateStore(element, double_element_ptr);
+    } else if (elem_ti.is_fp()) {
+      switch (elem_ti.get_size()) {
+        case sizeof(double): {
+          const auto double_element_ptr = ir_builder.CreatePointerCast(
+              element_ptr, llvm::Type::getDoublePtrTy(cgen_state_->context_));
+          ir_builder.CreateStore(element, double_element_ptr);
+          break;
+        }
+        case sizeof(float): {
+          const auto float_element_ptr = ir_builder.CreatePointerCast(
+              element_ptr, llvm::Type::getFloatPtrTy(cgen_state_->context_));
+          ir_builder.CreateStore(element, float_element_ptr);
+          break;
+        }
+        default:
+          UNREACHABLE();
+      }
+    } else if (elem_ti.is_integer() || elem_ti.is_decimal() || elem_ti.is_date() ||
+               elem_ti.is_timestamp() || elem_ti.is_time() || elem_ti.is_timeinterval() ||
+               elem_ti.is_dict_encoded_string()) {
+      // TODO(adb): this validation and handling should be done elsewhere
+      const auto sign_extended_element = ir_builder.CreateSExt(element, array_index_type);
+      ir_builder.CreateStore(sign_extended_element, element_ptr);
     } else {
       throw std::runtime_error("Unsupported type used in ARRAY construction.");
     }

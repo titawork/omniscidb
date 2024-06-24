@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,11 +16,9 @@
 
 /**
  * @file		PopulateTableRandom.cpp
- * @author	Wei Hong <wei@map-d.com>
  * @brief		Populate a table with random data
  *
- * Copyright (c) 2014 MapD Technologies, Inc.  All rights reserved.
- **/
+ */
 
 #include <boost/functional/hash.hpp>
 #include <cfloat>
@@ -33,14 +31,13 @@
 #include <random>
 #include <string>
 
-#include <glog/logging.h>
-
 #include "../Catalog/Catalog.h"
 #include "../DataMgr/DataMgr.h"
 #include "../Fragmenter/Fragmenter.h"
 #include "../Shared/DateConverters.h"
 #include "../Shared/measure.h"
 #include "../Shared/sqltypes.h"
+#include "Logger/Logger.h"
 
 using namespace Catalog_Namespace;
 using namespace Fragmenter_Namespace;
@@ -123,9 +120,7 @@ size_t random_fill_string(std::vector<std::string>& stringVec,
     int len = len_dist(gen);
     std::string s(len, ' ');
     for (int i = 0; i < len; i++) {
-      {
-        s[i] = chars[char_dist(gen)];
-      }
+      { s[i] = chars[char_dist(gen)]; }
     }
     stringVec[n] = s;
     boost::hash_combine(hash, string_hash(s));
@@ -139,14 +134,14 @@ size_t random_fill_int8array(std::vector<std::vector<int8_t>>& stringVec,
                              int max_len,
                              size_t& data_volumn) {
   std::default_random_engine gen;
-  std::uniform_int_distribution<int8_t> dist(INT8_MIN, INT8_MAX);
+  std::uniform_int_distribution<short> dist(INT8_MIN, INT8_MAX);
   std::uniform_int_distribution<> len_dist(0, max_len);
   size_t hash = 0;
   for (size_t n = 0; n < num_elems; n++) {
     int len = len_dist(gen);
     std::vector<int8_t> s(len);
     for (int i = 0; i < len; i++) {
-      s[i] = dist(gen);
+      s[i] = static_cast<int8_t>(dist(gen));
       boost::hash_combine(hash, s[i]);
     }
     stringVec[n] = s;
@@ -237,7 +232,8 @@ size_t random_fill(const ColumnDescriptor* cd,
       int64_t min = -max;
       hash = random_fill_int64(p.numbersPtr, num_elems, min, max);
       data_volumn += num_elems * sizeof(int64_t);
-    } break;
+      break;
+    }
     case kFLOAT:
       hash = random_fill_float(p.numbersPtr, num_elems);
       data_volumn += num_elems * sizeof(float);
@@ -286,6 +282,7 @@ std::vector<size_t> populate_table_random(const std::string& table_name,
   insert_data.tableId = td->tableId;
   for (const auto& cd : cds) {
     insert_data.columnIds.push_back(cd->columnId);
+    insert_data.is_default.push_back(false);
   }
   insert_data.numRows = num_rows;
   std::vector<std::vector<int8_t>> numbers_vec;

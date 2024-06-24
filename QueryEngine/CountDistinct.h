@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,11 +16,9 @@
 
 /**
  * @file    CountDistinct.h
- * @author  Alex Suhan <alex@mapd.com>
  * @brief   Functions used to work with (approximate) count distinct sets.
  *
- * Copyright (c) 2017 MapD Technologies, Inc.  All rights reserved.
- **/
+ */
 
 #ifndef QUERYENGINE_COUNTDISTINCT_H
 #define QUERYENGINE_COUNTDISTINCT_H
@@ -28,11 +26,13 @@
 #include "Descriptors/CountDistinctDescriptor.h"
 #include "HyperLogLog.h"
 
+#include "ThirdParty/robin_hood/robin_hood.h"
+
 #include <bitset>
-#include <set>
 #include <vector>
 
 using CountDistinctDescriptors = std::vector<CountDistinctDescriptor>;
+using CountDistinctSet = robin_hood::unordered_set<int64_t>;
 
 inline size_t bitmap_set_size(const int8_t* bitmap, const size_t bitmap_byte_sz) {
   const auto bitmap_word_count = bitmap_byte_sz >> 3;
@@ -93,8 +93,8 @@ inline int64_t count_distinct_set_size(
     }
     return bitmap_set_size(set_vals, count_distinct_desc.bitmapSizeBytes());
   }
-  CHECK(count_distinct_desc.impl_type_ == CountDistinctImplType::StdSet);
-  return reinterpret_cast<std::set<int64_t>*>(set_handle)->size();
+  CHECK(count_distinct_desc.impl_type_ == CountDistinctImplType::UnorderedSet);
+  return reinterpret_cast<CountDistinctSet*>(set_handle)->size();
 }
 
 inline void count_distinct_set_union(
@@ -111,23 +111,23 @@ inline void count_distinct_set_union(
           old_count_distinct_desc.device_type == ExecutorDeviceType::GPU) {
         hll_unify(reinterpret_cast<int32_t*>(new_set),
                   reinterpret_cast<int32_t*>(old_set),
-                  1 << old_count_distinct_desc.bitmap_sz_bits);
+                  size_t(1) << old_count_distinct_desc.bitmap_sz_bits);
       } else if (new_count_distinct_desc.device_type == ExecutorDeviceType::GPU &&
                  old_count_distinct_desc.device_type == ExecutorDeviceType::CPU) {
         hll_unify(reinterpret_cast<int32_t*>(new_set),
                   reinterpret_cast<int8_t*>(old_set),
-                  1 << old_count_distinct_desc.bitmap_sz_bits);
+                  size_t(1) << old_count_distinct_desc.bitmap_sz_bits);
       } else if (new_count_distinct_desc.device_type == ExecutorDeviceType::CPU &&
                  old_count_distinct_desc.device_type == ExecutorDeviceType::GPU) {
         hll_unify(reinterpret_cast<int8_t*>(new_set),
                   reinterpret_cast<int32_t*>(old_set),
-                  1 << old_count_distinct_desc.bitmap_sz_bits);
+                  size_t(1) << old_count_distinct_desc.bitmap_sz_bits);
       } else {
         CHECK(old_count_distinct_desc.device_type == ExecutorDeviceType::CPU &&
               new_count_distinct_desc.device_type == ExecutorDeviceType::CPU);
         hll_unify(reinterpret_cast<int8_t*>(new_set),
                   reinterpret_cast<int8_t*>(old_set),
-                  1 << old_count_distinct_desc.bitmap_sz_bits);
+                  size_t(1) << old_count_distinct_desc.bitmap_sz_bits);
       }
     } else {
       CHECK_EQ(new_count_distinct_desc.sub_bitmap_count,
@@ -142,19 +142,12 @@ inline void count_distinct_set_union(
       bitmap_set_union(new_set, old_set, bitmap_byte_sz);
     }
   } else {
-    CHECK(old_count_distinct_desc.impl_type_ == CountDistinctImplType::StdSet);
-    auto old_set = reinterpret_cast<std::set<int64_t>*>(old_set_handle);
-    auto new_set = reinterpret_cast<std::set<int64_t>*>(new_set_handle);
+    CHECK(old_count_distinct_desc.impl_type_ == CountDistinctImplType::UnorderedSet);
+    auto old_set = reinterpret_cast<CountDistinctSet*>(old_set_handle);
+    auto new_set = reinterpret_cast<CountDistinctSet*>(new_set_handle);
     new_set->insert(old_set->begin(), old_set->end());
     old_set->insert(new_set->begin(), new_set->end());
   }
-}
-
-inline void count_distinct_set_union(const int64_t new_set_handle,
-                                     const int64_t old_set_handle,
-                                     const CountDistinctDescriptor& count_distinct_desc) {
-  count_distinct_set_union(
-      new_set_handle, old_set_handle, count_distinct_desc, count_distinct_desc);
 }
 
 #endif

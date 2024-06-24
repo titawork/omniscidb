@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,25 +13,29 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 #include <algorithm>
-#include <boost/variant.hpp>
-#include <boost/variant/get.hpp>
-#include <limits>
 #include <mutex>
 #include <string>
 #include <vector>
 
+#include <boost/variant.hpp>
+#include <boost/variant/get.hpp>
+
 #include "Catalog/Catalog.h"
-#include "DataMgr/DataMgr.h"
+#include "DataMgr/ArrayNoneEncoder.h"
 #include "DataMgr/FixedLengthArrayNoneEncoder.h"
 #include "Fragmenter/InsertOrderFragmenter.h"
-#include "QueryEngine/TargetValue.h"
-#include "Shared/ConfigResolve.h"
+#include "LockMgr/LockMgr.h"
+#include "QueryEngine/Execute.h"
 #include "Shared/DateConverters.h"
 #include "Shared/TypedDataAccessors.h"
 #include "Shared/thread_count.h"
-#include "Shared/unreachable.h"
 #include "TargetValueConvertersFactories.h"
+
+extern bool g_enable_string_functions;
+
+bool g_enable_auto_metadata_update{true};
 
 namespace Fragmenter_Namespace {
 
@@ -42,44 +46,11 @@ inline void wait_cleanup_threads(std::vector<std::future<void>>& threads) {
   threads.clear();
 }
 
-FragmentInfo& InsertOrderFragmenter::getFragmentInfoFromId(const int fragment_id) {
-  auto fragment_it = std::find_if(
-      fragmentInfoVec_.begin(), fragmentInfoVec_.end(), [=](const auto& f) -> bool {
-        return f.fragmentId == fragment_id;
-      });
-  CHECK(fragment_it != fragmentInfoVec_.end());
-  return *fragment_it;
-}
-
 inline bool is_integral(const SQLTypeInfo& t) {
   return t.is_integer() || t.is_boolean() || t.is_time() || t.is_timeinterval();
 }
 
 bool FragmentInfo::unconditionalVacuum_{false};
-
-void InsertOrderFragmenter::updateColumn(const Catalog_Namespace::Catalog* catalog,
-                                         const std::string& tab_name,
-                                         const std::string& col_name,
-                                         const int fragment_id,
-                                         const std::vector<uint64_t>& frag_offsets,
-                                         const std::vector<ScalarTargetValue>& rhs_values,
-                                         const SQLTypeInfo& rhs_type,
-                                         const Data_Namespace::MemoryLevel memory_level,
-                                         UpdelRoll& updel_roll) {
-  const auto td = catalog->getMetadataForTable(tab_name);
-  CHECK(td);
-  const auto cd = catalog->getMetadataForColumn(td->tableId, col_name);
-  CHECK(cd);
-  td->fragmenter->updateColumn(catalog,
-                               td,
-                               cd,
-                               fragment_id,
-                               frag_offsets,
-                               rhs_values,
-                               rhs_type,
-                               memory_level,
-                               updel_roll);
-}
 
 void InsertOrderFragmenter::updateColumn(const Catalog_Namespace::Catalog* catalog,
                                          const TableDescriptor* td,
@@ -119,8 +90,8 @@ static int get_chunks(const Catalog_Namespace::Catalog* catalog,
                                                chunk_key,
                                                memory_level,
                                                0,
-                                               chunk_meta_it->second.numBytes,
-                                               chunk_meta_it->second.numElements);
+                                               chunk_meta_it->second->numBytes,
+                                               chunk_meta_it->second->numElements);
         chunks.push_back(chunk);
       }
     }
@@ -149,10 +120,10 @@ struct ScalarChunkConverter : public ChunkToInsertDataConverter {
   const BUFFER_DATA_TYPE* data_buffer_addr_;
 
   ScalarChunkConverter(const size_t num_rows, const Chunk_NS::Chunk* chunk)
-      : chunk_(chunk), column_descriptor_(chunk->get_column_desc()) {
+      : chunk_(chunk), column_descriptor_(chunk->getColumnDesc()) {
     column_data_ = ColumnDataPtr(reinterpret_cast<INSERT_DATA_TYPE*>(
         checked_malloc(num_rows * sizeof(INSERT_DATA_TYPE))));
-    data_buffer_addr_ = (BUFFER_DATA_TYPE*)chunk->get_buffer()->getMemoryPtr();
+    data_buffer_addr_ = (BUFFER_DATA_TYPE*)chunk->getBuffer()->getMemoryPtr();
   }
 
   ~ScalarChunkConverter() override {}
@@ -180,18 +151,22 @@ struct FixedLenArrayChunkConverter : public ChunkToInsertDataConverter {
   size_t fixed_array_length_;
 
   FixedLenArrayChunkConverter(const size_t num_rows, const Chunk_NS::Chunk* chunk)
-      : chunk_(chunk), column_descriptor_(chunk->get_column_desc()) {
+      : chunk_(chunk), column_descriptor_(chunk->getColumnDesc()) {
     column_data_ = std::make_unique<std::vector<ArrayDatum>>(num_rows);
-    data_buffer_addr_ = chunk->get_buffer()->getMemoryPtr();
-    fixed_array_length_ = chunk->get_column_desc()->columnType.get_size();
+    data_buffer_addr_ = chunk->getBuffer()->getMemoryPtr();
+    fixed_array_length_ = chunk->getColumnDesc()->columnType.get_size();
   }
 
   ~FixedLenArrayChunkConverter() override {}
 
   void convertToColumnarFormat(size_t row, size_t indexInFragment) override {
     auto src_value_ptr = data_buffer_addr_ + (indexInFragment * fixed_array_length_);
-    (*column_data_)[row] =
-        ArrayDatum(fixed_array_length_, (int8_t*)src_value_ptr, DoNothingDeleter());
+
+    bool is_null = FixedLengthArrayNoneEncoder::is_null(column_descriptor_->columnType,
+                                                        src_value_ptr);
+
+    (*column_data_)[row] = ArrayDatum(
+        fixed_array_length_, (int8_t*)src_value_ptr, is_null, DoNothingDeleter());
   }
 
   void addDataBlocksToInsertData(Fragmenter_Namespace::InsertData& insertData) override {
@@ -203,23 +178,24 @@ struct FixedLenArrayChunkConverter : public ChunkToInsertDataConverter {
 };
 
 struct ArrayChunkConverter : public FixedLenArrayChunkConverter {
-  StringOffsetT* index_buffer_addr_;
+  ArrayOffsetT* index_buffer_addr_;
 
   ArrayChunkConverter(const size_t num_rows, const Chunk_NS::Chunk* chunk)
       : FixedLenArrayChunkConverter(num_rows, chunk) {
     index_buffer_addr_ =
-        (StringOffsetT*)(chunk->get_index_buf() ? chunk->get_index_buf()->getMemoryPtr()
-                                                : nullptr);
+        (StringOffsetT*)(chunk->getIndexBuf() ? chunk->getIndexBuf()->getMemoryPtr()
+                                              : nullptr);
   }
 
   ~ArrayChunkConverter() override {}
 
   void convertToColumnarFormat(size_t row, size_t indexInFragment) override {
-    size_t src_value_size =
-        index_buffer_addr_[indexInFragment + 1] - index_buffer_addr_[indexInFragment];
+    auto startIndex = index_buffer_addr_[indexInFragment];
+    auto endIndex = index_buffer_addr_[indexInFragment + 1];
+    size_t src_value_size = std::abs(endIndex) - std::abs(startIndex);
     auto src_value_ptr = data_buffer_addr_ + index_buffer_addr_[indexInFragment];
-    (*column_data_)[row] =
-        ArrayDatum(src_value_size, (int8_t*)src_value_ptr, DoNothingDeleter());
+    (*column_data_)[row] = ArrayDatum(
+        src_value_size, (int8_t*)src_value_ptr, endIndex < 0, DoNothingDeleter());
   }
 };
 
@@ -232,12 +208,12 @@ struct StringChunkConverter : public ChunkToInsertDataConverter {
   const StringOffsetT* index_buffer_addr_;
 
   StringChunkConverter(size_t num_rows, const Chunk_NS::Chunk* chunk)
-      : chunk_(chunk), column_descriptor_(chunk->get_column_desc()) {
+      : chunk_(chunk), column_descriptor_(chunk->getColumnDesc()) {
     column_data_ = std::make_unique<std::vector<std::string>>(num_rows);
-    data_buffer_addr_ = chunk->get_buffer()->getMemoryPtr();
+    data_buffer_addr_ = chunk->getBuffer()->getMemoryPtr();
     index_buffer_addr_ =
-        (StringOffsetT*)(chunk->get_index_buf() ? chunk->get_index_buf()->getMemoryPtr()
-                                                : nullptr);
+        (StringOffsetT*)(chunk->getIndexBuf() ? chunk->getIndexBuf()->getMemoryPtr()
+                                              : nullptr);
   }
 
   ~StringChunkConverter() override {}
@@ -267,10 +243,10 @@ struct DateChunkConverter : public ChunkToInsertDataConverter {
   const BUFFER_DATA_TYPE* data_buffer_addr_;
 
   DateChunkConverter(const size_t num_rows, const Chunk_NS::Chunk* chunk)
-      : chunk_(chunk), column_descriptor_(chunk->get_column_desc()) {
+      : chunk_(chunk), column_descriptor_(chunk->getColumnDesc()) {
     column_data_ = ColumnDataPtr(
         reinterpret_cast<int64_t*>(checked_malloc(num_rows * sizeof(int64_t))));
-    data_buffer_addr_ = (BUFFER_DATA_TYPE*)chunk->get_buffer()->getMemoryPtr();
+    data_buffer_addr_ = (BUFFER_DATA_TYPE*)chunk->getBuffer()->getMemoryPtr();
   }
 
   ~DateChunkConverter() override {}
@@ -298,17 +274,15 @@ void InsertOrderFragmenter::updateColumns(
     const RowDataProvider& sourceDataProvider,
     const size_t indexOffFragmentOffsetColumn,
     const Data_Namespace::MemoryLevel memoryLevel,
-    UpdelRoll& updelRoll) {
-  if (!is_feature_enabled<VarlenUpdates>()) {
-    throw std::runtime_error("varlen UPDATE path not enabled.");
-  }
-
+    UpdelRoll& updelRoll,
+    Executor* executor) {
   updelRoll.is_varlen_update = true;
   updelRoll.catalog = catalog;
   updelRoll.logicalTableId = catalog->getLogicalTableId(td->tableId);
   updelRoll.memoryLevel = memoryLevel;
 
-  size_t num_rows = sourceDataProvider.count();
+  size_t num_entries = sourceDataProvider.getEntryCount();
+  size_t num_rows = sourceDataProvider.getRowCount();
 
   if (0 == num_rows) {
     // bail out early
@@ -317,19 +291,21 @@ void InsertOrderFragmenter::updateColumns(
 
   TargetValueConverterFactory factory;
 
-  auto& fragment = getFragmentInfoFromId(fragmentId);
+  auto fragment_ptr = getFragmentInfo(fragmentId);
+  auto& fragment = *fragment_ptr;
   std::vector<std::shared_ptr<Chunk_NS::Chunk>> chunks;
   get_chunks(catalog, td, fragment, memoryLevel, chunks);
   std::vector<std::unique_ptr<TargetValueConverter>> sourceDataConverters(
       columnDescriptors.size());
   std::vector<std::unique_ptr<ChunkToInsertDataConverter>> chunkConverters;
-
+  size_t indexOfDeletedColumn{0};
   std::shared_ptr<Chunk_NS::Chunk> deletedChunk;
   for (size_t indexOfChunk = 0; indexOfChunk < chunks.size(); indexOfChunk++) {
     auto chunk = chunks[indexOfChunk];
-    const auto chunk_cd = chunk->get_column_desc();
+    const auto chunk_cd = chunk->getColumnDesc();
 
     if (chunk_cd->isDeletedCol) {
+      indexOfDeletedColumn = chunk_cd->columnId;
       deletedChunk = chunk;
       continue;
     }
@@ -346,13 +322,21 @@ void InsertOrderFragmenter::updateColumns(
       auto sourceDataMetaInfo = sourceMetaInfo[indexOfTargetColumn];
       auto targetDescriptor = columnDescriptors[indexOfTargetColumn];
 
-      ConverterCreateParameter param{num_rows,
-                                     *catalog,
-                                     sourceDataMetaInfo,
-                                     targetDescriptor,
-                                     targetDescriptor->columnType,
-                                     !targetDescriptor->columnType.get_notnull(),
-                                     sourceDataProvider.getLiteralDictionary()};
+      ConverterCreateParameter param{
+          num_rows,
+          sourceDataMetaInfo,
+          targetDescriptor,
+          *catalog,
+          targetDescriptor->columnType,
+          !targetDescriptor->columnType.get_notnull(),
+          sourceDataProvider.getLiteralDictionary(),
+          g_enable_string_functions &&
+                  sourceDataMetaInfo.get_type_info().is_dict_encoded_string()
+              ? executor->getStringDictionaryProxy(
+                    sourceDataMetaInfo.get_type_info().getStringDictKey(),
+                    executor->getRowSetMemoryOwner(),
+                    true)
+              : nullptr};
       auto converter = factory.create(param);
       sourceDataConverters[indexOfTargetColumn] = std::move(converter);
 
@@ -366,7 +350,11 @@ void InsertOrderFragmenter::updateColumns(
           case kPOLYGON:
             indexOfChunk += 4;
             break;
+          case kMULTILINESTRING:
+            indexOfChunk += 3;
+            break;
           case kLINESTRING:
+          case kMULTIPOINT:
             indexOfChunk += 2;
             break;
           case kPOINT:
@@ -473,22 +461,25 @@ void InsertOrderFragmenter::updateColumns(
   static boost_variant_accessor<ScalarTargetValue> SCALAR_TARGET_VALUE_ACCESSOR;
   static boost_variant_accessor<int64_t> OFFSET_VALUE__ACCESSOR;
 
-  updelRoll.dirtyChunks[deletedChunk.get()] = deletedChunk;
-  ChunkKey chunkey{updelRoll.catalog->getCurrentDB().dbId,
-                   deletedChunk->get_column_desc()->tableId,
-                   deletedChunk->get_column_desc()->columnId,
-                   fragment.fragmentId};
-  updelRoll.dirtyChunkeys.insert(chunkey);
+  updelRoll.addDirtyChunk(deletedChunk, fragment.fragmentId);
   bool* deletedChunkBuffer =
-      reinterpret_cast<bool*>(deletedChunk->get_buffer()->getMemoryPtr());
+      reinterpret_cast<bool*>(deletedChunk->getBuffer()->getMemoryPtr());
+
+  std::atomic<size_t> row_idx{0};
 
   auto row_converter = [&sourceDataProvider,
                         &sourceDataConverters,
                         &indexOffFragmentOffsetColumn,
                         &chunkConverters,
-                        &deletedChunkBuffer](size_t indexOfRow) -> void {
+                        &deletedChunkBuffer,
+                        &row_idx](size_t indexOfEntry) -> void {
     // convert the source data
-    const auto row = sourceDataProvider.getEntryAt(indexOfRow);
+    const auto row = sourceDataProvider.getEntryAt(indexOfEntry);
+    if (row.empty()) {
+      return;
+    }
+
+    size_t indexOfRow = row_idx.fetch_add(1);
 
     for (size_t col = 0; col < sourceDataConverters.size(); col++) {
       if (sourceDataConverters[col]) {
@@ -517,8 +508,8 @@ void InsertOrderFragmenter::updateColumns(
     std::vector<std::future<void>> worker_threads;
     for (size_t i = 0,
                 start_entry = 0,
-                stride = (num_rows + num_worker_threads - 1) / num_worker_threads;
-         i < num_worker_threads && start_entry < num_rows;
+                stride = (num_entries + num_worker_threads - 1) / num_worker_threads;
+         i < num_worker_threads && start_entry < num_entries;
          ++i, start_entry += stride) {
       const auto end_entry = std::min(start_entry + stride, num_rows);
       worker_threads.push_back(std::async(
@@ -537,8 +528,8 @@ void InsertOrderFragmenter::updateColumns(
     }
 
   } else {
-    for (size_t indexOfRow = 0; indexOfRow < num_rows; indexOfRow++) {
-      row_converter(indexOfRow);
+    for (size_t entryIdx = 0; entryIdx < num_entries; entryIdx++) {
+      row_converter(entryIdx);
     }
   }
 
@@ -559,34 +550,102 @@ void InsertOrderFragmenter::updateColumns(
   }
 
   insert_data.numRows = num_rows;
+  insert_data.is_default.resize(insert_data.columnIds.size(), false);
   insertDataNoCheckpoint(insert_data);
 
-  // update metdata
-  if (!deletedChunk->get_buffer()->hasEncoder) {
-    deletedChunk->init_encoder();
-  }
-  deletedChunk->get_buffer()->encoder->updateStats(static_cast<int64_t>(true), false);
+  // update metdata for deleted chunk as we are doing special handling
+  auto chunkMetadata =
+      updelRoll.getChunkMetadata({td, &fragment}, indexOfDeletedColumn, fragment);
+  chunkMetadata->chunkStats.max.boolval = 1;
 
-  auto& shadowDeletedChunkMeta =
-      fragment.shadowChunkMetadataMap[deletedChunk->get_column_desc()->columnId];
-  if (shadowDeletedChunkMeta.numElements >
-      deletedChunk->get_buffer()->encoder->getNumElems()) {
-    // the append will have populated shadow meta data, otherwise use existing num
-    // elements
-    deletedChunk->get_buffer()->encoder->setNumElems(shadowDeletedChunkMeta.numElements);
+  // Im not completely sure that we need to do this in fragmented and on the buffer
+  // but leaving this alone for now
+  if (!deletedChunk->getBuffer()->hasEncoder()) {
+    deletedChunk->initEncoder();
   }
-  deletedChunk->get_buffer()->setUpdated();
+  deletedChunk->getBuffer()->getEncoder()->updateStats(static_cast<int64_t>(true), false);
+
+  if (fragment.shadowNumTuples > deletedChunk->getBuffer()->getEncoder()->getNumElems()) {
+    // An append to the same fragment will increase shadowNumTuples.
+    // Update NumElems in this case. Otherwise, use existing NumElems.
+    deletedChunk->getBuffer()->getEncoder()->setNumElems(fragment.shadowNumTuples);
+  }
+  deletedChunk->getBuffer()->setUpdated();
 }
 
-void InsertOrderFragmenter::updateColumn(const Catalog_Namespace::Catalog* catalog,
-                                         const TableDescriptor* td,
-                                         const ColumnDescriptor* cd,
-                                         const int fragment_id,
-                                         const std::vector<uint64_t>& frag_offsets,
-                                         const std::vector<ScalarTargetValue>& rhs_values,
-                                         const SQLTypeInfo& rhs_type,
-                                         const Data_Namespace::MemoryLevel memory_level,
-                                         UpdelRoll& updel_roll) {
+namespace {
+inline void update_metadata(SQLTypeInfo const& ti,
+                            ChunkUpdateStats& update_stats,
+                            int64_t const updated_val,
+                            int64_t const old_val,
+                            NullSentinelSupplier s = NullSentinelSupplier()) {
+  if (ti.get_notnull()) {
+    set_minmax(update_stats.new_values_stats.min_int64t,
+               update_stats.new_values_stats.max_int64t,
+               updated_val);
+    set_minmax(update_stats.old_values_stats.min_int64t,
+               update_stats.old_values_stats.max_int64t,
+               old_val);
+  } else {
+    set_minmax(update_stats.new_values_stats.min_int64t,
+               update_stats.new_values_stats.max_int64t,
+               update_stats.new_values_stats.has_null,
+               updated_val,
+               s(ti, updated_val));
+    set_minmax(update_stats.old_values_stats.min_int64t,
+               update_stats.old_values_stats.max_int64t,
+               update_stats.old_values_stats.has_null,
+               old_val,
+               s(ti, old_val));
+  }
+}
+
+inline void update_metadata(SQLTypeInfo const& ti,
+                            ChunkUpdateStats& update_stats,
+                            double const updated_val,
+                            double const old_val,
+                            NullSentinelSupplier s = NullSentinelSupplier()) {
+  if (ti.get_notnull()) {
+    set_minmax(update_stats.new_values_stats.min_double,
+               update_stats.new_values_stats.max_double,
+               updated_val);
+    set_minmax(update_stats.old_values_stats.min_double,
+               update_stats.old_values_stats.max_double,
+               old_val);
+  } else {
+    set_minmax(update_stats.new_values_stats.min_double,
+               update_stats.new_values_stats.max_double,
+               update_stats.new_values_stats.has_null,
+               updated_val,
+               s(ti, updated_val));
+    set_minmax(update_stats.old_values_stats.min_double,
+               update_stats.old_values_stats.max_double,
+               update_stats.old_values_stats.has_null,
+               old_val,
+               s(ti, old_val));
+  }
+}
+
+inline void update_metadata(UpdateValuesStats& agg_stats,
+                            const UpdateValuesStats& new_stats) {
+  agg_stats.has_null = agg_stats.has_null || new_stats.has_null;
+  agg_stats.max_double = std::max<double>(agg_stats.max_double, new_stats.max_double);
+  agg_stats.min_double = std::min<double>(agg_stats.min_double, new_stats.min_double);
+  agg_stats.max_int64t = std::max<int64_t>(agg_stats.max_int64t, new_stats.max_int64t);
+  agg_stats.min_int64t = std::min<int64_t>(agg_stats.min_int64t, new_stats.min_int64t);
+}
+}  // namespace
+
+std::optional<ChunkUpdateStats> InsertOrderFragmenter::updateColumn(
+    const Catalog_Namespace::Catalog* catalog,
+    const TableDescriptor* td,
+    const ColumnDescriptor* cd,
+    const int fragment_id,
+    const std::vector<uint64_t>& frag_offsets,
+    const std::vector<ScalarTargetValue>& rhs_values,
+    const SQLTypeInfo& rhs_type,
+    const Data_Namespace::MemoryLevel memory_level,
+    UpdelRoll& updel_roll) {
   updel_roll.catalog = catalog;
   updel_roll.logicalTableId = catalog->getLogicalTableId(td->tableId);
   updel_roll.memoryLevel = memory_level;
@@ -595,11 +654,12 @@ void InsertOrderFragmenter::updateColumn(const Catalog_Namespace::Catalog* catal
   const auto nrow = frag_offsets.size();
   const auto n_rhs_values = rhs_values.size();
   if (0 == nrow) {
-    return;
+    return {};
   }
   CHECK(nrow == n_rhs_values || 1 == n_rhs_values);
 
-  auto& fragment = getFragmentInfoFromId(fragment_id);
+  auto fragment_ptr = getFragmentInfo(fragment_id);
+  auto& fragment = *fragment_ptr;
   auto chunk_meta_it = fragment.getChunkMetadataMapPhysical().find(cd->columnId);
   CHECK(chunk_meta_it != fragment.getChunkMetadataMapPhysical().end());
   ChunkKey chunk_key{
@@ -609,45 +669,22 @@ void InsertOrderFragmenter::updateColumn(const Catalog_Namespace::Catalog* catal
                                          chunk_key,
                                          Data_Namespace::CPU_LEVEL,
                                          0,
-                                         chunk_meta_it->second.numBytes,
-                                         chunk_meta_it->second.numElements);
+                                         chunk_meta_it->second->numBytes,
+                                         chunk_meta_it->second->numElements);
 
-  std::vector<int8_t> has_null_per_thread(ncore, 0);
-  std::vector<double> max_double_per_thread(ncore, std::numeric_limits<double>::lowest());
-  std::vector<double> min_double_per_thread(ncore, std::numeric_limits<double>::max());
-  std::vector<int64_t> max_int64t_per_thread(ncore, std::numeric_limits<int64_t>::min());
-  std::vector<int64_t> min_int64t_per_thread(ncore, std::numeric_limits<int64_t>::max());
+  std::vector<ChunkUpdateStats> update_stats_per_thread(ncore);
 
   // parallel update elements
   std::vector<std::future<void>> threads;
 
   const auto segsz = (nrow + ncore - 1) / ncore;
-  auto dbuf = chunk->get_buffer();
+  auto dbuf = chunk->getBuffer();
   auto dbuf_addr = dbuf->getMemoryPtr();
   dbuf->setUpdated();
-  {
-    std::lock_guard<std::mutex> lck(updel_roll.mutex);
-    if (updel_roll.dirtyChunks.count(chunk.get()) == 0) {
-      updel_roll.dirtyChunks.emplace(chunk.get(), chunk);
-    }
-
-    ChunkKey chunkey{updel_roll.catalog->getCurrentDB().dbId,
-                     cd->tableId,
-                     cd->columnId,
-                     fragment.fragmentId};
-    updel_roll.dirtyChunkeys.insert(chunkey);
-  }
+  updel_roll.addDirtyChunk(chunk, fragment.fragmentId);
   for (size_t rbegin = 0, c = 0; rbegin < nrow; ++c, rbegin += segsz) {
     threads.emplace_back(std::async(
-        std::launch::async,
-        [=,
-         &has_null_per_thread,
-         &min_int64t_per_thread,
-         &max_int64t_per_thread,
-         &min_double_per_thread,
-         &max_double_per_thread,
-         &frag_offsets,
-         &rhs_values] {
+        std::launch::async, [=, &update_stats_per_thread, &frag_offsets, &rhs_values] {
           SQLTypeInfo lhs_type = cd->columnType;
 
           // !! not sure if this is a undocumented convention or a bug, but for a sharded
@@ -712,19 +749,24 @@ void InsertOrderFragmenter::updateColumn(const Catalog_Namespace::Catalog* catal
               if (lhs_type.is_string()) {
                 throw std::runtime_error("UPDATE does not support cast to string.");
               }
+              int64_t old_val;
+              get_scalar<int64_t>(data_ptr, lhs_type, old_val);
+              // Handle special case where date column with date in days encoding stores
+              // metadata in epoch seconds.
+              if (lhs_type.is_date_in_days()) {
+                old_val = DateConverters::get_epoch_seconds_from_days(old_val);
+              }
               put_scalar<int64_t>(data_ptr, lhs_type, v, cd->columnName, &rhs_type);
               if (lhs_type.is_decimal()) {
                 nullAwareDecimalOverflowValidator.validate<int64_t>(v);
                 int64_t decimal_val;
                 get_scalar<int64_t>(data_ptr, lhs_type, decimal_val);
-                tabulate_metadata(lhs_type,
-                                  min_int64t_per_thread[c],
-                                  max_int64t_per_thread[c],
-                                  has_null_per_thread[c],
-                                  (v == inline_int_null_value<int64_t>() &&
-                                   lhs_type.get_notnull() == false)
-                                      ? v
-                                      : decimal_val);
+                int64_t target_value = (v == inline_int_null_value<int64_t>() &&
+                                        lhs_type.get_notnull() == false)
+                                           ? v
+                                           : decimal_val;
+                update_metadata(
+                    lhs_type, update_stats_per_thread[c], target_value, old_val);
                 auto const positive_v_and_negative_d = (v >= 0) && (decimal_val < 0);
                 auto const negative_v_and_positive_d = (v < 0) && (decimal_val >= 0);
                 if (positive_v_and_negative_d || negative_v_and_positive_d) {
@@ -746,14 +788,12 @@ void InsertOrderFragmenter::updateColumn(const Catalog_Namespace::Catalog* catal
                   int64_t days;
                   get_scalar<int64_t>(data_ptr, lhs_type, days);
                   const auto seconds = DateConverters::get_epoch_seconds_from_days(days);
-                  tabulate_metadata(lhs_type,
-                                    min_int64t_per_thread[c],
-                                    max_int64t_per_thread[c],
-                                    has_null_per_thread[c],
-                                    (v == inline_int_null_value<int64_t>() &&
-                                     lhs_type.get_notnull() == false)
-                                        ? NullSentinelSupplier()(lhs_type, v)
-                                        : seconds);
+                  int64_t target_value = (v == inline_int_null_value<int64_t>() &&
+                                          lhs_type.get_notnull() == false)
+                                             ? NullSentinelSupplier()(lhs_type, v)
+                                             : seconds;
+                  update_metadata(
+                      lhs_type, update_stats_per_thread[c], target_value, old_val);
                 } else {
                   int64_t target_value;
                   if (rhs_type.is_decimal()) {
@@ -761,38 +801,33 @@ void InsertOrderFragmenter::updateColumn(const Catalog_Namespace::Catalog* catal
                   } else {
                     target_value = v;
                   }
-                  tabulate_metadata(lhs_type,
-                                    min_int64t_per_thread[c],
-                                    max_int64t_per_thread[c],
-                                    has_null_per_thread[c],
-                                    target_value);
+                  update_metadata(
+                      lhs_type, update_stats_per_thread[c], target_value, old_val);
                 }
               } else {
-                tabulate_metadata(
-                    lhs_type,
-                    min_double_per_thread[c],
-                    max_double_per_thread[c],
-                    has_null_per_thread[c],
-                    rhs_type.is_decimal() ? decimal_to_double(rhs_type, v) : v);
+                if (rhs_type.is_decimal()) {
+                  update_metadata(lhs_type,
+                                  update_stats_per_thread[c],
+                                  decimal_to_double(rhs_type, v),
+                                  double(old_val));
+                } else {
+                  update_metadata(lhs_type, update_stats_per_thread[c], v, old_val);
+                }
               }
             } else if (const auto vp = boost::get<double>(sv)) {
               auto v = *vp;
               if (lhs_type.is_string()) {
                 throw std::runtime_error("UPDATE does not support cast to string.");
               }
+              double old_val;
+              get_scalar<double>(data_ptr, lhs_type, old_val);
               put_scalar<double>(data_ptr, lhs_type, v, cd->columnName);
               if (lhs_type.is_integer()) {
-                tabulate_metadata(lhs_type,
-                                  min_int64t_per_thread[c],
-                                  max_int64t_per_thread[c],
-                                  has_null_per_thread[c],
-                                  int64_t(v));
+                update_metadata(
+                    lhs_type, update_stats_per_thread[c], int64_t(v), int64_t(old_val));
               } else if (lhs_type.is_fp()) {
-                tabulate_metadata(lhs_type,
-                                  min_double_per_thread[c],
-                                  max_double_per_thread[c],
-                                  has_null_per_thread[c],
-                                  double(v));
+                update_metadata(
+                    lhs_type, update_stats_per_thread[c], double(v), double(old_val));
               } else {
                 UNREACHABLE() << "Unexpected combination of a non-floating or integer "
                                  "LHS with a floating RHS.";
@@ -802,19 +837,14 @@ void InsertOrderFragmenter::updateColumn(const Catalog_Namespace::Catalog* catal
               if (lhs_type.is_string()) {
                 throw std::runtime_error("UPDATE does not support cast to string.");
               }
+              float old_val;
+              get_scalar<float>(data_ptr, lhs_type, old_val);
               put_scalar<float>(data_ptr, lhs_type, v, cd->columnName);
               if (lhs_type.is_integer()) {
-                tabulate_metadata(lhs_type,
-                                  min_int64t_per_thread[c],
-                                  max_int64t_per_thread[c],
-                                  has_null_per_thread[c],
-                                  int64_t(v));
+                update_metadata(
+                    lhs_type, update_stats_per_thread[c], int64_t(v), int64_t(old_val));
               } else {
-                tabulate_metadata(lhs_type,
-                                  min_double_per_thread[c],
-                                  max_double_per_thread[c],
-                                  has_null_per_thread[c],
-                                  double(v));
+                update_metadata(lhs_type, update_stats_per_thread[c], double(v), old_val);
               }
             } else if (const auto vp = boost::get<NullableString>(sv)) {
               const auto s = boost::get<std::string>(vp);
@@ -825,12 +855,11 @@ void InsertOrderFragmenter::updateColumn(const Catalog_Namespace::Catalog* catal
                   std::unique_lock<std::mutex> lock(temp_mutex_);
                   sidx = stringDict->getOrAdd(sval);
                 }
-                put_scalar<int32_t>(data_ptr, lhs_type, sidx, cd->columnName);
-                tabulate_metadata(lhs_type,
-                                  min_int64t_per_thread[c],
-                                  max_int64t_per_thread[c],
-                                  has_null_per_thread[c],
-                                  int64_t(sidx));
+                int64_t old_val;
+                get_scalar<int64_t>(data_ptr, lhs_type, old_val);
+                put_scalar<int64_t>(data_ptr, lhs_type, sidx, cd->columnName);
+                update_metadata(
+                    lhs_type, update_stats_per_thread[c], int64_t(sidx), old_val);
               } else if (sval.size() > 0) {
                 auto dval = std::atof(sval.data());
                 if (lhs_type.is_boolean()) {
@@ -841,23 +870,21 @@ void InsertOrderFragmenter::updateColumn(const Catalog_Namespace::Catalog* catal
                       "string path.");
                 }
                 if (lhs_type.is_fp() || lhs_type.is_decimal()) {
+                  double old_val;
+                  get_scalar<double>(data_ptr, lhs_type, old_val);
                   put_scalar<double>(data_ptr, lhs_type, dval, cd->columnName);
-                  tabulate_metadata(lhs_type,
-                                    min_double_per_thread[c],
-                                    max_double_per_thread[c],
-                                    has_null_per_thread[c],
-                                    double(dval));
+                  update_metadata(
+                      lhs_type, update_stats_per_thread[c], double(dval), old_val);
                 } else {
+                  int64_t old_val;
+                  get_scalar<int64_t>(data_ptr, lhs_type, old_val);
                   put_scalar<int64_t>(data_ptr, lhs_type, dval, cd->columnName);
-                  tabulate_metadata(lhs_type,
-                                    min_int64t_per_thread[c],
-                                    max_int64t_per_thread[c],
-                                    has_null_per_thread[c],
-                                    int64_t(dval));
+                  update_metadata(
+                      lhs_type, update_stats_per_thread[c], int64_t(dval), old_val);
                 }
               } else {
                 put_null(data_ptr, lhs_type, cd->columnName);
-                has_null_per_thread[c] = true;
+                update_stats_per_thread[c].new_values_stats.has_null = true;
               }
             } else {
               CHECK(false);
@@ -876,63 +903,40 @@ void InsertOrderFragmenter::updateColumn(const Catalog_Namespace::Catalog* catal
       const auto deleted_offsets = getVacuumOffsets(chunk);
       if (deleted_offsets.size() > 0) {
         compactRows(catalog, td, fragment_id, deleted_offsets, memory_level, updel_roll);
-        return;
+        return {};
       }
     }
   }
-  bool has_null_per_chunk{false};
-  double max_double_per_chunk{std::numeric_limits<double>::lowest()};
-  double min_double_per_chunk{std::numeric_limits<double>::max()};
-  int64_t max_int64t_per_chunk{std::numeric_limits<int64_t>::min()};
-  int64_t min_int64t_per_chunk{std::numeric_limits<int64_t>::max()};
+  ChunkUpdateStats update_stats;
   for (size_t c = 0; c < ncore; ++c) {
-    has_null_per_chunk = has_null_per_chunk || has_null_per_thread[c];
-    max_double_per_chunk =
-        std::max<double>(max_double_per_chunk, max_double_per_thread[c]);
-    min_double_per_chunk =
-        std::min<double>(min_double_per_chunk, min_double_per_thread[c]);
-    max_int64t_per_chunk =
-        std::max<int64_t>(max_int64t_per_chunk, max_int64t_per_thread[c]);
-    min_int64t_per_chunk =
-        std::min<int64_t>(min_int64t_per_chunk, min_int64t_per_thread[c]);
+    update_metadata(update_stats.new_values_stats,
+                    update_stats_per_thread[c].new_values_stats);
+    update_metadata(update_stats.old_values_stats,
+                    update_stats_per_thread[c].old_values_stats);
   }
-  updateColumnMetadata(cd,
-                       fragment,
-                       chunk,
-                       has_null_per_chunk,
-                       max_double_per_chunk,
-                       min_double_per_chunk,
-                       max_int64t_per_chunk,
-                       min_int64t_per_chunk,
-                       cd->columnType,
-                       updel_roll);
+
+  CHECK_GT(fragment.shadowNumTuples, size_t(0));
+  updateColumnMetadata(
+      cd, fragment, chunk, update_stats.new_values_stats, cd->columnType, updel_roll);
+  update_stats.updated_rows_count = nrow;
+  update_stats.fragment_rows_count = fragment.shadowNumTuples;
+  update_stats.chunk = chunk;
+  return update_stats;
 }
 
-void InsertOrderFragmenter::updateColumnMetadata(const ColumnDescriptor* cd,
-                                                 FragmentInfo& fragment,
-                                                 std::shared_ptr<Chunk_NS::Chunk> chunk,
-                                                 const bool has_null_per_chunk,
-                                                 const double max_double_per_chunk,
-                                                 const double min_double_per_chunk,
-                                                 const int64_t max_int64t_per_chunk,
-                                                 const int64_t min_int64t_per_chunk,
-                                                 const SQLTypeInfo& rhs_type,
-                                                 UpdelRoll& updel_roll) {
-  auto td = updel_roll.catalog->getMetadataForTable(cd->tableId);
-  auto key = std::make_pair(td, &fragment);
-  std::lock_guard<std::mutex> lck(updel_roll.mutex);
-  if (0 == updel_roll.chunkMetadata.count(key)) {
-    updel_roll.chunkMetadata[key] = fragment.getChunkMetadataMapPhysical();
-  }
-  if (0 == updel_roll.numTuples.count(key)) {
-    updel_roll.numTuples[key] = fragment.shadowNumTuples;
-  }
-  auto& chunkMetadata = updel_roll.chunkMetadata[key];
-
-  auto buffer = chunk->get_buffer();
+void InsertOrderFragmenter::updateColumnMetadata(
+    const ColumnDescriptor* cd,
+    FragmentInfo& fragment,
+    std::shared_ptr<Chunk_NS::Chunk> chunk,
+    const UpdateValuesStats& new_values_stats,
+    const SQLTypeInfo& rhs_type,
+    UpdelRoll& updel_roll) {
+  heavyai::unique_lock<heavyai::shared_mutex> write_lock(fragmentInfoMutex_);
+  auto buffer = chunk->getBuffer();
   const auto& lhs_type = cd->columnType;
 
-  auto update_stats = [& encoder = buffer->encoder](auto min, auto max, auto has_null) {
+  auto encoder = buffer->getEncoder();
+  auto update_stats = [&encoder](auto min, auto max, auto has_null) {
     static_assert(std::is_same<decltype(min), decltype(max)>::value,
                   "Type mismatch on min/max");
     if (has_null) {
@@ -946,45 +950,39 @@ void InsertOrderFragmenter::updateColumnMetadata(const ColumnDescriptor* cd,
   };
 
   if (is_integral(lhs_type) || (lhs_type.is_decimal() && rhs_type.is_decimal())) {
-    update_stats(min_int64t_per_chunk, max_int64t_per_chunk, has_null_per_chunk);
+    update_stats(new_values_stats.min_int64t,
+                 new_values_stats.max_int64t,
+                 new_values_stats.has_null);
   } else if (lhs_type.is_fp()) {
-    update_stats(min_double_per_chunk, max_double_per_chunk, has_null_per_chunk);
+    update_stats(new_values_stats.min_double,
+                 new_values_stats.max_double,
+                 new_values_stats.has_null);
   } else if (lhs_type.is_decimal()) {
-    update_stats((int64_t)(min_double_per_chunk * pow(10, lhs_type.get_scale())),
-                 (int64_t)(max_double_per_chunk * pow(10, lhs_type.get_scale())),
-                 has_null_per_chunk);
+    update_stats((int64_t)(new_values_stats.min_double * pow(10, lhs_type.get_scale())),
+                 (int64_t)(new_values_stats.max_double * pow(10, lhs_type.get_scale())),
+                 new_values_stats.has_null);
   } else if (!lhs_type.is_array() && !lhs_type.is_geometry() &&
              !(lhs_type.is_string() && kENCODING_DICT != lhs_type.get_compression())) {
-    update_stats(min_int64t_per_chunk, max_int64t_per_chunk, has_null_per_chunk);
+    update_stats(new_values_stats.min_int64t,
+                 new_values_stats.max_int64t,
+                 new_values_stats.has_null);
   }
-  buffer->encoder->getMetadata(chunkMetadata[cd->columnId]);
-
-  // removed as @alex suggests. keep it commented in case of any chance to revisit
-  // it once after vacuum code is introduced. fragment.invalidateChunkMetadataMap();
+  auto td = updel_roll.catalog->getMetadataForTable(cd->tableId);
+  auto chunk_metadata =
+      updel_roll.getChunkMetadata({td, &fragment}, cd->columnId, fragment);
+  buffer->getEncoder()->getMetadata(chunk_metadata);
 }
 
 void InsertOrderFragmenter::updateMetadata(const Catalog_Namespace::Catalog* catalog,
                                            const MetaDataKey& key,
                                            UpdelRoll& updel_roll) {
-  mapd_unique_lock<mapd_shared_mutex> writeLock(fragmentInfoMutex_);
-  if (updel_roll.chunkMetadata.count(key)) {
-    auto& fragmentInfo = *key.second;
-    const auto& chunkMetadata = updel_roll.chunkMetadata[key];
-    fragmentInfo.shadowChunkMetadataMap = chunkMetadata;
-    fragmentInfo.setChunkMetadataMap(chunkMetadata);
-    fragmentInfo.shadowNumTuples = updel_roll.numTuples[key];
-    fragmentInfo.setPhysicalNumTuples(fragmentInfo.shadowNumTuples);
-    // TODO(ppan): When fragment-level compaction is enable, the following code
-    // should suffice. When not (ie. existing code), we'll revert to update
-    // InsertOrderFragmenter::varLenColInfo_
-    /*
-    for (const auto cit : chunkMetadata) {
-      const auto& cd = *catalog->getMetadataForColumn(td->tableId, cit.first);
-      if (cd.columnType.get_size() < 0)
-        fragmentInfo.varLenColInfox[cd.columnId] = cit.second.numBytes;
-    }
-    */
-  }
+  heavyai::unique_lock<heavyai::shared_mutex> writeLock(fragmentInfoMutex_);
+  const auto chunk_metadata_map = updel_roll.getChunkMetadataMap(key);
+  auto& fragmentInfo = *key.second;
+  fragmentInfo.setChunkMetadataMap(chunk_metadata_map);
+  fragmentInfo.shadowChunkMetadataMap = fragmentInfo.getChunkMetadataMapPhysicalCopy();
+  fragmentInfo.shadowNumTuples = updel_roll.getNumTuple(key);
+  fragmentInfo.setPhysicalNumTuples(fragmentInfo.shadowNumTuples);
 }
 
 auto InsertOrderFragmenter::getChunksForAllColumns(
@@ -1006,8 +1004,8 @@ auto InsertOrderFragmenter::getChunksForAllColumns(
                                                chunk_key,
                                                memory_level,
                                                0,
-                                               chunk_meta_it->second.numBytes,
-                                               chunk_meta_it->second.numElements);
+                                               chunk_meta_it->second->numBytes,
+                                               chunk_meta_it->second->numElements);
         chunks.push_back(chunk);
       }
     }
@@ -1018,7 +1016,7 @@ auto InsertOrderFragmenter::getChunksForAllColumns(
 // get a sorted vector of offsets of rows to vacuum
 const std::vector<uint64_t> InsertOrderFragmenter::getVacuumOffsets(
     const std::shared_ptr<Chunk_NS::Chunk>& chunk) {
-  const auto data_buffer = chunk->get_buffer();
+  const auto data_buffer = chunk->getBuffer();
   const auto data_addr = data_buffer->getMemoryPtr();
   const size_t nrows_in_chunk = data_buffer->size();
   const size_t ncore = cpu_threads();
@@ -1051,7 +1049,7 @@ const std::vector<uint64_t> InsertOrderFragmenter::getVacuumOffsets(
 template <typename T>
 static void set_chunk_stats(const SQLTypeInfo& col_type,
                             int8_t* data_addr,
-                            int8_t& has_null,
+                            bool& has_null,
                             T& min,
                             T& max) {
   T v;
@@ -1069,29 +1067,23 @@ static void set_chunk_metadata(const Catalog_Namespace::Catalog* catalog,
                                const std::shared_ptr<Chunk_NS::Chunk>& chunk,
                                const size_t nrows_to_keep,
                                UpdelRoll& updel_roll) {
-  auto cd = chunk->get_column_desc();
+  auto cd = chunk->getColumnDesc();
   auto td = catalog->getMetadataForTable(cd->tableId);
-  auto data_buffer = chunk->get_buffer();
-  std::lock_guard<std::mutex> lck(updel_roll.mutex);
-  const auto key = std::make_pair(td, &fragment);
-  if (0 == updel_roll.chunkMetadata.count(key)) {
-    updel_roll.chunkMetadata[key] = fragment.getChunkMetadataMapPhysical();
-  }
-  auto& chunkMetadata = updel_roll.chunkMetadata[key];
-  chunkMetadata[cd->columnId].numElements = nrows_to_keep;
-  chunkMetadata[cd->columnId].numBytes = data_buffer->size();
-  if (updel_roll.dirtyChunks.count(chunk.get()) == 0) {
-    updel_roll.dirtyChunks.emplace(chunk.get(), chunk);
-  }
+  auto data_buffer = chunk->getBuffer();
+  auto chunkMetadata =
+      updel_roll.getChunkMetadata({td, &fragment}, cd->columnId, fragment);
+  chunkMetadata->numElements = nrows_to_keep;
+  chunkMetadata->numBytes = data_buffer->size();
+  updel_roll.addDirtyChunk(chunk, fragment.fragmentId);
 }
 
 auto InsertOrderFragmenter::vacuum_fixlen_rows(
     const FragmentInfo& fragment,
     const std::shared_ptr<Chunk_NS::Chunk>& chunk,
     const std::vector<uint64_t>& frag_offsets) {
-  const auto cd = chunk->get_column_desc();
+  const auto cd = chunk->getColumnDesc();
   const auto& col_type = cd->columnType;
-  auto data_buffer = chunk->get_buffer();
+  auto data_buffer = chunk->getBuffer();
   auto data_addr = data_buffer->getMemoryPtr();
   auto element_size =
       col_type.is_fixlen_array() ? col_type.get_size() : get_element_size(col_type);
@@ -1121,21 +1113,106 @@ auto InsertOrderFragmenter::vacuum_fixlen_rows(
   return nbytes_fix_data_to_keep;
 }
 
+// Gets the initial padding required for the chunk buffer. For variable length array
+// columns, if the first element after vacuuming is going to be a null array, a padding
+// with a value that is greater than 0 is expected.
+size_t get_null_padding(bool is_varlen_array,
+                        const std::vector<uint64_t>& frag_offsets,
+                        const StringOffsetT* index_array,
+                        size_t fragment_row_count) {
+  if (is_varlen_array) {
+    size_t first_non_deleted_row_index{0};
+    for (auto deleted_offset : frag_offsets) {
+      if (first_non_deleted_row_index < deleted_offset) {
+        break;
+      } else {
+        first_non_deleted_row_index++;
+      }
+    }
+    CHECK_LT(first_non_deleted_row_index, fragment_row_count);
+    if (first_non_deleted_row_index == 0) {
+      // If the first row in the fragment is not deleted, then the first offset in the
+      // index buffer/array already contains expected padding.
+      return index_array[0];
+    } else {
+      // If the first non-deleted element is a null array (indentified by a negative
+      // offset), get a padding value for the chunk buffer.
+      if (index_array[first_non_deleted_row_index + 1] < 0) {
+        size_t first_non_zero_offset{0};
+        for (size_t i = 0; i <= first_non_deleted_row_index; i++) {
+          if (index_array[i] != 0) {
+            first_non_zero_offset = index_array[i];
+            break;
+          }
+        }
+        CHECK_GT(first_non_zero_offset, static_cast<size_t>(0));
+        return std::min(ArrayNoneEncoder::DEFAULT_NULL_PADDING_SIZE,
+                        first_non_zero_offset);
+      } else {
+        return 0;
+      }
+    }
+  } else {
+    return 0;
+  }
+}
+
+// Gets the indexes of variable length null arrays in the chunk after vacuuming.
+std::set<size_t> get_var_len_null_array_indexes(const SQLTypeInfo sql_type_info,
+                                                const std::vector<uint64_t>& frag_offsets,
+                                                const StringOffsetT* index_array,
+                                                size_t fragment_row_count) {
+  std::set<size_t> null_array_indexes;
+  if (sql_type_info.is_varlen_array() && !sql_type_info.get_notnull()) {
+    size_t frag_offset_index{0};
+    size_t vacuum_offset{0};
+    for (size_t i = 0; i < fragment_row_count; i++) {
+      if (frag_offset_index < frag_offsets.size() &&
+          i == frag_offsets[frag_offset_index]) {
+        frag_offset_index++;
+        vacuum_offset++;
+      } else if (index_array[i + 1] < 0) {
+        null_array_indexes.emplace(i - vacuum_offset);
+      }
+    }
+  }
+  return null_array_indexes;
+}
+
+StringOffsetT get_buffer_offset(bool is_varlen_array,
+                                const StringOffsetT* index_array,
+                                size_t index) {
+  auto offset = index_array[index];
+  if (offset < 0) {
+    // Variable length arrays encode null arrays as negative offsets
+    CHECK(is_varlen_array);
+    offset = -offset;
+  }
+  return offset;
+}
+
 auto InsertOrderFragmenter::vacuum_varlen_rows(
     const FragmentInfo& fragment,
     const std::shared_ptr<Chunk_NS::Chunk>& chunk,
     const std::vector<uint64_t>& frag_offsets) {
-  auto data_buffer = chunk->get_buffer();
-  auto index_buffer = chunk->get_index_buf();
+  auto is_varlen_array = chunk->getColumnDesc()->columnType.is_varlen_array();
+  auto data_buffer = chunk->getBuffer();
+  CHECK(data_buffer);
+  auto index_buffer = chunk->getIndexBuf();
+  CHECK(index_buffer);
   auto data_addr = data_buffer->getMemoryPtr();
-  auto indices_addr = index_buffer ? index_buffer->getMemoryPtr() : nullptr;
+  auto indices_addr = index_buffer->getMemoryPtr();
+  CHECK(indices_addr);
   auto index_array = (StringOffsetT*)indices_addr;
   int64_t irow_of_blk_to_keep = 0;  // head of next row block to keep
   int64_t irow_of_blk_to_fill = 0;  // row offset to fit the kept block
-  size_t nbytes_fix_data_to_keep = 0;
-  size_t nbytes_var_data_to_keep = 0;
-  auto nrows_to_vacuum = frag_offsets.size();
   auto nrows_in_fragment = fragment.getPhysicalNumTuples();
+  size_t null_padding =
+      get_null_padding(is_varlen_array, frag_offsets, index_array, nrows_in_fragment);
+  size_t nbytes_var_data_to_keep = null_padding;
+  auto null_array_indexes = get_var_len_null_array_indexes(
+      chunk->getColumnDesc()->columnType, frag_offsets, index_array, nrows_in_fragment);
+  auto nrows_to_vacuum = frag_offsets.size();
   for (size_t irow = 0; irow <= nrows_to_vacuum; irow++) {
     auto is_last_one = irow == nrows_to_vacuum;
     auto irow_to_vacuum = is_last_one ? nrows_in_fragment : frag_offsets[irow];
@@ -1143,19 +1220,27 @@ auto InsertOrderFragmenter::vacuum_varlen_rows(
     int64_t nrows_to_keep = irow_to_vacuum - irow_of_blk_to_keep;
     if (nrows_to_keep > 0) {
       auto ibyte_var_data_to_keep = nbytes_var_data_to_keep;
+      auto deleted_row_start_offset =
+          get_buffer_offset(is_varlen_array, index_array, irow_to_vacuum);
+      auto kept_row_start_offset =
+          get_buffer_offset(is_varlen_array, index_array, irow_of_blk_to_keep);
       auto nbytes_to_keep =
-          (is_last_one ? data_buffer->size() : index_array[irow_to_vacuum]) -
-          index_array[irow_of_blk_to_keep];
+          (is_last_one ? data_buffer->size() : deleted_row_start_offset) -
+          kept_row_start_offset;
       if (irow_of_blk_to_fill != irow_of_blk_to_keep) {
-        // move curr varlen row block toward front
-        memmove(data_addr + ibyte_var_data_to_keep,
-                data_addr + index_array[irow_of_blk_to_keep],
-                nbytes_to_keep);
+        if (nbytes_to_keep > 0) {
+          CHECK(data_addr);
+          // move curr varlen row block toward front
+          memmove(data_addr + ibyte_var_data_to_keep,
+                  data_addr + kept_row_start_offset,
+                  nbytes_to_keep);
+        }
 
-        const auto index_base = index_array[irow_of_blk_to_keep];
+        const auto base_offset = kept_row_start_offset;
         for (int64_t i = 0; i < nrows_to_keep; ++i) {
-          auto& index = index_array[irow_of_blk_to_keep + i];
-          index = ibyte_var_data_to_keep + (index - index_base);
+          auto update_index = irow_of_blk_to_keep + i;
+          auto offset = get_buffer_offset(is_varlen_array, index_array, update_index);
+          index_array[update_index] = ibyte_var_data_to_keep + (offset - base_offset);
         }
       }
       nbytes_var_data_to_keep += nbytes_to_keep;
@@ -1170,9 +1255,19 @@ auto InsertOrderFragmenter::vacuum_varlen_rows(
                 nbytes_to_keep);
       }
       irow_of_blk_to_fill += nrows_to_keep;
-      nbytes_fix_data_to_keep += nbytes_to_keep;
     }
     irow_of_blk_to_keep = irow_to_vacuum + 1;
+  }
+
+  // Set expected null padding, last offset, and negative values for null array offsets.
+  index_array[0] = null_padding;
+  auto post_vacuum_row_count = nrows_in_fragment - nrows_to_vacuum;
+  index_array[post_vacuum_row_count] = nbytes_var_data_to_keep;
+  if (!is_varlen_array) {
+    CHECK(null_array_indexes.empty());
+  }
+  for (auto index : null_array_indexes) {
+    index_array[index + 1] = -1 * std::abs(index_array[index + 1]);
   }
   return nbytes_var_data_to_keep;
 }
@@ -1183,15 +1278,12 @@ void InsertOrderFragmenter::compactRows(const Catalog_Namespace::Catalog* catalo
                                         const std::vector<uint64_t>& frag_offsets,
                                         const Data_Namespace::MemoryLevel memory_level,
                                         UpdelRoll& updel_roll) {
-  auto& fragment = getFragmentInfoFromId(fragment_id);
+  auto fragment_ptr = getFragmentInfo(fragment_id);
+  auto& fragment = *fragment_ptr;
   auto chunks = getChunksForAllColumns(td, fragment, memory_level);
   const auto ncol = chunks.size();
 
-  std::vector<int8_t> has_null_per_thread(ncol, 0);
-  std::vector<double> max_double_per_thread(ncol, std::numeric_limits<double>::lowest());
-  std::vector<double> min_double_per_thread(ncol, std::numeric_limits<double>::max());
-  std::vector<int64_t> max_int64t_per_thread(ncol, std::numeric_limits<uint64_t>::min());
-  std::vector<int64_t> min_int64t_per_thread(ncol, std::numeric_limits<uint64_t>::max());
+  std::vector<ChunkUpdateStats> update_stats_per_thread(ncol);
 
   // parallel delete columns
   std::vector<std::future<void>> threads;
@@ -1201,67 +1293,68 @@ void InsertOrderFragmenter::compactRows(const Catalog_Namespace::Catalog* catalo
 
   for (size_t ci = 0; ci < chunks.size(); ++ci) {
     auto chunk = chunks[ci];
-    const auto cd = chunk->get_column_desc();
+    const auto cd = chunk->getColumnDesc();
     const auto& col_type = cd->columnType;
-    auto data_buffer = chunk->get_buffer();
-    auto index_buffer = chunk->get_index_buf();
+    auto data_buffer = chunk->getBuffer();
+    auto index_buffer = chunk->getIndexBuf();
     auto data_addr = data_buffer->getMemoryPtr();
     auto indices_addr = index_buffer ? index_buffer->getMemoryPtr() : nullptr;
     auto index_array = (StringOffsetT*)indices_addr;
     bool is_varlen = col_type.is_varlen_indeed();
 
-    auto fixlen_vacuum = [=,
-                          &has_null_per_thread,
-                          &max_double_per_thread,
-                          &min_double_per_thread,
-                          &min_int64t_per_thread,
-                          &max_int64t_per_thread,
-                          &updel_roll,
-                          &frag_offsets,
-                          &fragment] {
-      size_t nbytes_fix_data_to_keep;
-      nbytes_fix_data_to_keep = vacuum_fixlen_rows(fragment, chunk, frag_offsets);
+    auto fixlen_vacuum =
+        [=, &update_stats_per_thread, &updel_roll, &frag_offsets, &fragment] {
+          size_t nbytes_fix_data_to_keep;
+          if (nrows_to_keep == 0) {
+            nbytes_fix_data_to_keep = 0;
+          } else {
+            nbytes_fix_data_to_keep = vacuum_fixlen_rows(fragment, chunk, frag_offsets);
+          }
 
-      data_buffer->encoder->setNumElems(nrows_to_keep);
-      data_buffer->setSize(nbytes_fix_data_to_keep);
-      data_buffer->setUpdated();
+          data_buffer->getEncoder()->setNumElems(nrows_to_keep);
+          data_buffer->setSize(nbytes_fix_data_to_keep);
+          data_buffer->setUpdated();
 
-      set_chunk_metadata(catalog, fragment, chunk, nrows_to_keep, updel_roll);
+          set_chunk_metadata(catalog, fragment, chunk, nrows_to_keep, updel_roll);
 
-      auto daddr = data_addr;
-      auto element_size =
-          col_type.is_fixlen_array() ? col_type.get_size() : get_element_size(col_type);
-      for (size_t irow = 0; irow < nrows_to_keep; ++irow, daddr += element_size) {
-        if (col_type.is_fixlen_array()) {
-          auto encoder =
-              dynamic_cast<FixedLengthArrayNoneEncoder*>(data_buffer->encoder.get());
-          CHECK(encoder);
-          encoder->updateMetadata((int8_t*)daddr);
-        } else if (col_type.is_fp()) {
-          set_chunk_stats(col_type,
-                          data_addr,
-                          has_null_per_thread[ci],
-                          min_double_per_thread[ci],
-                          max_double_per_thread[ci]);
-        } else {
-          set_chunk_stats(col_type,
-                          data_addr,
-                          has_null_per_thread[ci],
-                          min_int64t_per_thread[ci],
-                          max_int64t_per_thread[ci]);
-        }
-      }
-    };
+          auto daddr = data_addr;
+          auto element_size = col_type.is_fixlen_array() ? col_type.get_size()
+                                                         : get_element_size(col_type);
+          data_buffer->getEncoder()->resetChunkStats();
+          for (size_t irow = 0; irow < nrows_to_keep; ++irow, daddr += element_size) {
+            if (col_type.is_fixlen_array()) {
+              auto encoder =
+                  dynamic_cast<FixedLengthArrayNoneEncoder*>(data_buffer->getEncoder());
+              CHECK(encoder);
+              encoder->updateMetadata((int8_t*)daddr);
+            } else if (col_type.is_fp()) {
+              set_chunk_stats(col_type,
+                              daddr,
+                              update_stats_per_thread[ci].new_values_stats.has_null,
+                              update_stats_per_thread[ci].new_values_stats.min_double,
+                              update_stats_per_thread[ci].new_values_stats.max_double);
+            } else {
+              set_chunk_stats(col_type,
+                              daddr,
+                              update_stats_per_thread[ci].new_values_stats.has_null,
+                              update_stats_per_thread[ci].new_values_stats.min_int64t,
+                              update_stats_per_thread[ci].new_values_stats.max_int64t);
+            }
+          }
+        };
 
     auto varlen_vacuum = [=, &updel_roll, &frag_offsets, &fragment] {
       size_t nbytes_var_data_to_keep;
-      nbytes_var_data_to_keep = vacuum_varlen_rows(fragment, chunk, frag_offsets);
+      if (nrows_to_keep == 0) {
+        nbytes_var_data_to_keep = 0;
+      } else {
+        nbytes_var_data_to_keep = vacuum_varlen_rows(fragment, chunk, frag_offsets);
+      }
 
-      data_buffer->encoder->setNumElems(nrows_to_keep);
+      data_buffer->getEncoder()->setNumElems(nrows_to_keep);
       data_buffer->setSize(nbytes_var_data_to_keep);
       data_buffer->setUpdated();
 
-      index_array[nrows_to_keep] = data_buffer->size();
       index_buffer->setSize(sizeof(*index_array) *
                             (nrows_to_keep ? 1 + nrows_to_keep : 0));
       index_buffer->setUpdated();
@@ -1281,20 +1374,23 @@ void InsertOrderFragmenter::compactRows(const Catalog_Namespace::Catalog* catalo
 
   wait_cleanup_threads(threads);
 
-  auto key = std::make_pair(td, &fragment);
-  updel_roll.numTuples[key] = nrows_to_keep;
+  updel_roll.setNumTuple({td, &fragment}, nrows_to_keep);
   for (size_t ci = 0; ci < chunks.size(); ++ci) {
     auto chunk = chunks[ci];
-    auto cd = chunk->get_column_desc();
+    auto cd = chunk->getColumnDesc();
     if (!cd->columnType.is_fixlen_array()) {
+      // For DATE_IN_DAYS encoded columns, data is stored in days but the metadata is
+      // stored in seconds. Do the metadata conversion here before updating the chunk
+      // stats.
+      if (cd->columnType.is_date_in_days()) {
+        auto& stats = update_stats_per_thread[ci].new_values_stats;
+        stats.min_int64t = DateConverters::get_epoch_seconds_from_days(stats.min_int64t);
+        stats.max_int64t = DateConverters::get_epoch_seconds_from_days(stats.max_int64t);
+      }
       updateColumnMetadata(cd,
                            fragment,
                            chunk,
-                           has_null_per_thread[ci],
-                           max_double_per_thread[ci],
-                           min_double_per_thread[ci],
-                           max_int64t_per_thread[ci],
-                           min_int64t_per_thread[ci],
+                           update_stats_per_thread[ci].new_values_stats,
                            cd->columnType,
                            updel_roll);
     }
@@ -1303,28 +1399,62 @@ void InsertOrderFragmenter::compactRows(const Catalog_Namespace::Catalog* catalo
 
 }  // namespace Fragmenter_Namespace
 
-void UpdelRoll::commitUpdate() {
+bool UpdelRoll::commitUpdate() {
   if (nullptr == catalog) {
-    return;
+    return false;
   }
   const auto td = catalog->getMetadataForTable(logicalTableId);
   CHECK(td);
-  // checkpoint all shards regardless, or epoch becomes out of sync
+  ChunkKey chunk_key{catalog->getDatabaseId(), td->tableId};
+  const auto table_lock = lockmgr::TableDataLockMgr::getWriteLockForTable(chunk_key);
+
+  // Checkpoint all shards. Otherwise, epochs can go out of sync.
   if (td->persistenceLevel == Data_Namespace::MemoryLevel::DISK_LEVEL) {
-    catalog->checkpoint(logicalTableId);
-  }
-  // for each dirty fragment
-  for (auto& cm : chunkMetadata) {
-    cm.first.first->fragmenter->updateMetadata(catalog, cm.first, *this);
-  }
-  dirtyChunks.clear();
-  // flush gpu dirty chunks if update was not on gpu
-  if (memoryLevel != Data_Namespace::MemoryLevel::GPU_LEVEL) {
-    for (const auto& chunkey : dirtyChunkeys) {
-      catalog->getDataMgr().deleteChunksWithPrefix(
-          chunkey, Data_Namespace::MemoryLevel::GPU_LEVEL);
+    auto table_epochs = catalog->getTableEpochs(catalog->getDatabaseId(), logicalTableId);
+    try {
+      // `checkpointWithAutoRollback` is not called here because, if a failure occurs,
+      // `dirtyChunks` has to be cleared before resetting epochs
+      catalog->checkpoint(logicalTableId);
+    } catch (...) {
+      dirty_chunks.clear();
+      catalog->setTableEpochsLogExceptions(catalog->getDatabaseId(), table_epochs);
+      throw;
     }
   }
+  updateFragmenterAndCleanupChunks();
+  return true;
+}
+
+void UpdelRoll::stageUpdate() {
+  CHECK(catalog);
+  auto db_id = catalog->getDatabaseId();
+  CHECK(table_descriptor);
+  auto table_id = table_descriptor->tableId;
+  CHECK_EQ(memoryLevel, Data_Namespace::MemoryLevel::CPU_LEVEL);
+  CHECK_EQ(table_descriptor->persistenceLevel, Data_Namespace::MemoryLevel::DISK_LEVEL);
+  try {
+    catalog->getDataMgr().checkpoint(db_id, table_id, memoryLevel);
+  } catch (...) {
+    dirty_chunks.clear();
+    throw;
+  }
+  updateFragmenterAndCleanupChunks();
+}
+
+void UpdelRoll::updateFragmenterAndCleanupChunks() {
+  // for each dirty fragment
+  for (auto& cm : chunk_metadata_map_per_fragment) {
+    cm.first.first->fragmenter->updateMetadata(catalog, cm.first, *this);
+  }
+
+  // flush gpu dirty chunks if update was not on gpu
+  if (memoryLevel != Data_Namespace::MemoryLevel::GPU_LEVEL) {
+    for (const auto& [chunk_key, chunk] : dirty_chunks) {
+      catalog->getDataMgr().deleteChunksWithPrefix(
+          chunk_key, Data_Namespace::MemoryLevel::GPU_LEVEL);
+    }
+  }
+  dirty_chunks.clear();
 }
 
 void UpdelRoll::cancelUpdate() {
@@ -1332,21 +1462,80 @@ void UpdelRoll::cancelUpdate() {
     return;
   }
 
+  // TODO: needed?
+  ChunkKey chunk_key{catalog->getDatabaseId(), logicalTableId};
+  const auto table_lock = lockmgr::TableDataLockMgr::getWriteLockForTable(chunk_key);
   if (is_varlen_update) {
-    int databaseId = catalog->getCurrentDB().dbId;
-    int32_t tableEpoch = catalog->getTableEpoch(databaseId, logicalTableId);
+    int databaseId = catalog->getDatabaseId();
+    auto table_epochs = catalog->getTableEpochs(databaseId, logicalTableId);
 
-    dirtyChunks.clear();
-    const_cast<Catalog_Namespace::Catalog*>(catalog)->setTableEpoch(
-        databaseId, logicalTableId, tableEpoch);
+    dirty_chunks.clear();
+    catalog->setTableEpochs(databaseId, table_epochs);
   } else {
     const auto td = catalog->getMetadataForTable(logicalTableId);
     CHECK(td);
     if (td->persistenceLevel != memoryLevel) {
-      for (auto dit : dirtyChunks) {
-        catalog->getDataMgr().free(dit.first->get_buffer());
-        dit.first->set_buffer(nullptr);
+      for (const auto& [chunk_key, chunk] : dirty_chunks) {
+        catalog->getDataMgr().free(chunk->getBuffer());
+        chunk->setBuffer(nullptr);
       }
     }
   }
+}
+
+void UpdelRoll::addDirtyChunk(std::shared_ptr<Chunk_NS::Chunk> chunk,
+                              int32_t fragment_id) {
+  heavyai::unique_lock<heavyai::shared_mutex> lock(chunk_update_tracker_mutex);
+  CHECK(catalog);
+  ChunkKey chunk_key{catalog->getDatabaseId(),
+                     chunk->getColumnDesc()->tableId,
+                     chunk->getColumnDesc()->columnId,
+                     fragment_id};
+  dirty_chunks[chunk_key] = chunk;
+}
+
+void UpdelRoll::initializeUnsetMetadata(
+    const TableDescriptor* td,
+    Fragmenter_Namespace::FragmentInfo& fragment_info) {
+  heavyai::unique_lock<heavyai::shared_mutex> lock(chunk_update_tracker_mutex);
+  MetaDataKey key{td, &fragment_info};
+  if (chunk_metadata_map_per_fragment.count(key) == 0) {
+    chunk_metadata_map_per_fragment[key] =
+        fragment_info.getChunkMetadataMapPhysicalCopy();
+  }
+  if (num_tuples.count(key) == 0) {
+    num_tuples[key] = fragment_info.shadowNumTuples;
+  }
+}
+
+std::shared_ptr<ChunkMetadata> UpdelRoll::getChunkMetadata(
+    const MetaDataKey& key,
+    int32_t column_id,
+    Fragmenter_Namespace::FragmentInfo& fragment_info) {
+  initializeUnsetMetadata(key.first, fragment_info);
+  heavyai::shared_lock<heavyai::shared_mutex> lock(chunk_update_tracker_mutex);
+  auto metadata_map_it = chunk_metadata_map_per_fragment.find(key);
+  CHECK(metadata_map_it != chunk_metadata_map_per_fragment.end());
+  auto chunk_metadata_it = metadata_map_it->second.find(column_id);
+  CHECK(chunk_metadata_it != metadata_map_it->second.end());
+  return chunk_metadata_it->second;
+}
+
+ChunkMetadataMap UpdelRoll::getChunkMetadataMap(const MetaDataKey& key) const {
+  heavyai::shared_lock<heavyai::shared_mutex> lock(chunk_update_tracker_mutex);
+  auto metadata_map_it = chunk_metadata_map_per_fragment.find(key);
+  CHECK(metadata_map_it != chunk_metadata_map_per_fragment.end());
+  return metadata_map_it->second;
+}
+
+size_t UpdelRoll::getNumTuple(const MetaDataKey& key) const {
+  heavyai::shared_lock<heavyai::shared_mutex> lock(chunk_update_tracker_mutex);
+  auto it = num_tuples.find(key);
+  CHECK(it != num_tuples.end());
+  return it->second;
+}
+
+void UpdelRoll::setNumTuple(const MetaDataKey& key, size_t num_tuple) {
+  heavyai::unique_lock<heavyai::shared_mutex> lock(chunk_update_tracker_mutex);
+  num_tuples[key] = num_tuple;
 }

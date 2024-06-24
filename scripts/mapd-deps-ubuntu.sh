@@ -3,6 +3,51 @@
 set -e
 set -x
 
+# Parse inputs
+TSAN=false
+COMPRESS=false
+NOCUDA=false
+CACHE=
+
+while (( $# )); do
+  case "$1" in
+    --compress)
+      COMPRESS=true
+      ;;
+    --savespace)
+      SAVE_SPACE=true
+      ;;
+    --tsan)
+      TSAN=true
+      ;;
+    --nocuda)
+      NOCUDA=true
+      ;;
+    --cache=*)
+      CACHE="${1#*=}"
+      ;;
+    *)
+      break
+      ;;
+  esac
+  shift
+done
+
+if [[ -n $CACHE && ( ! -d $CACHE  ||  ! -w $CACHE )  ]]; then
+  # To prevent possible mistakes CACHE must be a writable directory
+  echo "Invalid cache argument [$CACHE] supplied. Ignoring."
+  CACHE=
+fi
+
+if [[ ! -x  "$(command -v sudo)" ]] ; then
+  if [ "$EUID" -eq 0 ] ; then
+    yum install -y sudo
+  else
+    echo "ERROR - sudo not installed and not running as root"
+    exit
+  fi
+fi
+
 HTTP_DEPS="https://dependencies.mapd.com/thirdparty"
 
 SUFFIX=${SUFFIX:=$(date +%Y%m%d)}
@@ -10,36 +55,45 @@ PREFIX=/usr/local/mapd-deps
 
 SCRIPTS_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 source $SCRIPTS_DIR/common-functions.sh
+
+# Establish distro
 source /etc/os-release
+if [ "$ID" == "ubuntu" ] ; then
+  PACKAGER="apt -y"
+  if [ "$VERSION_ID" != "20.04" ] && [ "$VERSION_ID" != "19.10" ] && [ "$VERSION_ID" != "19.04" ] && [ "$VERSION_ID" != "18.04" ]; then
+    echo "Ubuntu 20.04, 19.10, 19.04, and 18.04 are the only debian-based releases supported by this script"
+    exit 1
+  fi
+else
+  echo "Only Ubuntu is supported by this script"
+  exit 1
+fi
 
 sudo mkdir -p $PREFIX
 sudo chown -R $(id -u) $PREFIX
+# create a  txt file in $PREFIX
 
-sudo apt update
-sudo apt install -y \
+# this should be based on the actual distro and arch, but they're the same files.
+DEBIAN_FRONTEND=noninteractive sudo apt-key adv --fetch-keys https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/3bf863cc.pub
+
+DEBIAN_FRONTEND=noninteractive sudo apt update
+
+DEBIAN_FRONTEND=noninteractive sudo apt install -y \
     software-properties-common \
     build-essential \
     ccache \
-    cmake \
-    cmake-curses-gui \
     git \
     wget \
     curl \
-    gcc \
-    g++ \
     libboost-all-dev \
-    libgoogle-glog-dev \
-    golang \
     libssl-dev \
     libevent-dev \
     default-jre \
     default-jre-headless \
     default-jdk \
     default-jdk-headless \
-    maven \
     libncurses5-dev \
     libldap2-dev \
-    binutils-dev \
     google-perftools \
     libdouble-conversion-dev \
     libevent-dev \
@@ -61,7 +115,7 @@ sudo apt install -y \
     autoconf-archive \
     automake \
     bison \
-    flex-old \
+    flex \
     libpng-dev \
     rsync \
     unzip \
@@ -69,109 +123,100 @@ sudo apt install -y \
     python-dev \
     python-yaml \
     swig \
+    pkg-config \
     libxerces-c-dev \
-    libxmlsec1-dev
+    libxmlsec1-dev \
+    libtool \
+    patchelf \
+    libxrandr-dev \
+    libxinerama-dev \
+    libxcursor-dev \
+    libxi-dev
 
-# Needed to find xmltooling and xml_security_c
+# required for gcc-11 on Ubuntu < 22.04
+if [ "$VERSION_ID" == "20.04" ] || [ "$VERSION_ID" == "19.04" ] || [ "$VERSION_ID" == "18.04" ]; then
+  DEBIAN_FRONTEND=noninteractive sudo add-apt-repository ppa:ubuntu-toolchain-r/test
+fi
+
+sudo $PACKAGER install \
+  gcc-11 \
+  g++-11
+
+# Set up gcc-11 as default gcc
+sudo update-alternatives \
+  --install /usr/bin/gcc gcc /usr/bin/gcc-11 1100 \
+  --slave /usr/bin/g++ g++ /usr/bin/g++-11
+
+generate_deps_version_file
+
+# Needed to find sqlite3, xmltooling, xml_security_c, and LLVM (for iwyu)
 export PKG_CONFIG_PATH=$PREFIX/lib/pkgconfig:$PREFIX/lib64/pkgconfig:$PKG_CONFIG_PATH
+export PATH=$PREFIX/bin:$PATH
+
+if [ "$VERSION_ID" == "18.04" ]; then
+  # Required for TBB
+  download_make_install https://mirrors.sarata.com/gnu/binutils/binutils-2.32.tar.xz
+else
+  DEBIAN_FRONTEND=noninteractive sudo apt install -y binutils-dev
+fi
+
+# mold fast linker
+install_mold_precompiled_x86_64
+
+install_ninja
+
+install_maven
+
+install_cmake
+
+install_memkind
 
 # llvm
 # (see common-functions.sh)
+LLVM_BUILD_DYLIB=true
 install_llvm
 
-# GEO STUFF
-# expat
-download_make_install https://github.com/libexpat/libexpat/releases/download/R_2_2_5/expat-2.2.5.tar.bz2
-# kml
-download ${HTTP_DEPS}/libkml-master.zip
-unzip -u libkml-master.zip
-pushd libkml-master
-./autogen.sh || true
-CXXFLAGS="-std=c++03" ./configure --with-expat-include-dir=$PREFIX/include/ --with-expat-lib-dir=$PREFIX/lib --prefix=$PREFIX --enable-static --disable-java --disable-python --disable-swig
-makej
-make install
-popd
-# proj.4
-download_make_install ${HTTP_DEPS}/proj-5.2.0.tar.gz
-# gdal
-download_make_install ${HTTP_DEPS}/gdal-2.3.2.tar.xz "" "--without-geos --with-libkml=$PREFIX --with-proj=$PREFIX"
+# c-blosc
+install_blosc
+
+# Geo Support
+install_gdal
+install_geos
+install_pdal
 
 # install AWS core and s3 sdk
 install_awscpp -j $(nproc)
 
-VERS=0.11.0
-wget --continue http://apache.claz.org/thrift/$VERS/thrift-$VERS.tar.gz
-tar xvf thrift-$VERS.tar.gz
-pushd thrift-$VERS
-CFLAGS="-fPIC" CXXFLAGS="-fPIC" JAVA_PREFIX=$PREFIX/lib ./configure \
-    --with-lua=no \
-    --with-python=no \
-    --with-php=no \
-    --with-ruby=no \
-    --with-qt4=no \
-    --with-qt5=no \
-    --prefix=$PREFIX
-make -j $(nproc)
-make install
-popd
+# thrift
+install_thrift
 
-#c-blosc
-VERS=1.14.4
-wget --continue https://github.com/Blosc/c-blosc/archive/v$VERS.tar.gz
-tar xvf v$VERS.tar.gz
-BDIR="c-blosc-$VERS/build"
-rm -rf "$BDIR"
-mkdir -p "$BDIR"
-pushd "$BDIR"
-cmake \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_INSTALL_PREFIX=$PREFIX \
-    -DBUILD_BENCHMARKS=off \
-    -DBUILD_TESTS=off \
-    -DPREFER_EXTERNAL_SNAPPY=off \
-    -DPREFER_EXTERNAL_ZLIB=off \
-    -DPREFER_EXTERNAL_ZSTD=off \
-    ..
-make -j $(nproc)
-make install
-popd
+VERS=3.52.16
+CFLAGS="-fPIC" CXXFLAGS="-fPIC" download_make_install ${HTTP_DEPS}/libiodbc-${VERS}.tar.gz
 
-VERS=2019.04.29.00
-download https://github.com/facebook/folly/archive/v$VERS.tar.gz
-extract v$VERS.tar.gz
-pushd folly-$VERS/build/
-CXXFLAGS="-fPIC -pthread" cmake -DCMAKE_INSTALL_PREFIX=$PREFIX -DBUILD_SHARED_LIBS=on ..
-makej
-make install
-popd
+install_folly
+
+install_iwyu
 
 download_make_install ${HTTP_DEPS}/bisonpp-1.21-45.tar.gz bison++-1.21
+
+# TBB
+install_tbb
+
+# OneDAL
+install_onedal
 
 # Apache Arrow (see common-functions.sh)
 ARROW_BOOST_USE_SHARED="ON"
 install_arrow
 
-VERS=3.0.2
-wget --continue https://github.com/cginternals/glbinding/archive/v$VERS.tar.gz
-tar xvf v$VERS.tar.gz
-mkdir -p glbinding-$VERS/build
-pushd glbinding-$VERS/build
-cmake \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_INSTALL_PREFIX=$PREFIX \
-    -DOPTION_BUILD_DOCS=OFF \
-    -DOPTION_BUILD_EXAMPLES=OFF \
-    -DOPTION_BUILD_GPU_TESTS=OFF \
-    -DOPTION_BUILD_TESTS=OFF \
-    -DOPTION_BUILD_TOOLS=OFF \
-    -DOPTION_BUILD_WITH_BOOST_THREAD=OFF \
-    ..
-make -j $(nproc)
-make install
-popd
+# Go
+install_go
+
+# librdkafka
+install_rdkafka
 
 # glslang (with spirv-tools)
-VERS=7.11.3113 # 2/8/19
+VERS=11.6.0 # stable 8/25/21
 rm -rf glslang
 mkdir -p glslang
 pushd glslang
@@ -192,7 +237,7 @@ popd # glslang-$VERS
 popd # glslang
 
 # spirv-cross
-VERS=2019-04-26
+VERS=2020-06-29 # latest from 6/29/20
 rm -rf spirv-cross
 mkdir -p spirv-cross
 pushd spirv-cross
@@ -204,6 +249,7 @@ pushd build
 cmake \
     -DCMAKE_BUILD_TYPE=RelWithDebInfo \
     -DCMAKE_INSTALL_PREFIX=$PREFIX \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=on \
     -DSPIRV_CROSS_ENABLE_TESTS=off \
     ..
 make -j $(nproc)
@@ -213,43 +259,95 @@ popd # SPIRV-Cross-$VERS
 popd # spirv-cross
 
 # Vulkan
-VERS=1.1.101.0 # 3/1/19
-rm -rf vulkan
-mkdir -p vulkan
-pushd vulkan
-wget --continue --no-cookies ${HTTP_DEPS}/vulkansdk-linux-x86_64-$VERS.tar.gz -O vulkansdk-linux-x86_64-$VERS.tar.gz
-tar xvf vulkansdk-linux-x86_64-$VERS.tar.gz
-rsync -av $VERS/x86_64/* $PREFIX
-popd # vulkan
+install_vulkan
 
+# GLM (GL Mathematics)
+install_glm
+
+# GLFW
+VERS=3.3.6
+download https://github.com/glfw/glfw/archive/refs/tags/${VERS}.tar.gz
+extract ${VERS}.tar.gz
+pushd glfw-${VERS}
+mkdir -p build
+pushd build
+cmake \
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+    -DCMAKE_INSTALL_PREFIX=$PREFIX \
+    -DBUILD_SHARED_LIBS=ON \
+    -DGLFW_BUILD_EXAMPLES=OFF \
+    -DGLFW_BUILD_TESTS=OFF \
+    -DGLFW_BUILD_DOCS=OFF \
+    ..
+make -j $(nproc)
+make install
+popd #build
+popd #glfw
+
+# ImGui
+VERS=1.89.1-docking
+rm -rf imgui
+mkdir -p imgui
+pushd imgui
+wget --continue ${HTTP_DEPS}/imgui.$VERS.tar.gz
+tar xvf imgui.$VERS.tar.gz
+mkdir -p $PREFIX/include
+mkdir -p $PREFIX/include/imgui
+rsync -av imgui.$VERS/* $PREFIX/include/imgui
+popd #imgui
+
+# ImPlot
+VERS=0.14
+rm -rf implot
+mkdir -p implot
+pushd implot
+wget --continue ${HTTP_DEPS}/implot.$VERS.tar.gz
+tar xvf implot.$VERS.tar.gz
+# Patch #includes for imgui.h / imgui_internal.h
+pushd implot.$VERS
+sudo patch -p0 < $SCRIPTS_DIR/implot-0.14_fix_imgui_includes.patch
+popd
+mkdir -p $PREFIX/include
+mkdir -p $PREFIX/include/implot
+rsync -av implot.$VERS/* $PREFIX/include/implot
+popd #implot
 
 # OpenSAML
 download_make_install ${HTTP_DEPS}/xml-security-c-2.0.2.tar.gz "" "--without-xalan"
 download_make_install ${HTTP_DEPS}/xmltooling-3.0.4-nolog4shib.tar.gz
-download_make_install ${HTTP_DEPS}/opensaml-3.0.1-nolog4shib.tar.gz
+CXXFLAGS="-std=c++14" download_make_install ${HTTP_DEPS}/opensaml-3.0.1-nolog4shib.tar.gz
 
 cat > $PREFIX/mapd-deps.sh <<EOF
-PREFIX=$PREFIX
+HEAVY_PREFIX=$PREFIX
 
 LD_LIBRARY_PATH=/usr/local/cuda/lib64:\$LD_LIBRARY_PATH
-LD_LIBRARY_PATH=\$PREFIX/lib:\$LD_LIBRARY_PATH
-LD_LIBRARY_PATH=\$PREFIX/lib64:\$LD_LIBRARY_PATH
+LD_LIBRARY_PATH=\$HEAVY_PREFIX/lib:\$LD_LIBRARY_PATH
+LD_LIBRARY_PATH=\$HEAVY_PREFIX/lib64:\$LD_LIBRARY_PATH
 
 PATH=/usr/local/cuda/bin:\$PATH
-PATH=\$PREFIX/bin:\$PATH
+PATH=\$HEAVY_PREFIX/go/bin:\$PATH
+PATH=\$HEAVY_PREFIX/maven/bin:\$PATH
+PATH=\$HEAVY_PREFIX/bin:\$PATH
 
-VULKAN_SDK=\$PREFIX
-VK_LAYER_PATH=\$PREFIX/etc/explicit_layer.d
+VULKAN_SDK=\$HEAVY_PREFIX
+VK_LAYER_PATH=\$HEAVY_PREFIX/etc/vulkan/explicit_layer.d
 
-CMAKE_PREFIX_PATH=\$PREFIX:\$CMAKE_PREFIX_PATH
+CMAKE_PREFIX_PATH=\$HEAVY_PREFIX:\$CMAKE_PREFIX_PATH
 
-export LD_LIBRARY_PATH PATH VULKAN_SDK VK_LAYER_PATH CMAKE_PREFIX_PATH
+GOROOT=\$HEAVY_PREFIX/go
+
+export LD_LIBRARY_PATH PATH VULKAN_SDK VK_LAYER_PATH CMAKE_PREFIX_PATH GOROOT
 EOF
 
 echo
 echo "Done. Be sure to source the 'mapd-deps.sh' file to pick up the required environment variables:"
 echo "    source $PREFIX/mapd-deps.sh"
 
-if [ "$1" = "--compress" ] ; then
-    tar acf mapd-deps-ubuntu-$VERSION_ID-$SUFFIX.tar.xz -C $PREFIX .
+if [ "$COMPRESS" = "true" ] ; then
+    if [ "$TSAN" = "false" ]; then
+      TARBALL_TSAN=""
+    elif [ "$TSAN" = "true" ]; then
+      TARBALL_TSAN="tsan-"
+    fi
+    tar acvf mapd-deps-ubuntu-${VERSION_ID}-${TARBALL_TSAN}${SUFFIX}.tar.xz -C ${PREFIX} .
 fi

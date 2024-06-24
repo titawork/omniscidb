@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 OmniSci, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,6 +20,9 @@
 
 #include "../Analyzer/Analyzer.h"
 #include "Execute.h"
+#include "Shared/DbObjectKeys.h"
+
+class AbstractMLModel;
 
 // Code generation utility to be used for queries and scalar expressions.
 class CodeGenerator {
@@ -39,18 +42,32 @@ class CodeGenerator {
                                     const bool fetch_columns,
                                     const CompilationOptions&);
 
+  llvm::Value* codegenPerRowStringOper(const Analyzer::StringOper* string_oper,
+                                       const CompilationOptions& co);
+
+  llvm::Value* codegenPseudoStringOper(
+      const Analyzer::ColumnVar*,
+      const std::vector<StringOps_Namespace::StringOpInfo>& string_op_infos,
+      const CompilationOptions&);
+
   // Generates constant values in the literal buffer of a query.
   std::vector<llvm::Value*> codegenHoistedConstants(
       const std::vector<const Analyzer::Constant*>& constants,
       const EncodingType enc_type,
-      const int dict_id);
+      const shared::StringDictKey& dict_id);
 
-  llvm::ConstantInt* codegenIntConst(const Analyzer::Constant* constant);
+  static llvm::ConstantInt* codegenIntConst(const Analyzer::Constant* constant,
+                                            CgenState* cgen_state);
 
   llvm::Value* codegenCastBetweenIntTypes(llvm::Value* operand_lv,
                                           const SQLTypeInfo& operand_ti,
                                           const SQLTypeInfo& ti,
                                           bool upscale = true);
+
+  void codegenCastBetweenIntTypesOverflowChecks(llvm::Value* operand_lv,
+                                                const SQLTypeInfo& operand_ti,
+                                                const SQLTypeInfo& ti,
+                                                const int64_t scale);
 
   // Generates the index of the current row in the context of query execution.
   llvm::Value* posArg(const Analyzer::Expr*) const;
@@ -64,51 +81,90 @@ class CodeGenerator {
       const std::vector<llvm::Function*>& roots,
       const std::vector<llvm::Function*>& leaves);
 
-  static std::unique_ptr<llvm::ExecutionEngine> generateNativeCPUCode(
+  static ExecutionEngineWrapper generateNativeCPUCode(
       llvm::Function* func,
       const std::unordered_set<llvm::Function*>& live_funcs,
       const CompilationOptions& co);
 
   static std::string generatePTX(const std::string& cuda_llir,
                                  llvm::TargetMachine* nvptx_target_machine,
-                                 CgenState* cgen_state);
+                                 llvm::LLVMContext& context);
 
-  static std::unique_ptr<llvm::TargetMachine> initializeNVPTXBackend();
+  static std::unique_ptr<llvm::TargetMachine> initializeNVPTXBackend(
+      const CudaMgr_Namespace::NvidiaDeviceArch arch);
 
-  struct GPUCode {
-    std::vector<std::pair<void*, void*>> native_functions;
-    std::vector<std::tuple<void*, llvm::ExecutionEngine*, GpuCompilationContext*>>
-        cached_functions;
-  };
+  static bool alwaysCloneRuntimeFunction(const llvm::Function* func);
 
   struct GPUTarget {
     llvm::TargetMachine* nvptx_target_machine;
     const CudaMgr_Namespace::CudaMgr* cuda_mgr;
-    unsigned block_size;
     CgenState* cgen_state;
     bool row_func_not_inlined;
   };
 
-  static GPUCode generateNativeGPUCode(
+  static void linkModuleWithLibdevice(Executor* executor,
+                                      llvm::Module& module,
+                                      llvm::PassManagerBuilder& pass_manager_builder,
+                                      const GPUTarget& gpu_target);
+
+  static std::shared_ptr<GpuCompilationContext> generateNativeGPUCode(
+      Executor* executor,
       llvm::Function* func,
       llvm::Function* wrapper_func,
       const std::unordered_set<llvm::Function*>& live_funcs,
+      const bool is_gpu_smem_used,
       const CompilationOptions& co,
       const GPUTarget& gpu_target);
 
+  static void link_udf_module(const std::unique_ptr<llvm::Module>& udf_module,
+                              llvm::Module& module,
+                              CgenState* cgen_state,
+                              llvm::Linker::Flags flags = llvm::Linker::Flags::None);
+
   static bool prioritizeQuals(const RelAlgExecutionUnit& ra_exe_unit,
                               std::vector<Analyzer::Expr*>& primary_quals,
-                              std::vector<Analyzer::Expr*>& deferred_quals);
+                              std::vector<Analyzer::Expr*>& deferred_quals,
+                              const PlanState::HoistedFiltersSet& hoisted_quals);
 
   struct ExecutorRequired : public std::runtime_error {
     ExecutorRequired()
         : std::runtime_error("Executor required to generate this expression") {}
   };
 
+  struct NullCheckCodegen {
+    NullCheckCodegen(CgenState* cgen_state,
+                     Executor* executor,
+                     llvm::Value* nullable_lv,
+                     const SQLTypeInfo& nullable_ti,
+                     const std::string& name = "");
+
+    llvm::Value* finalize(llvm::Value* null_lv, llvm::Value* notnull_lv);
+
+    CgenState* cgen_state{nullptr};
+    std::string name;
+    llvm::BasicBlock* nullcheck_bb{nullptr};
+    llvm::PHINode* nullcheck_value{nullptr};
+    std::unique_ptr<DiamondCodegen> null_check;
+  };
+
+  static ArrayLoadCodegen codegenGeoArrayLoadAndNullcheck(llvm::Value* byte_stream,
+                                                          llvm::Value* pos,
+                                                          const SQLTypeInfo& ti,
+                                                          CgenState* cgen_state);
+
+  llvm::Value* codegenCastBetweenTimestamps(llvm::Value* ts_lv,
+                                            const SQLTypeInfo& operand_dimen,
+                                            const SQLTypeInfo& target_dimen,
+                                            const bool nullable);
+
+  // Generate the position for the given window function and the query iteration position.
+  llvm::Value* codegenWindowPosition(const WindowFunctionContext* window_func_context,
+                                     llvm::Value* pos_arg);
+
  private:
   std::vector<llvm::Value*> codegen(const Analyzer::Constant*,
                                     const EncodingType enc_type,
-                                    const int dict_id,
+                                    const shared::StringDictKey& dict_id,
                                     const CompilationOptions&);
 
   virtual std::vector<llvm::Value*> codegenColumn(const Analyzer::ColumnVar*,
@@ -162,6 +218,32 @@ class CodeGenerator {
 
   llvm::Value* codegen(const Analyzer::KeyForStringExpr*, const CompilationOptions&);
 
+  llvm::Value* codegen(const Analyzer::SampleRatioExpr*, const CompilationOptions&);
+
+  llvm::Value* codegen(const Analyzer::WidthBucketExpr*, const CompilationOptions&);
+
+  llvm::Value* codegenConstantWidthBucketExpr(const Analyzer::WidthBucketExpr*,
+                                              const CompilationOptions&);
+
+  llvm::Value* codegenWidthBucketExpr(const Analyzer::WidthBucketExpr*,
+                                      const CompilationOptions&);
+
+  llvm::Value* codegen(const Analyzer::MLPredictExpr*, const CompilationOptions&);
+
+  llvm::Value* codegen(const Analyzer::PCAProjectExpr*, const CompilationOptions&);
+
+  llvm::Value* codegenLinRegPredict(const Analyzer::MLPredictExpr*,
+                                    const std::string& model_name,
+                                    const std::shared_ptr<AbstractMLModel>& model,
+                                    const CompilationOptions&);
+
+  llvm::Value* codegenTreeRegPredict(const Analyzer::MLPredictExpr*,
+                                     const std::string& model_name,
+                                     const std::shared_ptr<AbstractMLModel>& model,
+                                     const CompilationOptions&);
+
+  llvm::Value* codegen(const Analyzer::StringOper*, const CompilationOptions&);
+
   llvm::Value* codegen(const Analyzer::LikeExpr*, const CompilationOptions&);
 
   llvm::Value* codegen(const Analyzer::RegexpExpr*, const CompilationOptions&);
@@ -175,6 +257,38 @@ class CodeGenerator {
   std::vector<llvm::Value*> codegenArrayExpr(const Analyzer::ArrayExpr*,
                                              const CompilationOptions&);
 
+  std::vector<llvm::Value*> codegenGeoColumnVar(const Analyzer::GeoColumnVar*,
+                                                const bool fetch_columns,
+                                                const CompilationOptions& co);
+
+  std::vector<llvm::Value*> codegenGeoExpr(const Analyzer::GeoExpr*,
+                                           const CompilationOptions&);
+
+  std::vector<llvm::Value*> codegenGeoConstant(const Analyzer::GeoConstant*,
+                                               const CompilationOptions&);
+
+  std::vector<llvm::Value*> codegenGeoOperator(const Analyzer::GeoOperator*,
+                                               const CompilationOptions&);
+
+  std::vector<llvm::Value*> codegenGeoUOper(const Analyzer::GeoUOper*,
+                                            const CompilationOptions&);
+
+  std::vector<llvm::Value*> codegenGeoBinOper(const Analyzer::GeoBinOper*,
+                                              const CompilationOptions&);
+
+  std::vector<llvm::Value*> codegenGeosPredicateCall(const std::string&,
+                                                     std::vector<llvm::Value*>,
+                                                     const CompilationOptions&);
+
+  std::vector<llvm::Value*> codegenGeosConstructorCall(const std::string&,
+                                                       std::vector<llvm::Value*>,
+                                                       llvm::Value*,
+                                                       const CompilationOptions&);
+
+  std::vector<llvm::Value*> codegenGeoArgs(
+      const std::vector<std::shared_ptr<Analyzer::Expr>>&,
+      const CompilationOptions&);
+
   llvm::Value* codegenFunctionOper(const Analyzer::FunctionOper*,
                                    const CompilationOptions&);
 
@@ -186,10 +300,12 @@ class CodeGenerator {
 
   llvm::Value* codegen(const Analyzer::UOper*, const CompilationOptions&);
 
-  std::vector<llvm::Value*> codegenHoistedConstantsLoads(const SQLTypeInfo& type_info,
-                                                         const EncodingType enc_type,
-                                                         const int dict_id,
-                                                         const int16_t lit_off);
+  std::vector<llvm::Value*> codegenHoistedConstantsLoads(
+      const SQLTypeInfo& type_info,
+      const EncodingType enc_type,
+      const shared::StringDictKey& dict_id,
+      const int16_t lit_off,
+      const size_t lit_bytes);
 
   std::vector<llvm::Value*> codegenHoistedConstantsPlaceholders(
       const SQLTypeInfo& type_info,
@@ -202,18 +318,19 @@ class CodeGenerator {
                                           const bool update_query_plan,
                                           const CompilationOptions&);
 
-  llvm::Value* codegenFixedLengthColVar(const Analyzer::ColumnVar* col_var,
-                                        llvm::Value* col_byte_stream,
-                                        llvm::Value* pos_arg);
+  llvm::Value* codegenFixedLengthColVar(
+      const Analyzer::ColumnVar* col_var,
+      llvm::Value* col_byte_stream,
+      llvm::Value* pos_arg,
+      const WindowFunctionContext* window_function_context = nullptr);
 
   // Generates code for a fixed length column when a window function is active.
-  llvm::Value* codegenFixedLengthColVarInWindow(const Analyzer::ColumnVar* col_var,
-                                                llvm::Value* col_byte_stream,
-                                                llvm::Value* pos_arg);
-
-  // Generate the position for the given window function and the query iteration position.
-  llvm::Value* codegenWindowPosition(WindowFunctionContext* window_func_context,
-                                     llvm::Value* pos_arg);
+  llvm::Value* codegenFixedLengthColVarInWindow(
+      const Analyzer::ColumnVar* col_var,
+      llvm::Value* col_byte_stream,
+      llvm::Value* pos_arg,
+      const CompilationOptions& co,
+      const WindowFunctionContext* window_function_context = nullptr);
 
   std::vector<llvm::Value*> codegenVariableLengthStringColVar(
       llvm::Value* col_byte_stream,
@@ -229,24 +346,32 @@ class CodeGenerator {
       const bool fetch_column,
       const CompilationOptions& co);
 
-  llvm::Value* codegenIntArith(const Analyzer::BinOper*, llvm::Value*, llvm::Value*);
+  llvm::Value* codegenIntArith(const Analyzer::BinOper*,
+                               llvm::Value*,
+                               llvm::Value*,
+                               const CompilationOptions&);
 
   llvm::Value* codegenFpArith(const Analyzer::BinOper*, llvm::Value*, llvm::Value*);
+
+  llvm::Value* codegenCastTimestampToTime(llvm::Value* ts_lv,
+                                          const int dimen,
+                                          const bool nullable);
 
   llvm::Value* codegenCastTimestampToDate(llvm::Value* ts_lv,
                                           const int dimen,
                                           const bool nullable);
-
-  llvm::Value* codegenCastBetweenTimestamps(llvm::Value* ts_lv,
-                                            const int operand_dimen,
-                                            const int target_dimen,
-                                            const bool nullable);
 
   llvm::Value* codegenCastFromString(llvm::Value* operand_lv,
                                      const SQLTypeInfo& operand_ti,
                                      const SQLTypeInfo& ti,
                                      const bool operand_is_const,
                                      const CompilationOptions& co);
+
+  llvm::Value* codegenCastNonStringToString(llvm::Value* operand_lv,
+                                            const SQLTypeInfo& operand_ti,
+                                            const SQLTypeInfo& ti,
+                                            const bool operand_is_const,
+                                            const CompilationOptions& co);
 
   llvm::Value* codegenCastToFp(llvm::Value* operand_lv,
                                const SQLTypeInfo& operand_ti,
@@ -261,14 +386,16 @@ class CodeGenerator {
                           llvm::Value*,
                           const std::string& null_typename,
                           const std::string& null_check_suffix,
-                          const SQLTypeInfo&);
+                          const SQLTypeInfo&,
+                          const CompilationOptions&);
 
   llvm::Value* codegenSub(const Analyzer::BinOper*,
                           llvm::Value*,
                           llvm::Value*,
                           const std::string& null_typename,
                           const std::string& null_check_suffix,
-                          const SQLTypeInfo&);
+                          const SQLTypeInfo&,
+                          const CompilationOptions&);
 
   void codegenSkipOverflowCheckForNull(llvm::Value* lhs_lv,
                                        llvm::Value* rhs_lv,
@@ -281,6 +408,7 @@ class CodeGenerator {
                           const std::string& null_typename,
                           const std::string& null_check_suffix,
                           const SQLTypeInfo&,
+                          const CompilationOptions&,
                           bool downscale = true);
 
   llvm::Value* codegenDiv(llvm::Value*,
@@ -318,11 +446,11 @@ class CodeGenerator {
                                       const Analyzer::Expr*,
                                       const CompilationOptions&);
 
-  llvm::Value* codegenOverlaps(const SQLOps,
-                               const SQLQualifier,
-                               const std::shared_ptr<Analyzer::Expr>,
-                               const std::shared_ptr<Analyzer::Expr>,
-                               const CompilationOptions&);
+  llvm::Value* codegenBoundingBoxIntersect(const SQLOps,
+                                           const SQLQualifier,
+                                           const std::shared_ptr<Analyzer::Expr>,
+                                           const std::shared_ptr<Analyzer::Expr>,
+                                           const CompilationOptions&);
 
   llvm::Value* codegenStrCmp(const SQLOps,
                              const SQLQualifier,
@@ -358,7 +486,7 @@ class CodeGenerator {
 
   // Returns the IR value which holds true iff at least one match has been found for outer
   // join, null if there's no outer join condition on the given nesting level.
-  llvm::Value* foundOuterJoinMatch(const ssize_t nesting_level) const;
+  llvm::Value* foundOuterJoinMatch(const size_t nesting_level) const;
 
   llvm::Value* resolveGroupedColumnReference(const Analyzer::ColumnVar*);
 
@@ -371,6 +499,8 @@ class CodeGenerator {
   std::shared_ptr<const Analyzer::ColumnVar> hashJoinLhsTuple(
       const Analyzer::ColumnVar* rhs,
       const Analyzer::BinOper* tautological_eq) const;
+
+  bool needCastForHashJoinLhs(const Analyzer::ColumnVar* rhs) const;
 
   std::unique_ptr<InValuesBitmap> createInValuesBitmap(const Analyzer::InValues*,
                                                        const CompilationOptions&);
@@ -385,22 +515,144 @@ class CodeGenerator {
     llvm::BasicBlock* orig_bb;
   };
 
-  ArgNullcheckBBs beginArgsNullcheck(const Analyzer::FunctionOper* function_oper,
-                                     const std::vector<llvm::Value*>& orig_arg_lvs);
+  std::tuple<ArgNullcheckBBs, llvm::Value*> beginArgsNullcheck(
+      const Analyzer::FunctionOper* function_oper,
+      const std::vector<llvm::Value*>& orig_arg_lvs);
 
   llvm::Value* endArgsNullcheck(const ArgNullcheckBBs&,
+                                llvm::Value*,
                                 llvm::Value*,
                                 const Analyzer::FunctionOper*);
 
   llvm::Value* codegenFunctionOperNullArg(const Analyzer::FunctionOper*,
                                           const std::vector<llvm::Value*>&);
 
+  llvm::Value* codegenCompression(const SQLTypeInfo& type_info);
+
+  std::pair<llvm::Value*, llvm::Value*> codegenArrayBuff(llvm::Value* chunk,
+                                                         llvm::Value* row_pos,
+                                                         SQLTypes array_type,
+                                                         bool cast_and_extend);
+
+  void codegenBufferArgs(const std::string& udf_func_name,
+                         size_t param_num,
+                         llvm::Value* buffer_buf,
+                         llvm::Value* buffer_size,
+                         llvm::Value* buffer_is_null,
+                         std::vector<llvm::Value*>& output_args);
+
+  llvm::StructType* createPointStructType(const std::string& udf_func_name,
+                                          size_t param_num);
+
+  void codegenGeoPointArgs(const std::string& udf_func_name,
+                           size_t param_num,
+                           llvm::Value* point_buf,
+                           llvm::Value* point_size,
+                           llvm::Value* compression,
+                           llvm::Value* input_srid,
+                           llvm::Value* output_srid,
+                           std::vector<llvm::Value*>& output_args);
+
+  llvm::StructType* createMultiPointStructType(const std::string& udf_func_name,
+                                               size_t param_num);
+
+  void codegenGeoMultiPointArgs(const std::string& udf_func_name,
+                                size_t param_num,
+                                llvm::Value* multi_point_buf,
+                                llvm::Value* multi_point_size,
+                                // TODO: bounds?
+                                llvm::Value* compression,
+                                llvm::Value* input_srid,
+                                llvm::Value* output_srid,
+                                std::vector<llvm::Value*>& output_args);
+
+  llvm::StructType* createLineStringStructType(const std::string& udf_func_name,
+                                               size_t param_num);
+
+  void codegenGeoLineStringArgs(const std::string& udf_func_name,
+                                size_t param_num,
+                                llvm::Value* line_string_buf,
+                                llvm::Value* line_string_size,
+                                llvm::Value* compression,
+                                llvm::Value* input_srid,
+                                llvm::Value* output_srid,
+                                std::vector<llvm::Value*>& output_args);
+
+  llvm::StructType* createMultiLineStringStructType(const std::string& udf_func_name,
+                                                    size_t param_num);
+
+  void codegenGeoMultiLineStringArgs(const std::string& udf_func_name,
+                                     size_t param_num,
+                                     llvm::Value* multi_linestring_coords,
+                                     llvm::Value* multi_linestring_size,
+                                     llvm::Value* linestring_sizes,
+                                     llvm::Value* linestring_sizes_size,
+                                     // TODO: bounds?
+                                     llvm::Value* compression,
+                                     llvm::Value* input_srid,
+                                     llvm::Value* output_srid,
+                                     std::vector<llvm::Value*>& output_args);
+
+  llvm::StructType* createPolygonStructType(const std::string& udf_func_name,
+                                            size_t param_num);
+
+  void codegenGeoPolygonArgs(const std::string& udf_func_name,
+                             size_t param_num,
+                             llvm::Value* polygon_buf,
+                             llvm::Value* polygon_size,
+                             llvm::Value* ring_sizes_buf,
+                             llvm::Value* num_rings,
+                             llvm::Value* compression,
+                             llvm::Value* input_srid,
+                             llvm::Value* output_srid,
+                             std::vector<llvm::Value*>& output_args);
+
+  llvm::StructType* createMultiPolygonStructType(const std::string& udf_func_name,
+                                                 size_t param_num);
+
+  void codegenGeoMultiPolygonArgs(const std::string& udf_func_name,
+                                  size_t param_num,
+                                  llvm::Value* polygon_coords,
+                                  llvm::Value* polygon_coords_size,
+                                  llvm::Value* ring_sizes_buf,
+                                  llvm::Value* ring_sizes,
+                                  llvm::Value* polygon_bounds,
+                                  llvm::Value* polygon_bounds_sizes,
+                                  llvm::Value* compression,
+                                  llvm::Value* input_srid,
+                                  llvm::Value* output_srid,
+                                  std::vector<llvm::Value*>& output_args);
+
   std::vector<llvm::Value*> codegenFunctionOperCastArgs(
       const Analyzer::FunctionOper*,
       const ExtensionFunction*,
       const std::vector<llvm::Value*>&,
+      const std::vector<size_t>&,
       const std::unordered_map<llvm::Value*, llvm::Value*>&,
       const CompilationOptions&);
+
+  llvm::StructType* createStringViewStructType();
+
+  // Return LLVM intrinsic providing fast arithmetic with overflow check
+  // for the given binary operation.
+  llvm::Function* getArithWithOverflowIntrinsic(const Analyzer::BinOper* bin_oper,
+                                                llvm::Type* type);
+
+  // Generate code for the given binary operation with overflow check.
+  // Signed integer add, sub and mul operations are supported. Overflow
+  // check is performed using LLVM arithmetic intrinsics which are not
+  // supported for GPU. Return the IR value which holds operation result.
+  llvm::Value* codegenBinOpWithOverflowForCPU(const Analyzer::BinOper* bin_oper,
+                                              llvm::Value* lhs_lv,
+                                              llvm::Value* rhs_lv,
+                                              const std::string& null_check_suffix,
+                                              const SQLTypeInfo& ti);
+
+  std::pair<std::vector<llvm::Value*>, std::unique_ptr<CodeGenerator::NullCheckCodegen>>
+  codegenStringFetchAndEncode(const Analyzer::StringOper* expr,
+                              const CompilationOptions& co,
+                              const size_t arg_idx,
+                              const bool codegen_nullcheck);
 
   Executor* executor_;
 
@@ -414,14 +666,22 @@ class CodeGenerator {
 
   CgenState* cgen_state_;
   PlanState* plan_state_;
+  friend class GroupByAndAggregate;
+
+ private:
+  // mutex to protect the critical section in initializeNVPTXBackend
+  static std::mutex initialize_nvptx_mutex_;
+  // mutex to protect the critical sections in
+  // generateNativeCPUCode/create_execution_engine
+  static std::mutex initialize_cpu_backend_mutex_;
 };
 
 // Code generator specialized for scalar expressions which doesn't require an executor.
 class ScalarCodeGenerator : public CodeGenerator {
  public:
   // Constructor which takes the runtime module.
-  ScalarCodeGenerator(std::unique_ptr<llvm::Module> module)
-      : CodeGenerator(nullptr, nullptr), module_(std::move(module)) {}
+  ScalarCodeGenerator(std::unique_ptr<llvm::Module> llvm_module)
+      : CodeGenerator(nullptr, nullptr), module_(std::move(llvm_module)) {}
 
   // Function generated for a given analyzer expression. For GPU, a wrapper which meets
   // the kernel signature constraints (returns void, takes all arguments as pointers) is
@@ -443,7 +703,8 @@ class ScalarCodeGenerator : public CodeGenerator {
   // NB: this is separated from the compile method to allow building higher level code
   // generators which can inline the IR for evaluating a single expression (for example
   // loops).
-  std::vector<void*> generateNativeCode(const CompiledExpression& compiled_expression,
+  std::vector<void*> generateNativeCode(Executor* executor,
+                                        const CompiledExpression& compiled_expression,
                                         const CompilationOptions& co);
 
   CudaMgr_Namespace::CudaMgr* getCudaMgr() const { return cuda_mgr_.get(); }
@@ -460,15 +721,30 @@ class ScalarCodeGenerator : public CodeGenerator {
   // map to be used during code generation.
   ColumnMap prepare(const Analyzer::Expr*);
 
-  std::vector<void*> generateNativeGPUCode(llvm::Function* func,
+  std::vector<void*> generateNativeGPUCode(Executor* executor,
+                                           llvm::Function* func,
                                            llvm::Function* wrapper_func,
                                            const CompilationOptions& co);
 
   std::unique_ptr<llvm::Module> module_;
-  std::unique_ptr<llvm::ExecutionEngine> execution_engine_;
+  ExecutionEngineWrapper execution_engine_;
   std::unique_ptr<CgenState> own_cgen_state_;
   std::unique_ptr<PlanState> own_plan_state_;
   std::unique_ptr<CudaMgr_Namespace::CudaMgr> cuda_mgr_;
-  std::vector<std::unique_ptr<GpuCompilationContext>> gpu_compilation_contexts_;
+  std::shared_ptr<GpuCompilationContext> gpu_compilation_context_;
   std::unique_ptr<llvm::TargetMachine> nvptx_target_machine_;
 };
+
+/**
+ * Makes a shallow copy (just declarations) of the runtime module. Function definitions
+ * are cloned only if they're used from the generated code.
+ */
+std::unique_ptr<llvm::Module> runtime_module_shallow_copy(CgenState* cgen_state);
+
+/**
+ *  Loads individual columns from a single, packed pointers buffer (the byte stream arg)
+ */
+std::vector<llvm::Value*> generate_column_heads_load(const int num_columns,
+                                                     llvm::Value* byte_stream_arg,
+                                                     llvm::IRBuilder<>& ir_builder,
+                                                     llvm::LLVMContext& ctx);

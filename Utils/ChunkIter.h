@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,9 +16,10 @@
 
 /**
  * @file ChunkIter.h
- * @author Wei Hong <wei@mapd.com>
+ * @brief
  *
  */
+
 #ifndef _CHUNK_ITER_H_
 #define _CHUNK_ITER_H_
 
@@ -50,5 +51,16 @@ DEVICE void ChunkIter_get_nth(ChunkIter* it,
                               VarlenDatum* vd,
                               bool* is_end);
 DEVICE void ChunkIter_get_nth(ChunkIter* it, int nth, ArrayDatum* vd, bool* is_end);
-
+DEVICE void ChunkIter_get_nth_varlen(ChunkIter* it,
+                                     int nth,
+                                     ArrayDatum* vd,
+                                     bool* is_end);
+DEVICE void ChunkIter_get_nth_varlen_notnull(ChunkIter* it,
+                                             int nth,
+                                             ArrayDatum* vd,
+                                             bool* is_end);
+DEVICE void ChunkIter_get_nth_point_coords(ChunkIter* it,
+                                           int nth,
+                                           ArrayDatum* vd,
+                                           bool* is_end);
 #endif  // _CHUNK_ITER_H_

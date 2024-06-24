@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,27 +14,29 @@
  * limitations under the License.
  */
 
-#ifndef PARSER_RESERVEDKEYWORDS_H
-#define PARSER_RESERVEDKEYWORDS_H
+#pragma once
 
 #include <set>
 #include <string>
 
 static std::set<std::string> reserved_keywords{
 
-    // MapD reserved keywords
+    // OmniSci reserved keywords
 
     "ACCESS",
     "ADD",  // legacy
     "AMMSC",
+    "ARCHIVE",
     "ASC",
     "CONTINUE",
     "COPY",
     "DASHBOARD",
     "DATABASE",
+    "DATAFRAME",
     "DATETIME",
     "DATE_TRUNC",
     "DESC",
+    "DUMP",
     "EDIT",
     "EDITOR",
     "FIRST",
@@ -45,8 +47,10 @@ static std::set<std::string> reserved_keywords{
     "ILIKE",
     "LAST",
     "LENGTH",
-    "LINESTRING",    // geo type
-    "MULTIPOLYGON",  // geo type
+    "LINESTRING",       // geo type
+    "MULTILINESTRING",  // geo type
+    "MULTIPOINT",       // geo type
+    "MULTIPOLYGON",     // geo type
     "NOW",
     "NULLX",
     "OPTION",
@@ -55,6 +59,7 @@ static std::set<std::string> reserved_keywords{
     "PRIVILEGES",
     "PUBLIC",
     "RENAME",
+    "RESTORE",
     "ROLE",   // permissions
     "ROWID",  // hidden column name
     "SCHEMA",
@@ -223,6 +228,7 @@ static std::set<std::string> reserved_keywords{
     "INTERVAL",
     "INTO",
     "IS",
+    "JAROWINKLER_SIMILARITY"
     "JOIN",
     "LAG",
     "LANGUAGE",
@@ -232,6 +238,7 @@ static std::set<std::string> reserved_keywords{
     "LEAD",
     "LEADING",
     "LEFT",
+    "LEVENSHTEIN_DISTANCE"
     "LIKE",
     "LIKE_REGEX",
     "LIMIT",
@@ -240,6 +247,8 @@ static std::set<std::string> reserved_keywords{
     "LOCALTIME",
     "LOCALTIMESTAMP",
     "LOWER",
+    "LPAD",
+    "LTRIM",
     "MATCH",
     "MATCHES",
     "MATCH_NUMBER",
@@ -318,6 +327,9 @@ static std::set<std::string> reserved_keywords{
     "REF",
     "REFERENCES",
     "REFERENCING",
+    "REGEXP_REPLACE",
+    "REGEXP_SUBSTR",
+    "REGEXP_MATCH"
     "REGR_AVGX",
     "REGR_AVGY",
     "REGR_COUNT",
@@ -328,10 +340,13 @@ static std::set<std::string> reserved_keywords{
     "REGR_SXY",
     "REGR_SYY",
     "RELEASE",
+    "REPEAT",
+    "REPLACE",
     "RESET",
     "RESULT",
     "RETURN",
     "RETURNS",
+    "REVERSE",
     "REVOKE",
     "RIGHT",
     "ROLLBACK",
@@ -339,7 +354,9 @@ static std::set<std::string> reserved_keywords{
     "ROW",
     "ROWS",
     "ROW_NUMBER",
+    "RPAD",
     "RUNNING",
+    "RTRIM",
     "SAVEPOINT",
     "SCOPE",
     "SCROLL",
@@ -357,6 +374,7 @@ static std::set<std::string> reserved_keywords{
     "SOME",
     "SPECIFIC",
     "SPECIFICTYPE",
+    "SPLIT_PART",
     "SQL",
     "SQLEXCEPTION",
     "SQLSTATE",
@@ -370,7 +388,6 @@ static std::set<std::string> reserved_keywords{
     "SUBMULTISET",
     "SUBSET",
     "SUBSTRING",
-    "SUBSTRING_REGEX",
     "SUCCEEDS",
     "SUM",
     "SYMMETRIC",
@@ -396,6 +413,7 @@ static std::set<std::string> reserved_keywords{
     "TRIM_ARRAY",
     "TRUE",
     "TRUNCATE",
+    "TRY_CAST",
     "UESCAPE",
     "UNION",
     "UNIQUE",
@@ -425,5 +443,3 @@ static std::set<std::string> reserved_keywords{
     "WITHOUT",
     "YEAR",
 };
-
-#endif  // PARSER_RESERVEDKEYWORDS_H

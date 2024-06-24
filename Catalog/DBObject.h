@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,24 +14,22 @@
  * limitations under the License.
  */
 
-/*
- * File:   DBObject.h
- * Author: norair
+/**
+ * @file   DBObject.h
  * @brief  Class specification and related data structures for DBObject class.
  *
  * To support access privileges of DB users to DB entities (tables, columns, views, etc),
  * the users are granted roles and included in the corresponding object of the Role class,
  * and DB entities are being described as objects of DBObjects class
  *
- * Created on May 16, 2017, 03:30 PM
  */
 
 #ifndef DBOBJECT_H
 #define DBOBJECT_H
 
-#include <glog/logging.h>
 #include <string>
 #include <unordered_set>
+#include "Logger/Logger.h"
 
 namespace Catalog_Namespace {
 class Catalog;
@@ -44,7 +42,8 @@ enum DBObjectType {
   DatabaseDBObjectType,
   TableDBObjectType,
   DashboardDBObjectType,
-  ViewDBObjectType
+  ViewDBObjectType,
+  ServerDBObjectType
 };
 
 std::string DBObjectTypeToString(DBObjectType type);
@@ -122,6 +121,14 @@ struct ViewPrivileges {
       CREATE_VIEW | DROP_VIEW | SELECT_FROM_VIEW | INSERT_INTO_VIEW;
 };
 
+struct ServerPrivileges {
+  static const int32_t ALL = -1;
+  static const int32_t CREATE_SERVER = 1 << 0;
+  static const int32_t DROP_SERVER = 1 << 1;
+  static const int32_t ALTER_SERVER = 1 << 2;
+  static const int32_t SERVER_USAGE = 1 << 3;
+};
+
 struct AccessPrivileges {
   int64_t privileges;
 
@@ -175,6 +182,13 @@ struct AccessPrivileges {
   static const AccessPrivileges UPDATE_IN_VIEW;
   static const AccessPrivileges DELETE_FROM_VIEW;
   static const AccessPrivileges TRUNCATE_VIEW;
+
+  // server permissions
+  static const AccessPrivileges ALL_SERVER;
+  static const AccessPrivileges CREATE_SERVER;
+  static const AccessPrivileges DROP_SERVER;
+  static const AccessPrivileges ALTER_SERVER;
+  static const AccessPrivileges SERVER_USAGE;
 };
 
 class DBObject {
@@ -188,11 +202,22 @@ class DBObject {
       , objectPrivs_(privs)
       , ownerId_(owner){};
   DBObject(const DBObject& object);
+  DBObject(const std::string& name,
+           DBObjectType type,
+           DBObjectKey key,
+           AccessPrivileges privs,
+           int32_t owner)
+      : objectName_(name)
+      , objectType_(type)
+      , objectKey_(key)
+      , objectPrivs_(privs)
+      , ownerId_(owner){};
   ~DBObject() {}
 
   void setObjectType(const DBObjectType& objectType);
   void setName(std::string name) { objectName_ = name; }
   std::string getName() const { return objectName_; }
+  DBObjectType getType() const { return objectType_; }
   DBObjectKey getObjectKey() const {
     CHECK(-1 != objectKey_.dbId); /** load key not called? */
     return objectKey_;
@@ -211,6 +236,11 @@ class DBObject {
   std::vector<std::string> toString() const;
   void loadKey();
   void loadKey(const Catalog_Namespace::Catalog& catalog);
+
+  bool valid() const {
+    return (objectType_ != AbstractDBObjectType && objectKey_.permissionType != -1 &&
+            objectKey_.dbId != -1);
+  }
 
  private:
   std::string objectName_;

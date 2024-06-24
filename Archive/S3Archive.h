@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,7 +20,10 @@
 #include <cstdio>
 #include <exception>
 #include <map>
+#include <optional>
+#include <string>
 #include <thread>
+#include <vector>
 #include "Archive.h"
 
 #include <openssl/evp.h>
@@ -38,18 +41,6 @@
 class S3Archive : public Archive {
  public:
   S3Archive(const std::string& url, const bool plain_text) : Archive(url, plain_text) {
-// init aws api should be singleton because because
-// it's bad to call Aws::InitAPI and Aws::ShutdownAPI
-// multiple times.
-#ifdef HAVE_AWS_S3
-    {
-      std::unique_lock<std::mutex> lck(awsapi_mtx);
-      if (0 == awsapi_count++) {
-        Aws::InitAPI(awsapi_options);
-      }
-    }
-#endif  // HAVE_AWS_S3
-
     // these envs are on server side so are global settings
     // which make few senses in case of private s3 resources
     char* env;
@@ -62,6 +53,10 @@ class S3Archive : public Archive {
     if (0 != (env = getenv("AWS_SECRET_ACCESS_KEY"))) {
       s3_secret_key = env;
     }
+    if (0 != (env = getenv("AWS_SESSION_TOKEN"))) {
+      s3_session_token = env;
+    }
+
     if (0 != (env = getenv("AWS_ENDPOINT"))) {
       s3_endpoint = env;
     }
@@ -70,19 +65,32 @@ class S3Archive : public Archive {
   S3Archive(const std::string& url,
             const std::string& s3_access_key,
             const std::string& s3_secret_key,
+            const std::string& s3_session_token,
             const std::string& s3_region,
             const std::string& s3_endpoint,
-            const bool plain_text)
+            const bool plain_text,
+            const std::optional<std::string>& regex_path_filter,
+            const std::optional<std::string>& file_sort_order_by,
+            const std::optional<std::string>& file_sort_regex,
+            const std::string& s3_temp_dir_path = {})
       : S3Archive(url, plain_text) {
     this->s3_access_key = s3_access_key;
     this->s3_secret_key = s3_secret_key;
+    this->s3_session_token = s3_session_token;
     this->s3_region = s3_region;
     this->s3_endpoint = s3_endpoint;
+    this->regex_path_filter = regex_path_filter;
+    this->file_sort_order_by = file_sort_order_by;
+    this->file_sort_regex = file_sort_regex;
 
-    // this must be local to omnisci_server not client
-    // or posix dir path accessible to omnisci_server
-    auto env_s3_temp_dir = getenv("TMPDIR");
-    s3_temp_dir = env_s3_temp_dir ? env_s3_temp_dir : "/tmp";
+    if (s3_temp_dir_path.empty()) {
+      // this must be local to heavydb not client
+      // or posix dir path accessible to heavydb
+      auto env_s3_temp_dir = getenv("TMPDIR");
+      s3_temp_dir = env_s3_temp_dir ? env_s3_temp_dir : "/tmp";
+    } else {
+      s3_temp_dir = s3_temp_dir_path;
+    }
   }
 
   ~S3Archive() override {
@@ -92,26 +100,25 @@ class S3Archive : public Archive {
         thread.join();
       }
     }
-    std::unique_lock<std::mutex> lck(awsapi_mtx);
-    if (0 == --awsapi_count) {
-      Aws::ShutdownAPI(awsapi_options);
-      // somehow, with -DPREFER_STATIC_LIBS=ON, any s3 activity causes following SAML
-      // logins to fail with an error "OpenSSL:Hash - Error loading Message Digest"
-      // (due to a unknown hash algorithm). Reloading related openssl stuff seems
-      // the only fix i can think of, though it is the best fix for sure ...
-      OpenSSL_add_all_algorithms();
-      OpenSSL_add_all_ciphers();
-      OpenSSL_add_all_digests();
-    }
 #endif  // HAVE_AWS_S3
   }
 
+#ifdef HAVE_AWS_S3
   void init_for_read() override;
-  const std::vector<std::string>& get_objkeys() { return objkeys; }
+#else
+  void init_for_read() override {
+    throw std::runtime_error("AWS S3 support not available");
+  }
+#endif
+  const std::vector<std::string>& get_objkeys() {
+    return objkeys;
+  }
 #ifdef HAVE_AWS_S3
   const std::string land(const std::string& objkey,
                          std::exception_ptr& teptr,
-                         const bool for_detection);
+                         const bool for_detection,
+                         const bool allow_named_pipe_use = true,
+                         const bool track_file_paths = true);
   void vacuum(const std::string& objkey);
 #else
   const std::string land(const std::string& objkey,
@@ -123,7 +130,9 @@ class S3Archive : public Archive {
     throw std::runtime_error("AWS S3 support not available");
   }
 #endif  // HAVE_AWS_S3
-  size_t get_total_file_size() const { return total_file_size; }
+  size_t get_total_file_size() const {
+    return total_file_size;
+  }
 
  private:
 #ifdef HAVE_AWS_S3
@@ -136,12 +145,16 @@ class S3Archive : public Archive {
 #endif                        // HAVE_AWS_S3
   std::string s3_access_key;  // per-query credentials to override the
   std::string s3_secret_key;  // settings in ~/.aws/credentials or environment
+  std::string s3_session_token;
   std::string s3_region;
   std::string s3_endpoint;
   std::string s3_temp_dir;
 
   std::string bucket_name;
   std::string prefix_name;
+  std::optional<std::string> regex_path_filter;
+  std::optional<std::string> file_sort_order_by;
+  std::optional<std::string> file_sort_regex;
   std::vector<std::string> objkeys;
   std::map<const std::string, const std::string> file_paths;
   size_t total_file_size{0};
@@ -152,13 +165,23 @@ class S3ParquetArchive : public S3Archive {
   S3ParquetArchive(const std::string& url,
                    const std::string& s3_access_key,
                    const std::string& s3_secret_key,
+                   const std::string& s3_session_token,
                    const std::string& s3_region,
                    const std::string& s3_endpoint,
-                   const bool plain_text)
-      : S3Archive(url, s3_access_key, s3_secret_key, s3_region, s3_endpoint, plain_text) {
-  }
-
- private:
+                   const bool plain_text,
+                   const std::optional<std::string>& regex_path_filter,
+                   const std::optional<std::string>& file_sort_order_by,
+                   const std::optional<std::string>& file_sort_regex)
+      : S3Archive(url,
+                  s3_access_key,
+                  s3_secret_key,
+                  s3_session_token,
+                  s3_region,
+                  s3_endpoint,
+                  plain_text,
+                  regex_path_filter,
+                  file_sort_order_by,
+                  file_sort_regex) {}
 };
 
 #endif /* ARCHIVE_S3ARCHIVE_H_ */

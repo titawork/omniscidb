@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,10 +14,11 @@
  * limitations under the License.
  */
 
-#ifndef CPUBUFFERMGR_H
-#define CPUBUFFERMGR_H
+#pragma once
 
-#include "../BufferMgr.h"
+#include "DataMgr/BufferMgr/BufferMgr.h"
+
+#include "DataMgr/Allocators/ArenaAllocator.h"
 
 namespace CudaMgr_Namespace {
 class CudaMgr;
@@ -27,25 +28,47 @@ namespace Buffer_Namespace {
 
 class CpuBufferMgr : public BufferMgr {
  public:
-  CpuBufferMgr(const int deviceId,
-               const size_t maxBufferSize,
-               CudaMgr_Namespace::CudaMgr* cudaMgr,
-               const size_t bufferAllocIncrement = 2147483648,
-               const size_t pageSize = 512,
-               AbstractBufferMgr* parentMgr = 0);
+  CpuBufferMgr(const int device_id,
+               const size_t max_buffer_pool_size,
+               CudaMgr_Namespace::CudaMgr* cuda_mgr,
+               const size_t min_slab_size,
+               const size_t max_slab_size,
+               const size_t page_size,
+               AbstractBufferMgr* parent_mgr = nullptr)
+      : BufferMgr(device_id,
+                  max_buffer_pool_size,
+                  min_slab_size,
+                  max_slab_size,
+                  page_size,
+                  parent_mgr)
+      , cuda_mgr_(cuda_mgr) {
+    initializeMem();
+  }
+
+  ~CpuBufferMgr() override {
+    /* the destruction of the allocator automatically frees all memory */
+  }
+
   inline MgrType getMgrType() override { return CPU_MGR; }
   inline std::string getStringMgrType() override { return ToString(CPU_MGR); }
-  ~CpuBufferMgr() override;
+
+  // Used for testing.
+  void setAllocator(std::unique_ptr<DramArena> allocator) {
+    allocator_ = std::move(allocator);
+  }
+
+ protected:
+  void addSlab(const size_t slab_size) override;
+  void freeAllMem() override;
+  void allocateBuffer(BufferList::iterator segment_iter,
+                      const size_t page_size,
+                      const size_t initial_size) override;
+  virtual void initializeMem();
+
+  CudaMgr_Namespace::CudaMgr* cuda_mgr_;
 
  private:
-  void addSlab(const size_t slabSize) override;
-  void freeAllMem() override;
-  void allocateBuffer(BufferList::iterator segIt,
-                      const size_t pageSize,
-                      const size_t initialSize) override;
-  CudaMgr_Namespace::CudaMgr* cudaMgr_;
+  std::unique_ptr<DramArena> allocator_;
 };
 
 }  // namespace Buffer_Namespace
-
-#endif  // CPUBUFFERMGR_H

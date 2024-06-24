@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,7 +21,7 @@
 #include "BufferCompaction.h"
 #include "TypePunning.h"
 
-#include <glog/logging.h>
+#include "Logger/Logger.h"
 
 inline void set_component(int8_t* group_by_buffer,
                           const size_t comp_sz,
@@ -70,7 +70,7 @@ inline std::vector<int64_t> compact_init_vals(
     const std::vector<int64_t>& init_vec,
     const QueryMemoryDescriptor& query_mem_desc) {
   std::vector<int64_t> cmpt_res(cmpt_size, 0);
-  int8_t* buffer_ptr = reinterpret_cast<int8_t*>(&cmpt_res[0]);
+  int8_t* buffer_ptr = reinterpret_cast<int8_t*>(cmpt_res.data());
   for (size_t col_idx = 0, init_vec_idx = 0, col_count = query_mem_desc.getSlotCount();
        col_idx < col_count;
        ++col_idx) {

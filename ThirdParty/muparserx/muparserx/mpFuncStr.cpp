@@ -38,7 +38,7 @@
 
 #include "mpValue.h"
 #include "mpError.h"
-#include <glog/logging.h>
+#include "Logger/Logger.h"
 
 
 MUP_NAMESPACE_START

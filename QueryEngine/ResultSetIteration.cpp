@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,23 +16,26 @@
 
 /**
  * @file    ResultSetIteration.cpp
- * @author  Alex Suhan <alex@mapd.com>
  * @brief   Iteration part of the row set interface.
  *
- * Copyright (c) 2014 MapD Technologies, Inc.  All rights reserved.
  */
 
-#include "../Shared/geo_types.h"
-#include "../Shared/likely.h"
 #include "Execute.h"
+#include "Geospatial/Compression.h"
+#include "Geospatial/Types.h"
 #include "ParserNode.h"
+#include "QueryEngine/QueryEngine.h"
 #include "QueryEngine/TargetValue.h"
+#include "QueryEngine/Utils/FlatBuffer.h"
 #include "ResultSet.h"
 #include "ResultSetGeoSerialization.h"
 #include "RuntimeFunctions.h"
 #include "Shared/SqlTypesLayout.h"
+#include "Shared/likely.h"
 #include "Shared/sqltypes.h"
 #include "TypePunning.h"
+
+#include <boost/math/special_functions/fpclassify.hpp>
 
 #include <memory>
 #include <utility>
@@ -49,9 +52,10 @@ TargetValue make_avg_target_value(const int8_t* ptr1,
   CHECK(target_info.agg_kind == kAVG);
   const bool float_argument_input = takes_float_argument(target_info);
   const auto actual_compact_sz1 = float_argument_input ? sizeof(float) : compact_sz1;
-  if (target_info.agg_arg_type.is_integer() || target_info.agg_arg_type.is_decimal()) {
+  const auto& agg_ti = target_info.agg_arg_type;
+  if (agg_ti.is_integer() || agg_ti.is_decimal()) {
     sum = read_int_from_buff(ptr1, actual_compact_sz1);
-  } else if (target_info.agg_arg_type.is_fp()) {
+  } else if (agg_ti.is_fp()) {
     switch (actual_compact_sz1) {
       case 8: {
         double d = *reinterpret_cast<const double*>(ptr1);
@@ -71,13 +75,6 @@ TargetValue make_avg_target_value(const int8_t* ptr1,
   }
   const auto count = read_int_from_buff(ptr2, compact_sz2);
   return pair_to_double({sum, count}, target_info.sql_type, false);
-}
-
-// Gets the byte offset, starting from the beginning of the row targets buffer, of
-// the value in position slot_idx (only makes sense for row-wise representation).
-size_t get_byteoff_of_slot(const size_t slot_idx,
-                           const QueryMemoryDescriptor& query_mem_desc) {
-  return query_mem_desc.getPaddedColWidthForRange(0, slot_idx);
 }
 
 // Given the entire buffer for the result set, buff, finds the beginning of the
@@ -112,12 +109,19 @@ const int8_t* advance_col_buff_to_slot(const int8_t* buff,
 }
 }  // namespace
 
+// Gets the byte offset, starting from the beginning of the row targets buffer, of
+// the value in position slot_idx (only makes sense for row-wise representation).
+size_t result_set::get_byteoff_of_slot(const size_t slot_idx,
+                                       const QueryMemoryDescriptor& query_mem_desc) {
+  return query_mem_desc.getPaddedColWidthForRange(0, slot_idx);
+}
+
 std::vector<TargetValue> ResultSet::getRowAt(
     const size_t global_entry_idx,
     const bool translate_strings,
     const bool decimal_to_double,
     const bool fixup_count_distinct_pointers,
-    const bool skip_non_lazy_columns /* = false*/) const {
+    const std::vector<bool>& targets_to_skip /* = {}*/) const {
   const auto storage_lookup_result =
       fixup_count_distinct_pointers
           ? StorageLookupResult{storage_.get(), global_entry_idx, 0}
@@ -127,7 +131,6 @@ std::vector<TargetValue> ResultSet::getRowAt(
   if (!fixup_count_distinct_pointers && storage->isEmptyEntry(local_entry_idx)) {
     return {};
   }
-
   const auto buff = storage->buff_;
   CHECK(buff);
   std::vector<TargetValue> row;
@@ -144,12 +147,11 @@ std::vector<TargetValue> ResultSet::getRowAt(
         align_to_int64(get_key_bytes_rowwise(query_mem_desc_));
     rowwise_target_ptr = keys_ptr + key_bytes_with_padding;
   }
-  for (size_t target_idx = 0; target_idx < storage_->targets_.size(); ++target_idx) {
-    const auto& agg_info = storage_->targets_[target_idx];
+  for (size_t target_idx = 0; target_idx < storage->targets_.size(); ++target_idx) {
+    const auto& agg_info = storage->targets_[target_idx];
     if (query_mem_desc_.didOutputColumnar()) {
-      if (skip_non_lazy_columns) {
-        row.push_back(!lazy_fetch_info_.empty() &&
-                              lazy_fetch_info_[target_idx].is_lazily_fetched
+      if (UNLIKELY(!targets_to_skip.empty())) {
+        row.push_back(!targets_to_skip[target_idx]
                           ? getTargetValueFromBufferColwise(crt_col_ptr,
                                                             keys_ptr,
                                                             storage->query_mem_desc_,
@@ -179,15 +181,29 @@ std::vector<TargetValue> ResultSet::getRowAt(
                                                 storage->query_mem_desc_,
                                                 separate_varlen_storage_valid_);
     } else {
-      row.push_back(getTargetValueFromBufferRowwise(rowwise_target_ptr,
-                                                    keys_ptr,
-                                                    global_entry_idx,
-                                                    agg_info,
-                                                    target_idx,
-                                                    agg_col_idx,
-                                                    translate_strings,
-                                                    decimal_to_double,
-                                                    fixup_count_distinct_pointers));
+      if (UNLIKELY(!targets_to_skip.empty())) {
+        row.push_back(!targets_to_skip[target_idx]
+                          ? getTargetValueFromBufferRowwise(rowwise_target_ptr,
+                                                            keys_ptr,
+                                                            global_entry_idx,
+                                                            agg_info,
+                                                            target_idx,
+                                                            agg_col_idx,
+                                                            translate_strings,
+                                                            decimal_to_double,
+                                                            fixup_count_distinct_pointers)
+                          : nullptr);
+      } else {
+        row.push_back(getTargetValueFromBufferRowwise(rowwise_target_ptr,
+                                                      keys_ptr,
+                                                      global_entry_idx,
+                                                      agg_info,
+                                                      target_idx,
+                                                      agg_col_idx,
+                                                      translate_strings,
+                                                      decimal_to_double,
+                                                      fixup_count_distinct_pointers));
+      }
       rowwise_target_ptr = advance_target_ptr_row_wise(rowwise_target_ptr,
                                                        agg_info,
                                                        agg_col_idx,
@@ -256,13 +272,13 @@ std::vector<TargetValue> ResultSet::getRowAt(const size_t logical_index) const {
 
 std::vector<TargetValue> ResultSet::getRowAtNoTranslations(
     const size_t logical_index,
-    const bool skip_non_lazy_columns /* = false*/) const {
+    const std::vector<bool>& targets_to_skip /* = {}*/) const {
   if (logical_index >= entryCount()) {
     return {};
   }
   const auto entry_idx =
       permutation_.empty() ? logical_index : permutation_[logical_index];
-  return getRowAt(entry_idx, false, false, false, skip_non_lazy_columns);
+  return getRowAt(entry_idx, false, false, false, targets_to_skip);
 }
 
 bool ResultSet::isRowAtEmpty(const size_t logical_index) const {
@@ -296,30 +312,30 @@ std::vector<TargetValue> ResultSet::getNextRowUnlocked(
     fetched_so_far_ = 1;
     return {explanation_};
   }
-  while (fetched_so_far_ < drop_first_) {
-    const auto row = getNextRowImpl(translate_strings, decimal_to_double);
-    if (row.empty()) {
-      return row;
-    }
-  }
   return getNextRowImpl(translate_strings, decimal_to_double);
 }
 
 std::vector<TargetValue> ResultSet::getNextRowImpl(const bool translate_strings,
                                                    const bool decimal_to_double) const {
-  auto entry_buff_idx = advanceCursorToNextEntry();
-  if (keep_first_ && fetched_so_far_ >= drop_first_ + keep_first_) {
-    return {};
-  }
+  size_t entry_buff_idx = 0;
+  do {
+    if (keep_first_ && fetched_so_far_ >= drop_first_ + keep_first_) {
+      return {};
+    }
 
-  if (crt_row_buff_idx_ >= entryCount()) {
-    CHECK_EQ(entryCount(), crt_row_buff_idx_);
-    return {};
-  }
+    entry_buff_idx = advanceCursorToNextEntry();
+
+    if (crt_row_buff_idx_ >= entryCount()) {
+      CHECK_EQ(entryCount(), crt_row_buff_idx_);
+      return {};
+    }
+    ++crt_row_buff_idx_;
+    ++fetched_so_far_;
+
+  } while (drop_first_ && fetched_so_far_ <= drop_first_);
+
   auto row = getRowAt(entry_buff_idx, translate_strings, decimal_to_double, false);
   CHECK(!row.empty());
-  ++crt_row_buff_idx_;
-  ++fetched_so_far_;
 
   return row;
 }
@@ -421,6 +437,7 @@ InternalTargetValue ResultSet::RowWiseTargetAccessor::getColumnInternal(
 
   const auto& offsets_for_target = offsets_for_storage_[storage_idx][target_logical_idx];
   const auto& agg_info = result_set_->storage_->targets_[target_logical_idx];
+  const auto& type_info = agg_info.sql_type;
 
   keys_ptr = get_rowwise_ptr(buff, entry_idx);
   rowwise_target_ptr = keys_ptr + key_bytes_with_padding_;
@@ -436,7 +453,6 @@ InternalTargetValue ResultSet::RowWiseTargetAccessor::getColumnInternal(
       result_set_->lazyReadInt(read_int_from_buff(ptr1, offsets_for_target.compact_sz1),
                                target_logical_idx,
                                storage_lookup_result);
-
   if (agg_info.is_agg && agg_info.agg_kind == kAVG) {
     CHECK(offsets_for_target.ptr2);
     const auto ptr2 =
@@ -444,8 +460,7 @@ InternalTargetValue ResultSet::RowWiseTargetAccessor::getColumnInternal(
     const auto i2 = read_int_from_buff(ptr2, offsets_for_target.compact_sz2);
     return InternalTargetValue(i1, i2);
   } else {
-    if (agg_info.sql_type.is_string() &&
-        agg_info.sql_type.get_compression() == kENCODING_NONE) {
+    if (type_info.is_string() && type_info.get_compression() == kENCODING_NONE) {
       CHECK(!agg_info.is_agg);
       if (!result_set_->lazy_fetch_info_.empty()) {
         CHECK_LT(target_logical_idx, result_set_->lazy_fetch_info_.size());
@@ -463,7 +478,7 @@ InternalTargetValue ResultSet::RowWiseTargetAccessor::getColumnInternal(
                  result_set_->serialized_varlen_buffer_.size());
         const auto& varlen_buffer_for_fragment =
             result_set_->serialized_varlen_buffer_[storage_lookup_result.storage_idx];
-        CHECK_LT(i1, varlen_buffer_for_fragment.size());
+        CHECK_LT(static_cast<size_t>(i1), varlen_buffer_for_fragment.size());
         return InternalTargetValue(&varlen_buffer_for_fragment[i1]);
       }
       CHECK(offsets_for_target.ptr2);
@@ -472,11 +487,11 @@ InternalTargetValue ResultSet::RowWiseTargetAccessor::getColumnInternal(
       const auto str_len = read_int_from_buff(ptr2, offsets_for_target.compact_sz2);
       CHECK_GE(str_len, 0);
       return result_set_->getVarlenOrderEntry(i1, str_len);
+    } else if (agg_info.is_agg && agg_info.agg_kind == kMODE) {
+      return InternalTargetValue(i1);  // AggMode*
     }
     return InternalTargetValue(
-        agg_info.sql_type.is_fp()
-            ? i1
-            : int_resize_cast(i1, agg_info.sql_type.get_logical_size()));
+        type_info.is_fp() ? i1 : int_resize_cast(i1, type_info.get_logical_size()));
   }
 }
 
@@ -549,6 +564,7 @@ InternalTargetValue ResultSet::ColumnWiseTargetAccessor::getColumnInternal(
 
   const auto& offsets_for_target = offsets_for_storage_[storage_idx][target_logical_idx];
   const auto& agg_info = result_set_->storage_->targets_[target_logical_idx];
+  const auto& type_info = agg_info.sql_type;
   auto ptr1 = offsets_for_target.ptr1;
   if (result_set_->query_mem_desc_.targetGroupbyIndicesSize() > 0) {
     if (result_set_->query_mem_desc_.getTargetGroupbyIndex(target_logical_idx) >= 0) {
@@ -574,8 +590,7 @@ InternalTargetValue ResultSet::ColumnWiseTargetAccessor::getColumnInternal(
     return InternalTargetValue(i1, i2);
   } else {
     // for TEXT ENCODING NONE:
-    if (agg_info.sql_type.is_string() &&
-        agg_info.sql_type.get_compression() == kENCODING_NONE) {
+    if (type_info.is_string() && type_info.get_compression() == kENCODING_NONE) {
       CHECK(!agg_info.is_agg);
       if (!result_set_->lazy_fetch_info_.empty()) {
         CHECK_LT(target_logical_idx, result_set_->lazy_fetch_info_.size());
@@ -593,7 +608,7 @@ InternalTargetValue ResultSet::ColumnWiseTargetAccessor::getColumnInternal(
                  result_set_->serialized_varlen_buffer_.size());
         const auto& varlen_buffer_for_fragment =
             result_set_->serialized_varlen_buffer_[storage_lookup_result.storage_idx];
-        CHECK_LT(i1, varlen_buffer_for_fragment.size());
+        CHECK_LT(static_cast<size_t>(i1), varlen_buffer_for_fragment.size());
         return InternalTargetValue(&varlen_buffer_for_fragment[i1]);
       }
       CHECK(offsets_for_target.ptr2);
@@ -605,9 +620,7 @@ InternalTargetValue ResultSet::ColumnWiseTargetAccessor::getColumnInternal(
       return result_set_->getVarlenOrderEntry(i1, i2);
     }
     return InternalTargetValue(
-        agg_info.sql_type.is_fp()
-            ? i1
-            : int_resize_cast(i1, agg_info.sql_type.get_logical_size()));
+        type_info.is_fp() ? i1 : int_resize_cast(i1, type_info.get_logical_size()));
   }
 }
 
@@ -619,12 +632,11 @@ InternalTargetValue ResultSet::getVarlenOrderEntry(const int64_t str_ptr,
     cpu_buffer.resize(str_len);
     const auto executor = query_mem_desc_.getExecutor();
     CHECK(executor);
-    auto& data_mgr = executor->catalog_->getDataMgr();
-    copy_from_gpu(&data_mgr,
-                  &cpu_buffer[0],
-                  static_cast<CUdeviceptr>(str_ptr),
-                  str_len,
-                  device_id_);
+    auto data_mgr = executor->getDataMgr();
+    auto allocator = std::make_unique<CudaAllocator>(
+        data_mgr, device_id_, getQueryEngineCudaStreamForDevice(device_id_));
+    allocator->copyFromDevice(
+        &cpu_buffer[0], reinterpret_cast<int8_t*>(str_ptr), str_len);
     host_str_ptr = reinterpret_cast<char*>(&cpu_buffer[0]);
   } else {
     CHECK(device_type_ == ExecutorDeviceType::CPU);
@@ -669,7 +681,7 @@ int64_t ResultSet::lazyReadInt(const int64_t ival,
         std::string fetched_str(reinterpret_cast<char*>(vd.pointer), vd.length);
         return reinterpret_cast<int64_t>(row_set_mem_owner_->addString(fetched_str));
       }
-      return lazy_decode(col_lazy_fetch, frag_col_buffer, ival_copy);
+      return result_set::lazy_decode(col_lazy_fetch, frag_col_buffer, ival_copy);
     }
   }
   return ival;
@@ -746,66 +758,6 @@ size_t ResultSet::getBufferSizeBytes(const ExecutorDeviceType device_type) const
   return storage_->query_mem_desc_.getBufferSizeBytes(device_type);
 }
 
-int64_t lazy_decode(const ColumnLazyFetchInfo& col_lazy_fetch,
-                    const int8_t* byte_stream,
-                    const int64_t pos) {
-  CHECK(col_lazy_fetch.is_lazily_fetched);
-  const auto& type_info = col_lazy_fetch.type;
-  if (type_info.is_fp()) {
-    if (type_info.get_type() == kFLOAT) {
-      double fval = fixed_width_float_decode_noinline(byte_stream, pos);
-      return *reinterpret_cast<const int64_t*>(may_alias_ptr(&fval));
-    } else {
-      double fval = fixed_width_double_decode_noinline(byte_stream, pos);
-      return *reinterpret_cast<const int64_t*>(may_alias_ptr(&fval));
-    }
-  }
-  CHECK(type_info.is_integer() || type_info.is_decimal() || type_info.is_time() ||
-        type_info.is_timeinterval() || type_info.is_boolean() || type_info.is_string() ||
-        type_info.is_array());
-  size_t type_bitwidth = get_bit_width(type_info);
-  if (type_info.get_compression() == kENCODING_FIXED) {
-    type_bitwidth = type_info.get_comp_param();
-  } else if (type_info.get_compression() == kENCODING_DICT) {
-    type_bitwidth = 8 * type_info.get_size();
-  }
-  CHECK_EQ(size_t(0), type_bitwidth % 8);
-  int64_t val;
-  if (type_info.is_date_in_days()) {
-    val = type_info.get_comp_param() == 16
-              ? fixed_width_small_date_decode_noinline(
-                    byte_stream, 2, NULL_SMALLINT, NULL_BIGINT, pos)
-              : fixed_width_small_date_decode_noinline(
-                    byte_stream, 4, NULL_INT, NULL_BIGINT, pos);
-  } else {
-    val = (type_info.get_compression() == kENCODING_DICT &&
-           type_info.get_size() < type_info.get_logical_size() &&
-           type_info.get_comp_param())
-              ? fixed_width_unsigned_decode_noinline(byte_stream, type_bitwidth / 8, pos)
-              : fixed_width_int_decode_noinline(byte_stream, type_bitwidth / 8, pos);
-  }
-  if (type_info.get_compression() != kENCODING_NONE &&
-      type_info.get_compression() != kENCODING_DATE_IN_DAYS) {
-    CHECK(type_info.get_compression() == kENCODING_FIXED ||
-          type_info.get_compression() == kENCODING_DICT);
-    auto encoding = type_info.get_compression();
-    if (encoding == kENCODING_FIXED) {
-      encoding = kENCODING_NONE;
-    }
-    SQLTypeInfo col_logical_ti(type_info.get_type(),
-                               type_info.get_dimension(),
-                               type_info.get_scale(),
-                               false,
-                               encoding,
-                               0,
-                               type_info.get_subtype());
-    if (val == inline_fixed_encoding_null_val(type_info)) {
-      return inline_int_null_val(col_logical_ti);
-    }
-  }
-  return val;
-}
-
 namespace {
 
 template <class T>
@@ -841,10 +793,9 @@ TargetValue build_array_target_value(
 TargetValue build_string_array_target_value(
     const int32_t* buff,
     const size_t buff_sz,
-    const int dict_id,
+    const shared::StringDictKey& dict_key,
     const bool translate_strings,
-    std::shared_ptr<RowSetMemoryOwner> row_set_mem_owner,
-    const Executor* executor) {
+    std::shared_ptr<RowSetMemoryOwner> row_set_mem_owner) {
   std::vector<ScalarTargetValue> values;
   CHECK_EQ(size_t(0), buff_sz % sizeof(int32_t));
   const size_t num_elems = buff_sz / sizeof(int32_t);
@@ -855,12 +806,13 @@ TargetValue build_string_array_target_value(
       if (string_id == NULL_INT) {
         values.emplace_back(NullableString(nullptr));
       } else {
-        if (dict_id == 0) {
+        if (dict_key.dict_id == 0) {
           StringDictionaryProxy* sdp = row_set_mem_owner->getLiteralStringDictProxy();
           values.emplace_back(sdp->getString(string_id));
         } else {
           values.emplace_back(NullableString(
-              executor->getStringDictionaryProxy(dict_id, row_set_mem_owner, false)
+              row_set_mem_owner
+                  ->getOrAddStringDictProxy(dict_key, /*with_generation=*/false)
                   ->getString(string_id)));
         }
       }
@@ -873,21 +825,20 @@ TargetValue build_string_array_target_value(
   return ArrayTargetValue(values);
 }
 
-TargetValue build_array_target_value(const SQLTypeInfo& array_ti,
-                                     const int8_t* buff,
-                                     const size_t buff_sz,
-                                     const bool translate_strings,
-                                     std::shared_ptr<RowSetMemoryOwner> row_set_mem_owner,
-                                     const Executor* executor) {
+TargetValue build_array_target_value(
+    const SQLTypeInfo& array_ti,
+    const int8_t* buff,
+    const size_t buff_sz,
+    const bool translate_strings,
+    std::shared_ptr<RowSetMemoryOwner> row_set_mem_owner) {
   CHECK(array_ti.is_array());
   const auto& elem_ti = array_ti.get_elem_type();
   if (elem_ti.is_string()) {
     return build_string_array_target_value(reinterpret_cast<const int32_t*>(buff),
                                            buff_sz,
-                                           elem_ti.get_comp_param(),
+                                           elem_ti.getStringDictKey(),
                                            translate_strings,
-                                           row_set_mem_owner,
-                                           executor);
+                                           row_set_mem_owner);
   }
   switch (elem_ti.get_size()) {
     case 1:
@@ -935,7 +886,9 @@ inline std::unique_ptr<ArrayDatum> lazy_fetch_chunk(const int8_t* ptr,
 
 struct GeoLazyFetchHandler {
   template <typename... T>
-  static inline auto fetch(const ResultSet::GeoReturnType return_type, T&&... vals) {
+  static inline auto fetch(const SQLTypeInfo& geo_ti,
+                           const ResultSet::GeoReturnType return_type,
+                           T&&... vals) {
     constexpr int num_vals = sizeof...(vals);
     static_assert(
         num_vals % 2 == 0,
@@ -945,7 +898,27 @@ struct GeoLazyFetchHandler {
     std::array<VarlenDatumPtr, num_vals / 2> ad_arr;
     size_t ctr = 0;
     for (const auto& col_pair : vals_vector) {
-      ad_arr[ctr++] = lazy_fetch_chunk(col_pair.first, col_pair.second);
+      ad_arr[ctr] = lazy_fetch_chunk(col_pair.first, col_pair.second);
+      // Regular chunk iterator used to fetch this datum sets the right nullness.
+      // That includes the fixlen bounds array.
+      // However it may incorrectly set it for the POINT coord array datum
+      // if 1st byte happened to hold NULL_ARRAY_TINYINT. One should either use
+      // the specialized iterator for POINT coords or rely on regular iterator +
+      // reset + recheck, which is what is done below.
+      auto is_point = (geo_ti.get_type() == kPOINT && ctr == 0);
+      if (is_point) {
+        // Resetting POINT coords array nullness here
+        ad_arr[ctr]->is_null = false;
+      }
+      if (!geo_ti.get_notnull()) {
+        // Recheck and set nullness
+        if (ad_arr[ctr]->length == 0 || ad_arr[ctr]->pointer == NULL ||
+            (is_point &&
+             is_null_point(geo_ti, ad_arr[ctr]->pointer, ad_arr[ctr]->length))) {
+          ad_arr[ctr]->is_null = true;
+        }
+      }
+      ctr++;
     }
     return ad_arr;
   }
@@ -955,15 +928,19 @@ inline std::unique_ptr<ArrayDatum> fetch_data_from_gpu(int64_t varlen_ptr,
                                                        const int64_t length,
                                                        Data_Namespace::DataMgr* data_mgr,
                                                        const int device_id) {
-  auto cpu_buf = std::shared_ptr<int8_t>(new int8_t[length], FreeDeleter());
-  copy_from_gpu(
-      data_mgr, cpu_buf.get(), static_cast<CUdeviceptr>(varlen_ptr), length, device_id);
+  auto cpu_buf =
+      std::shared_ptr<int8_t>(new int8_t[length], std::default_delete<int8_t[]>());
+  auto allocator = std::make_unique<CudaAllocator>(
+      data_mgr, device_id, getQueryEngineCudaStreamForDevice(device_id));
+  allocator->copyFromDevice(cpu_buf.get(), reinterpret_cast<int8_t*>(varlen_ptr), length);
+  // Just fetching the data from gpu, not checking geo nullness
   return std::make_unique<ArrayDatum>(length, cpu_buf, false);
 }
 
 struct GeoQueryOutputFetchHandler {
   static inline auto yieldGpuPtrFetcher() {
     return [](const int64_t ptr, const int64_t length) -> VarlenDatumPtr {
+      // Just fetching the data from gpu, not checking geo nullness
       return std::make_unique<VarlenDatum>(length, reinterpret_cast<int8_t*>(ptr), false);
     };
   }
@@ -978,12 +955,14 @@ struct GeoQueryOutputFetchHandler {
 
   static inline auto yieldCpuDatumFetcher() {
     return [](const int64_t ptr, const int64_t length) -> VarlenDatumPtr {
+      // Just fetching the data from gpu, not checking geo nullness
       return std::make_unique<VarlenDatum>(length, reinterpret_cast<int8_t*>(ptr), false);
     };
   }
 
   template <typename... T>
-  static inline auto fetch(const ResultSet::GeoReturnType return_type,
+  static inline auto fetch(const SQLTypeInfo& geo_ti,
+                           const ResultSet::GeoReturnType return_type,
                            Data_Namespace::DataMgr* data_mgr,
                            const bool fetch_data_from_gpu,
                            const int device_id,
@@ -997,8 +976,30 @@ struct GeoQueryOutputFetchHandler {
 
       std::array<VarlenDatumPtr, num_vals / 2> ad_arr;
       size_t ctr = 0;
-      for (size_t i = 0; i < vals_vector.size(); i += 2) {
-        ad_arr[ctr++] = datum_fetcher(vals_vector[i], vals_vector[i + 1]);
+      for (size_t i = 0; i < vals_vector.size(); i += 2, ctr++) {
+        if (vals_vector[i] == 0) {
+          // projected null
+          CHECK(!geo_ti.get_notnull());
+          ad_arr[ctr] = std::make_unique<ArrayDatum>(0, nullptr, true);
+          continue;
+        }
+        ad_arr[ctr] = datum_fetcher(vals_vector[i], vals_vector[i + 1]);
+        // All fetched datums come in with is_null set to false
+        if (!geo_ti.get_notnull()) {
+          bool is_null = false;
+          // Now need to set the nullness
+          if (ad_arr[ctr]->length == 0 || ad_arr[ctr]->pointer == NULL) {
+            is_null = true;
+          } else if (geo_ti.get_type() == kPOINT && ctr == 0 &&
+                     is_null_point(geo_ti, ad_arr[ctr]->pointer, ad_arr[ctr]->length)) {
+            is_null = true;  // recognizes compressed and uncompressed points
+          } else if (ad_arr[ctr]->length == 4 * sizeof(double)) {
+            // Bounds
+            auto dti = SQLTypeInfo(kARRAY, 0, 0, false, kENCODING_NONE, 0, kDOUBLE);
+            is_null = dti.is_null_fixlen_array(ad_arr[ctr]->pointer, ad_arr[ctr]->length);
+          }
+          ad_arr[ctr]->is_null = is_null;
+        }
       }
       return ad_arr;
     };
@@ -1021,28 +1022,36 @@ struct GeoTargetValueBuilder {
   static inline TargetValue build(const SQLTypeInfo& geo_ti,
                                   const ResultSet::GeoReturnType return_type,
                                   T&&... vals) {
-    auto ad_arr = GeoTargetFetcher::fetch(return_type, std::forward<T>(vals)...);
+    auto ad_arr = GeoTargetFetcher::fetch(geo_ti, return_type, std::forward<T>(vals)...);
     static_assert(std::tuple_size<decltype(ad_arr)>::value > 0,
                   "ArrayDatum array for Geo Target must contain at least one value.");
 
+    // Fetcher sets the geo nullness based on geo typeinfo's notnull, type and
+    // compression. Serializers will generate appropriate NULL geo where necessary.
     switch (return_type) {
       case ResultSet::GeoReturnType::GeoTargetValue: {
-        if (ad_arr[0]->is_null) {
-          return ArrayTargetValue(boost::optional<std::vector<ScalarTargetValue>>{});
+        if (!geo_ti.get_notnull() && ad_arr[0]->is_null) {
+          return GeoTargetValue();
         }
         return GeoReturnTypeTraits<ResultSet::GeoReturnType::GeoTargetValue,
                                    GEO_SOURCE_TYPE>::GeoSerializerType::serialize(geo_ti,
                                                                                   ad_arr);
       }
       case ResultSet::GeoReturnType::WktString: {
+        if (!geo_ti.get_notnull() && ad_arr[0]->is_null) {
+          // Generating NULL wkt string to represent NULL geo
+          return NullableString(nullptr);
+        }
         return GeoReturnTypeTraits<ResultSet::GeoReturnType::WktString,
                                    GEO_SOURCE_TYPE>::GeoSerializerType::serialize(geo_ti,
                                                                                   ad_arr);
       }
       case ResultSet::GeoReturnType::GeoTargetValuePtr:
       case ResultSet::GeoReturnType::GeoTargetValueGpuPtr: {
-        if (ad_arr[0]->is_null) {
-          return GeoTargetValuePtr();
+        if (!geo_ti.get_notnull() && ad_arr[0]->is_null) {
+          // NULL geo
+          // Pass along null datum, instead of an empty/null GeoTargetValuePtr
+          // return GeoTargetValuePtr();
         }
         return GeoReturnTypeTraits<ResultSet::GeoReturnType::GeoTargetValuePtr,
                                    GEO_SOURCE_TYPE>::GeoSerializerType::serialize(geo_ti,
@@ -1074,6 +1083,56 @@ inline std::pair<int64_t, int64_t> get_frag_id_and_local_idx(
 
 }  // namespace
 
+// clang-format off
+// formatted by clang-format 14.0.6
+ScalarTargetValue ResultSet::convertToScalarTargetValue(SQLTypeInfo const& ti,
+                                                        bool const translate_strings,
+                                                        int64_t const val) const {
+  if (ti.is_string()) {
+    CHECK_EQ(kENCODING_DICT, ti.get_compression());
+    return makeStringTargetValue(ti, translate_strings, val);
+  } else {
+    return ti.is_any<kDOUBLE>()  ? ScalarTargetValue(shared::bit_cast<double>(val))
+           : ti.is_any<kFLOAT>() ? ScalarTargetValue(shared::bit_cast<float>(val))
+                                 : ScalarTargetValue(val);
+  }
+}
+
+ScalarTargetValue ResultSet::nullScalarTargetValue(SQLTypeInfo const& ti,
+                                                   bool const translate_strings) {
+  return ti.is_any<kDOUBLE>()  ? ScalarTargetValue(NULL_DOUBLE)
+         : ti.is_any<kFLOAT>() ? ScalarTargetValue(NULL_FLOAT)
+         : ti.is_string()      ? translate_strings
+                                     ? ScalarTargetValue(NullableString(nullptr))
+                                     : ScalarTargetValue(static_cast<int64_t>(NULL_INT))
+                               : ScalarTargetValue(inline_int_null_val(ti));
+}
+
+bool ResultSet::isLessThan(SQLTypeInfo const& ti,
+                           int64_t const lhs,
+                           int64_t const rhs) const {
+  if (ti.is_string()) {
+    CHECK_EQ(kENCODING_DICT, ti.get_compression());
+    return getString(ti, lhs) < getString(ti, rhs);
+  } else {
+    return ti.is_any<kDOUBLE>()
+               ? shared::bit_cast<double>(lhs) < shared::bit_cast<double>(rhs)
+           : ti.is_any<kFLOAT>()
+               ? shared::bit_cast<float>(lhs) < shared::bit_cast<float>(rhs)
+               : lhs < rhs;
+  }
+}
+
+bool ResultSet::isNullIval(SQLTypeInfo const& ti,
+                           bool const translate_strings,
+                           int64_t const ival) {
+  return ti.is_any<kDOUBLE>()  ? shared::bit_cast<double>(ival) == NULL_DOUBLE
+         : ti.is_any<kFLOAT>() ? shared::bit_cast<float>(ival) == NULL_FLOAT
+         : ti.is_string()      ? translate_strings ? ival == NULL_INT : ival == 0
+                               : ival == inline_int_null_val(ti);
+}
+// clang-format on
+
 const std::vector<const int8_t*>& ResultSet::getColumnFrag(const size_t storage_idx,
                                                            const size_t col_logical_idx,
                                                            int64_t& global_idx) const {
@@ -1090,7 +1149,7 @@ const std::vector<const int8_t*>& ResultSet::getColumnFrag(const size_t storage_
       CHECK_LE(local_idx, global_idx);
     }
     CHECK_GE(frag_id, int64_t(0));
-    CHECK_LT(frag_id, col_buffers_[storage_idx].size());
+    CHECK_LT(static_cast<size_t>(frag_id), col_buffers_[storage_idx].size());
     global_idx = local_idx;
     return col_buffers_[storage_idx][frag_id];
   } else {
@@ -1099,14 +1158,20 @@ const std::vector<const int8_t*>& ResultSet::getColumnFrag(const size_t storage_
   }
 }
 
+const VarlenOutputInfo* ResultSet::getVarlenOutputInfo(const size_t entry_idx) const {
+  auto storage_lookup_result = findStorage(entry_idx);
+  CHECK(storage_lookup_result.storage_ptr);
+  return storage_lookup_result.storage_ptr->getVarlenOutputInfo();
+}
+
 /**
- * For each specified column, this function goes through all available storages and copy
+ * For each specified column, this function goes through all available storages and copies
  * its content into a contiguous output_buffer
  */
 void ResultSet::copyColumnIntoBuffer(const size_t column_idx,
                                      int8_t* output_buffer,
                                      const size_t output_buffer_size) const {
-  CHECK(isFastColumnarConversionPossible());
+  CHECK(isDirectColumnarConversionPossible());
   CHECK_LT(column_idx, query_mem_desc_.getSlotCount());
   CHECK(output_buffer_size > 0);
   CHECK(output_buffer);
@@ -1125,9 +1190,13 @@ void ResultSet::copyColumnIntoBuffer(const size_t column_idx,
 
   // the appended storages:
   for (size_t i = 0; i < appended_storage_.size(); i++) {
-    CHECK_LT(out_buff_offset, output_buffer_size);
     const size_t crt_storage_row_count =
         appended_storage_[i]->query_mem_desc_.getEntryCount();
+    if (crt_storage_row_count == 0) {
+      // skip an empty appended storage
+      continue;
+    }
+    CHECK_LT(out_buff_offset, output_buffer_size);
     const size_t crt_buffer_size = crt_storage_row_count * column_width_size;
     const size_t column_offset =
         appended_storage_[i]->query_mem_desc_.getColOffInBytes(column_idx);
@@ -1138,6 +1207,151 @@ void ResultSet::copyColumnIntoBuffer(const size_t column_idx,
 
     out_buff_offset += crt_buffer_size;
   }
+}
+
+template <typename ENTRY_TYPE, QueryDescriptionType QUERY_TYPE, bool COLUMNAR_FORMAT>
+ENTRY_TYPE ResultSet::getEntryAt(const size_t row_idx,
+                                 const size_t target_idx,
+                                 const size_t slot_idx) const {
+  if constexpr (QUERY_TYPE == QueryDescriptionType::GroupByPerfectHash) {  // NOLINT
+    if constexpr (COLUMNAR_FORMAT) {                                       // NOLINT
+      return getColumnarPerfectHashEntryAt<ENTRY_TYPE>(row_idx, target_idx, slot_idx);
+    } else {
+      return getRowWisePerfectHashEntryAt<ENTRY_TYPE>(row_idx, target_idx, slot_idx);
+    }
+  } else if constexpr (QUERY_TYPE == QueryDescriptionType::GroupByBaselineHash) {
+    if constexpr (COLUMNAR_FORMAT) {  // NOLINT
+      return getColumnarBaselineEntryAt<ENTRY_TYPE>(row_idx, target_idx, slot_idx);
+    } else {
+      return getRowWiseBaselineEntryAt<ENTRY_TYPE>(row_idx, target_idx, slot_idx);
+    }
+  } else {
+    UNREACHABLE() << "Invalid query type is used";
+    return 0;
+  }
+}
+
+#define DEF_GET_ENTRY_AT(query_type, columnar_output)                         \
+  template DATA_T ResultSet::getEntryAt<DATA_T, query_type, columnar_output>( \
+      const size_t row_idx, const size_t target_idx, const size_t slot_idx) const;
+
+#define DATA_T int64_t
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByPerfectHash, true)
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByPerfectHash, false)
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByBaselineHash, true)
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByBaselineHash, false)
+#undef DATA_T
+
+#define DATA_T int32_t
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByPerfectHash, true)
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByPerfectHash, false)
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByBaselineHash, true)
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByBaselineHash, false)
+#undef DATA_T
+
+#define DATA_T int16_t
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByPerfectHash, true)
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByPerfectHash, false)
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByBaselineHash, true)
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByBaselineHash, false)
+#undef DATA_T
+
+#define DATA_T int8_t
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByPerfectHash, true)
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByPerfectHash, false)
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByBaselineHash, true)
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByBaselineHash, false)
+#undef DATA_T
+
+#define DATA_T float
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByPerfectHash, true)
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByPerfectHash, false)
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByBaselineHash, true)
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByBaselineHash, false)
+#undef DATA_T
+
+#define DATA_T double
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByPerfectHash, true)
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByPerfectHash, false)
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByBaselineHash, true)
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByBaselineHash, false)
+#undef DATA_T
+
+#undef DEF_GET_ENTRY_AT
+
+/**
+ * Directly accesses the result set's storage buffer for a particular data type (columnar
+ * output, perfect hash group by)
+ *
+ * NOTE: Currently, only used in direct columnarization
+ */
+template <typename ENTRY_TYPE>
+ENTRY_TYPE ResultSet::getColumnarPerfectHashEntryAt(const size_t row_idx,
+                                                    const size_t target_idx,
+                                                    const size_t slot_idx) const {
+  const size_t column_offset = storage_->query_mem_desc_.getColOffInBytes(slot_idx);
+  const int8_t* storage_buffer = storage_->getUnderlyingBuffer() + column_offset;
+  return reinterpret_cast<const ENTRY_TYPE*>(storage_buffer)[row_idx];
+}
+
+/**
+ * Directly accesses the result set's storage buffer for a particular data type (row-wise
+ * output, perfect hash group by)
+ *
+ * NOTE: Currently, only used in direct columnarization
+ */
+template <typename ENTRY_TYPE>
+ENTRY_TYPE ResultSet::getRowWisePerfectHashEntryAt(const size_t row_idx,
+                                                   const size_t target_idx,
+                                                   const size_t slot_idx) const {
+  const size_t row_offset = storage_->query_mem_desc_.getRowSize() * row_idx;
+  const size_t column_offset = storage_->query_mem_desc_.getColOffInBytes(slot_idx);
+  const int8_t* storage_buffer =
+      storage_->getUnderlyingBuffer() + row_offset + column_offset;
+  return *reinterpret_cast<const ENTRY_TYPE*>(storage_buffer);
+}
+
+/**
+ * Directly accesses the result set's storage buffer for a particular data type (columnar
+ * output, baseline hash group by)
+ *
+ * NOTE: Currently, only used in direct columnarization
+ */
+template <typename ENTRY_TYPE>
+ENTRY_TYPE ResultSet::getRowWiseBaselineEntryAt(const size_t row_idx,
+                                                const size_t target_idx,
+                                                const size_t slot_idx) const {
+  CHECK_NE(storage_->query_mem_desc_.targetGroupbyIndicesSize(), size_t(0));
+  const auto key_width = storage_->query_mem_desc_.getEffectiveKeyWidth();
+  auto keys_ptr = row_ptr_rowwise(
+      storage_->getUnderlyingBuffer(), storage_->query_mem_desc_, row_idx);
+  const auto column_offset =
+      (storage_->query_mem_desc_.getTargetGroupbyIndex(target_idx) < 0)
+          ? storage_->query_mem_desc_.getColOffInBytes(slot_idx)
+          : storage_->query_mem_desc_.getTargetGroupbyIndex(target_idx) * key_width;
+  const auto storage_buffer = keys_ptr + column_offset;
+  return *reinterpret_cast<const ENTRY_TYPE*>(storage_buffer);
+}
+
+/**
+ * Directly accesses the result set's storage buffer for a particular data type (row-wise
+ * output, baseline hash group by)
+ *
+ * NOTE: Currently, only used in direct columnarization
+ */
+template <typename ENTRY_TYPE>
+ENTRY_TYPE ResultSet::getColumnarBaselineEntryAt(const size_t row_idx,
+                                                 const size_t target_idx,
+                                                 const size_t slot_idx) const {
+  CHECK_NE(storage_->query_mem_desc_.targetGroupbyIndicesSize(), size_t(0));
+  const auto key_width = storage_->query_mem_desc_.getEffectiveKeyWidth();
+  const auto column_offset =
+      (storage_->query_mem_desc_.getTargetGroupbyIndex(target_idx) < 0)
+          ? storage_->query_mem_desc_.getColOffInBytes(slot_idx)
+          : storage_->query_mem_desc_.getTargetGroupbyIndex(target_idx) * key_width *
+                storage_->query_mem_desc_.getEntryCount();
+  const auto column_buffer = storage_->getUnderlyingBuffer() + column_offset;
+  return reinterpret_cast<const ENTRY_TYPE*>(column_buffer)[row_idx];
 }
 
 // Interprets ptr1, ptr2 as the ptr and len pair used for variable length data.
@@ -1161,13 +1375,13 @@ TargetValue ResultSet::makeVarlenTargetValue(const int8_t* ptr1,
     const auto storage_idx = getStorageIndex(entry_buff_idx);
     if (target_info.sql_type.is_string()) {
       CHECK(target_info.sql_type.get_compression() == kENCODING_NONE);
-      CHECK_LT(static_cast<size_t>(storage_idx.first), serialized_varlen_buffer_.size());
+      CHECK_LT(storage_idx.first, serialized_varlen_buffer_.size());
       const auto& varlen_buffer_for_storage =
           serialized_varlen_buffer_[storage_idx.first];
       CHECK_LT(static_cast<size_t>(varlen_ptr), varlen_buffer_for_storage.size());
       return varlen_buffer_for_storage[varlen_ptr];
     } else if (target_info.sql_type.get_type() == kARRAY) {
-      CHECK_LT(static_cast<size_t>(storage_idx.first), serialized_varlen_buffer_.size());
+      CHECK_LT(storage_idx.first, serialized_varlen_buffer_.size());
       const auto& varlen_buffer = serialized_varlen_buffer_[storage_idx.first];
       CHECK_LT(static_cast<size_t>(varlen_ptr), varlen_buffer.size());
 
@@ -1176,8 +1390,7 @@ TargetValue ResultSet::makeVarlenTargetValue(const int8_t* ptr1,
           reinterpret_cast<const int8_t*>(varlen_buffer[varlen_ptr].data()),
           varlen_buffer[varlen_ptr].size(),
           translate_strings,
-          row_set_mem_owner_,
-          executor_);
+          row_set_mem_owner_);
     } else {
       CHECK(false);
     }
@@ -1187,39 +1400,47 @@ TargetValue ResultSet::makeVarlenTargetValue(const int8_t* ptr1,
     const auto& col_lazy_fetch = lazy_fetch_info_[target_logical_idx];
     if (col_lazy_fetch.is_lazily_fetched) {
       const auto storage_idx = getStorageIndex(entry_buff_idx);
-      CHECK_LT(static_cast<size_t>(storage_idx.first), col_buffers_.size());
+      CHECK_LT(storage_idx.first, col_buffers_.size());
       auto& frag_col_buffers =
           getColumnFrag(storage_idx.first, target_logical_idx, varlen_ptr);
       bool is_end{false};
+      auto col_buf = const_cast<int8_t*>(frag_col_buffers[col_lazy_fetch.local_col_id]);
       if (target_info.sql_type.is_string()) {
+        if (FlatBufferManager::isFlatBuffer(col_buf)) {
+          FlatBufferManager m{col_buf};
+          std::string fetched_str;
+          bool is_null{};
+          auto status = m.getItem(varlen_ptr, fetched_str, is_null);
+          if (is_null) {
+            return TargetValue(nullptr);
+          }
+          CHECK_EQ(status, FlatBufferManager::Status::Success);
+          return fetched_str;
+        }
         VarlenDatum vd;
-        ChunkIter_get_nth(reinterpret_cast<ChunkIter*>(const_cast<int8_t*>(
-                              frag_col_buffers[col_lazy_fetch.local_col_id])),
-                          varlen_ptr,
-                          false,
-                          &vd,
-                          &is_end);
+        ChunkIter_get_nth(
+            reinterpret_cast<ChunkIter*>(col_buf), varlen_ptr, false, &vd, &is_end);
         CHECK(!is_end);
         if (vd.is_null) {
           return TargetValue(nullptr);
         }
         CHECK(vd.pointer);
-        CHECK_GT(vd.length, 0);
+        CHECK_GT(vd.length, 0u);
         std::string fetched_str(reinterpret_cast<char*>(vd.pointer), vd.length);
         return fetched_str;
       } else {
         CHECK(target_info.sql_type.is_array());
         ArrayDatum ad;
-        ChunkIter_get_nth(reinterpret_cast<ChunkIter*>(const_cast<int8_t*>(
-                              frag_col_buffers[col_lazy_fetch.local_col_id])),
-                          varlen_ptr,
-                          &ad,
-                          &is_end);
-        CHECK(!is_end);
+        if (FlatBufferManager::isFlatBuffer(col_buf)) {
+          VarlenArray_get_nth(col_buf, varlen_ptr, &ad, &is_end);
+        } else {
+          ChunkIter_get_nth(
+              reinterpret_cast<ChunkIter*>(col_buf), varlen_ptr, &ad, &is_end);
+        }
         if (ad.is_null) {
           return ArrayTargetValue(boost::optional<std::vector<ScalarTargetValue>>{});
         }
-        CHECK_GE(ad.length, 0);
+        CHECK_GE(ad.length, 0u);
         if (ad.length > 0) {
           CHECK(ad.pointer);
         }
@@ -1227,8 +1448,7 @@ TargetValue ResultSet::makeVarlenTargetValue(const int8_t* ptr1,
                                         ad.pointer,
                                         ad.length,
                                         translate_strings,
-                                        row_set_mem_owner_,
-                                        executor_);
+                                        row_set_mem_owner_);
       }
     }
   }
@@ -1248,12 +1468,12 @@ TargetValue ResultSet::makeVarlenTargetValue(const int8_t* ptr1,
     cpu_buffer.resize(length);
     const auto executor = query_mem_desc_.getExecutor();
     CHECK(executor);
-    auto& data_mgr = executor->catalog_->getDataMgr();
-    copy_from_gpu(&data_mgr,
-                  &cpu_buffer[0],
-                  static_cast<CUdeviceptr>(varlen_ptr),
-                  length,
-                  device_id_);
+    auto data_mgr = executor->getDataMgr();
+    auto allocator = std::make_unique<CudaAllocator>(
+        data_mgr, device_id_, getQueryEngineCudaStreamForDevice(device_id_));
+
+    allocator->copyFromDevice(
+        &cpu_buffer[0], reinterpret_cast<int8_t*>(varlen_ptr), length);
     varlen_ptr = reinterpret_cast<int64_t>(&cpu_buffer[0]);
   }
   if (target_info.sql_type.is_array()) {
@@ -1261,8 +1481,7 @@ TargetValue ResultSet::makeVarlenTargetValue(const int8_t* ptr1,
                                     reinterpret_cast<const int8_t*>(varlen_ptr),
                                     length,
                                     translate_strings,
-                                    row_set_mem_owner_,
-                                    executor_);
+                                    row_set_mem_owner_);
   }
   return std::string(reinterpret_cast<char*>(varlen_ptr), length);
 }
@@ -1292,6 +1511,138 @@ bool ResultSet::isGeoColOnGpu(const size_t col_idx) const {
   }
 
   return device_type_ == ExecutorDeviceType::GPU;
+}
+
+template <size_t NDIM,
+          typename GeospatialGeoType,
+          typename GeoTypeTargetValue,
+          typename GeoTypeTargetValuePtr>
+TargetValue NestedArrayToGeoTargetValue(const int8_t* buf,
+                                        const int64_t index,
+                                        const SQLTypeInfo& ti,
+                                        const ResultSet::GeoReturnType return_type) {
+  FlatBufferManager m{const_cast<int8_t*>(buf)};
+  const SQLTypeInfoLite* ti_lite =
+      reinterpret_cast<const SQLTypeInfoLite*>(m.get_user_data_buffer());
+  if (ti_lite->is_geoint()) {
+    CHECK_EQ(ti.get_compression(), kENCODING_GEOINT);
+  } else {
+    CHECK_EQ(ti.get_compression(), kENCODING_NONE);
+  }
+  FlatBufferManager::NestedArrayItem<NDIM> item;
+  auto status = m.getItem(index, item);
+  CHECK_EQ(status, FlatBufferManager::Status::Success);
+  if (!item.is_null) {
+    // to ensure we can access item.sizes_buffers[...] and item.sizes_lengths[...]
+    CHECK_EQ(item.nof_sizes, NDIM - 1);
+  }
+  switch (return_type) {
+    case ResultSet::GeoReturnType::WktString: {
+      if (item.is_null) {
+        return NullableString(nullptr);
+      }
+      std::vector<double> coords;
+      if (ti_lite->is_geoint()) {
+        coords = *decompress_coords<double, SQLTypeInfo>(
+            ti, item.values, 2 * item.nof_values * sizeof(int32_t));
+      } else {
+        const double* values_buf = reinterpret_cast<const double*>(item.values);
+        coords.insert(coords.end(), values_buf, values_buf + 2 * item.nof_values);
+      }
+      if constexpr (NDIM == 1) {
+        GeospatialGeoType obj(coords);
+        return NullableString(obj.getWktString());
+      } else if constexpr (NDIM == 2) {
+        std::vector<int32_t> rings;
+        rings.insert(rings.end(),
+                     item.sizes_buffers[0],
+                     item.sizes_buffers[0] + item.sizes_lengths[0]);
+        GeospatialGeoType obj(coords, rings);
+        return NullableString(obj.getWktString());
+      } else if constexpr (NDIM == 3) {
+        std::vector<int32_t> rings;
+        std::vector<int32_t> poly_rings;
+        poly_rings.insert(poly_rings.end(),
+                          item.sizes_buffers[0],
+                          item.sizes_buffers[0] + item.sizes_lengths[0]);
+        rings.insert(rings.end(),
+                     item.sizes_buffers[1],
+                     item.sizes_buffers[1] + item.sizes_lengths[1]);
+        GeospatialGeoType obj(coords, rings, poly_rings);
+        return NullableString(obj.getWktString());
+      } else {
+        UNREACHABLE();
+      }
+    } break;
+    case ResultSet::GeoReturnType::GeoTargetValue: {
+      if (item.is_null) {
+        return GeoTargetValue();
+      }
+      std::vector<double> coords;
+      if (ti_lite->is_geoint()) {
+        coords = *decompress_coords<double, SQLTypeInfo>(
+            ti, item.values, 2 * item.nof_values * sizeof(int32_t));
+      } else {
+        const double* values_buf = reinterpret_cast<const double*>(item.values);
+        coords.insert(coords.end(), values_buf, values_buf + 2 * item.nof_values);
+      }
+      if constexpr (NDIM == 1) {
+        return GeoTargetValue(GeoTypeTargetValue(coords));
+      } else if constexpr (NDIM == 2) {
+        std::vector<int32_t> rings;
+        rings.insert(rings.end(),
+                     item.sizes_buffers[0],
+                     item.sizes_buffers[0] + item.sizes_lengths[0]);
+        return GeoTargetValue(GeoTypeTargetValue(coords, rings));
+      } else if constexpr (NDIM == 3) {
+        std::vector<int32_t> rings;
+        std::vector<int32_t> poly_rings;
+        poly_rings.insert(poly_rings.end(),
+                          item.sizes_buffers[0],
+                          item.sizes_buffers[0] + item.sizes_lengths[0]);
+        rings.insert(rings.end(),
+                     item.sizes_buffers[1],
+                     item.sizes_buffers[1] + item.sizes_lengths[1]);
+        return GeoTargetValue(GeoTypeTargetValue(coords, rings, poly_rings));
+      } else {
+        UNREACHABLE();
+      }
+    } break;
+    case ResultSet::GeoReturnType::GeoTargetValuePtr:
+    case ResultSet::GeoReturnType::GeoTargetValueGpuPtr: {
+      if (item.is_null) {
+        return GeoTypeTargetValuePtr();
+      }
+      auto coords = std::make_shared<VarlenDatum>(
+          item.nof_values * m.getValueSize(), item.values, false);
+
+      if constexpr (NDIM == 1) {
+        return GeoTypeTargetValuePtr({std::move(coords)});
+      } else if constexpr (NDIM == 2) {
+        auto rings = std::make_shared<VarlenDatum>(
+            item.sizes_lengths[0] * sizeof(int32_t),
+            reinterpret_cast<int8_t*>(item.sizes_buffers[0]),
+            false);
+        return GeoTypeTargetValuePtr({std::move(coords), std::move(rings)});
+      } else if constexpr (NDIM == 3) {
+        auto poly_rings = std::make_shared<VarlenDatum>(
+            item.sizes_lengths[0] * sizeof(int32_t),
+            reinterpret_cast<int8_t*>(item.sizes_buffers[0]),
+            false);
+        auto rings = std::make_shared<VarlenDatum>(
+            item.sizes_lengths[1] * sizeof(int32_t),
+            reinterpret_cast<int8_t*>(item.sizes_buffers[1]),
+            false);
+        return GeoTypeTargetValuePtr(
+            {std::move(coords), std::move(rings), std::move(poly_rings)});
+      } else {
+        UNREACHABLE();
+      }
+    } break;
+    default:
+      UNREACHABLE();
+  }
+  return TargetValue(nullptr);
 }
 
 // Reads a geo value from a series of ptrs to var len types
@@ -1361,7 +1712,7 @@ TargetValue ResultSet::makeGeoTargetValue(const int8_t* geo_target_ptr,
 
   auto getFragColBuffers = [&]() -> decltype(auto) {
     const auto storage_idx = getStorageIndex(entry_buff_idx);
-    CHECK_LT(static_cast<size_t>(storage_idx.first), col_buffers_.size());
+    CHECK_LT(storage_idx.first, col_buffers_.size());
     auto global_idx = getCoordsDataPtr(geo_target_ptr);
     return getColumnFrag(storage_idx.first, target_logical_idx, global_idx);
   };
@@ -1371,13 +1722,12 @@ TargetValue ResultSet::makeGeoTargetValue(const int8_t* geo_target_ptr,
   auto getDataMgr = [&]() {
     auto executor = query_mem_desc_.getExecutor();
     CHECK(executor);
-    auto& data_mgr = executor->catalog_->getDataMgr();
-    return &data_mgr;
+    return executor->getDataMgr();
   };
 
   auto getSeparateVarlenStorage = [&]() -> decltype(auto) {
     const auto storage_idx = getStorageIndex(entry_buff_idx);
-    CHECK_LT(static_cast<size_t>(storage_idx.first), serialized_varlen_buffer_.size());
+    CHECK_LT(storage_idx.first, serialized_varlen_buffer_.size());
     const auto& varlen_buffer = serialized_varlen_buffer_[storage_idx.first];
     return varlen_buffer;
   };
@@ -1395,7 +1745,22 @@ TargetValue ResultSet::makeGeoTargetValue(const int8_t* geo_target_ptr,
 
   switch (target_info.sql_type.get_type()) {
     case kPOINT: {
-      if (separate_varlen_storage_valid_ && !target_info.is_agg) {
+      if (query_mem_desc_.slotIsVarlenOutput(slot_idx)) {
+        auto varlen_output_info = getVarlenOutputInfo(entry_buff_idx);
+        CHECK(varlen_output_info);
+        auto geo_data_ptr = read_int_from_buff(
+            geo_target_ptr, query_mem_desc_.getPaddedSlotWidthBytes(slot_idx));
+        auto cpu_data_ptr =
+            reinterpret_cast<int64_t>(varlen_output_info->computeCpuOffset(geo_data_ptr));
+        return GeoTargetValueBuilder<kPOINT, GeoQueryOutputFetchHandler>::build(
+            target_info.sql_type,
+            geo_return_type_,
+            /*data_mgr=*/nullptr,
+            /*is_gpu_fetch=*/false,
+            device_id_,
+            cpu_data_ptr,
+            target_info.sql_type.get_compression() == kENCODING_GEOINT ? 8 : 16);
+      } else if (separate_varlen_storage_valid_ && !target_info.is_agg) {
         const auto& varlen_buffer = getSeparateVarlenStorage();
         CHECK_LT(static_cast<size_t>(getCoordsDataPtr(geo_target_ptr)),
                  varlen_buffer.size());
@@ -1426,7 +1791,52 @@ TargetValue ResultSet::makeGeoTargetValue(const int8_t* geo_target_ptr,
             getCoordsDataPtr(geo_target_ptr),
             getCoordsLength(geo_target_ptr));
       }
-    } break;
+      break;
+    }
+    case kMULTIPOINT: {
+      if (separate_varlen_storage_valid_ && !target_info.is_agg) {
+        const auto& varlen_buffer = getSeparateVarlenStorage();
+        CHECK_LT(static_cast<size_t>(getCoordsDataPtr(geo_target_ptr)),
+                 varlen_buffer.size());
+
+        return GeoTargetValueBuilder<kMULTIPOINT, GeoQueryOutputFetchHandler>::build(
+            target_info.sql_type,
+            geo_return_type_,
+            nullptr,
+            false,
+            device_id_,
+            reinterpret_cast<int64_t>(
+                varlen_buffer[getCoordsDataPtr(geo_target_ptr)].data()),
+            static_cast<int64_t>(varlen_buffer[getCoordsDataPtr(geo_target_ptr)].size()));
+      } else if (col_lazy_fetch && col_lazy_fetch->is_lazily_fetched) {
+        const auto& frag_col_buffers = getFragColBuffers();
+
+        auto ptr = frag_col_buffers[col_lazy_fetch->local_col_id];
+        if (FlatBufferManager::isFlatBuffer(ptr)) {
+          int64_t index = getCoordsDataPtr(geo_target_ptr);
+          return NestedArrayToGeoTargetValue<1,
+                                             Geospatial::GeoMultiPoint,
+                                             GeoMultiPointTargetValue,
+                                             GeoMultiPointTargetValuePtr>(
+              ptr, index, target_info.sql_type, geo_return_type_);
+        }
+        return GeoTargetValueBuilder<kMULTIPOINT, GeoLazyFetchHandler>::build(
+            target_info.sql_type,
+            geo_return_type_,
+            frag_col_buffers[col_lazy_fetch->local_col_id],
+            getCoordsDataPtr(geo_target_ptr));
+      } else {
+        return GeoTargetValueBuilder<kMULTIPOINT, GeoQueryOutputFetchHandler>::build(
+            target_info.sql_type,
+            geo_return_type_,
+            is_gpu_fetch ? getDataMgr() : nullptr,
+            is_gpu_fetch,
+            device_id_,
+            getCoordsDataPtr(geo_target_ptr),
+            getCoordsLength(geo_target_ptr));
+      }
+      break;
+    }
     case kLINESTRING: {
       if (separate_varlen_storage_valid_ && !target_info.is_agg) {
         const auto& varlen_buffer = getSeparateVarlenStorage();
@@ -1444,6 +1854,16 @@ TargetValue ResultSet::makeGeoTargetValue(const int8_t* geo_target_ptr,
             static_cast<int64_t>(varlen_buffer[getCoordsDataPtr(geo_target_ptr)].size()));
       } else if (col_lazy_fetch && col_lazy_fetch->is_lazily_fetched) {
         const auto& frag_col_buffers = getFragColBuffers();
+
+        auto ptr = frag_col_buffers[col_lazy_fetch->local_col_id];
+        if (FlatBufferManager::isFlatBuffer(ptr)) {
+          int64_t index = getCoordsDataPtr(geo_target_ptr);
+          return NestedArrayToGeoTargetValue<1,
+                                             Geospatial::GeoLineString,
+                                             GeoLineStringTargetValue,
+                                             GeoLineStringTargetValuePtr>(
+              ptr, index, target_info.sql_type, geo_return_type_);
+        }
         return GeoTargetValueBuilder<kLINESTRING, GeoLazyFetchHandler>::build(
             target_info.sql_type,
             geo_return_type_,
@@ -1459,7 +1879,61 @@ TargetValue ResultSet::makeGeoTargetValue(const int8_t* geo_target_ptr,
             getCoordsDataPtr(geo_target_ptr),
             getCoordsLength(geo_target_ptr));
       }
-    } break;
+      break;
+    }
+    case kMULTILINESTRING: {
+      if (separate_varlen_storage_valid_ && !target_info.is_agg) {
+        const auto& varlen_buffer = getSeparateVarlenStorage();
+        CHECK_LT(static_cast<size_t>(getCoordsDataPtr(geo_target_ptr) + 1),
+                 varlen_buffer.size());
+
+        return GeoTargetValueBuilder<kMULTILINESTRING, GeoQueryOutputFetchHandler>::build(
+            target_info.sql_type,
+            geo_return_type_,
+            nullptr,
+            false,
+            device_id_,
+            reinterpret_cast<int64_t>(
+                varlen_buffer[getCoordsDataPtr(geo_target_ptr)].data()),
+            static_cast<int64_t>(varlen_buffer[getCoordsDataPtr(geo_target_ptr)].size()),
+            reinterpret_cast<int64_t>(
+                varlen_buffer[getCoordsDataPtr(geo_target_ptr) + 1].data()),
+            static_cast<int64_t>(
+                varlen_buffer[getCoordsDataPtr(geo_target_ptr) + 1].size()));
+      } else if (col_lazy_fetch && col_lazy_fetch->is_lazily_fetched) {
+        const auto& frag_col_buffers = getFragColBuffers();
+
+        auto ptr = frag_col_buffers[col_lazy_fetch->local_col_id];
+        if (FlatBufferManager::isFlatBuffer(ptr)) {
+          int64_t index = getCoordsDataPtr(geo_target_ptr);
+          return NestedArrayToGeoTargetValue<2,
+                                             Geospatial::GeoMultiLineString,
+                                             GeoMultiLineStringTargetValue,
+                                             GeoMultiLineStringTargetValuePtr>(
+              ptr, index, target_info.sql_type, geo_return_type_);
+        }
+
+        return GeoTargetValueBuilder<kMULTILINESTRING, GeoLazyFetchHandler>::build(
+            target_info.sql_type,
+            geo_return_type_,
+            frag_col_buffers[col_lazy_fetch->local_col_id],
+            getCoordsDataPtr(geo_target_ptr),
+            frag_col_buffers[col_lazy_fetch->local_col_id + 1],
+            getCoordsDataPtr(geo_target_ptr));
+      } else {
+        return GeoTargetValueBuilder<kMULTILINESTRING, GeoQueryOutputFetchHandler>::build(
+            target_info.sql_type,
+            geo_return_type_,
+            is_gpu_fetch ? getDataMgr() : nullptr,
+            is_gpu_fetch,
+            device_id_,
+            getCoordsDataPtr(geo_target_ptr),
+            getCoordsLength(geo_target_ptr),
+            getRingSizesPtr(geo_target_ptr),
+            getRingSizesLength(geo_target_ptr) * 4);
+      }
+      break;
+    }
     case kPOLYGON: {
       if (separate_varlen_storage_valid_ && !target_info.is_agg) {
         const auto& varlen_buffer = getSeparateVarlenStorage();
@@ -1481,6 +1955,15 @@ TargetValue ResultSet::makeGeoTargetValue(const int8_t* geo_target_ptr,
                 varlen_buffer[getCoordsDataPtr(geo_target_ptr) + 1].size()));
       } else if (col_lazy_fetch && col_lazy_fetch->is_lazily_fetched) {
         const auto& frag_col_buffers = getFragColBuffers();
+        auto ptr = frag_col_buffers[col_lazy_fetch->local_col_id];
+        if (FlatBufferManager::isFlatBuffer(ptr)) {
+          int64_t index = getCoordsDataPtr(geo_target_ptr);
+          return NestedArrayToGeoTargetValue<2,
+                                             Geospatial::GeoPolygon,
+                                             GeoPolyTargetValue,
+                                             GeoPolyTargetValuePtr>(
+              ptr, index, target_info.sql_type, geo_return_type_);
+        }
 
         return GeoTargetValueBuilder<kPOLYGON, GeoLazyFetchHandler>::build(
             target_info.sql_type,
@@ -1501,7 +1984,8 @@ TargetValue ResultSet::makeGeoTargetValue(const int8_t* geo_target_ptr,
             getRingSizesPtr(geo_target_ptr),
             getRingSizesLength(geo_target_ptr) * 4);
       }
-    } break;
+      break;
+    }
     case kMULTIPOLYGON: {
       if (separate_varlen_storage_valid_ && !target_info.is_agg) {
         const auto& varlen_buffer = getSeparateVarlenStorage();
@@ -1527,6 +2011,15 @@ TargetValue ResultSet::makeGeoTargetValue(const int8_t* geo_target_ptr,
                 varlen_buffer[getCoordsDataPtr(geo_target_ptr) + 2].size()));
       } else if (col_lazy_fetch && col_lazy_fetch->is_lazily_fetched) {
         const auto& frag_col_buffers = getFragColBuffers();
+        auto ptr = frag_col_buffers[col_lazy_fetch->local_col_id];
+        if (FlatBufferManager::isFlatBuffer(ptr)) {
+          int64_t index = getCoordsDataPtr(geo_target_ptr);
+          return NestedArrayToGeoTargetValue<3,
+                                             Geospatial::GeoMultiPolygon,
+                                             GeoMultiPolyTargetValue,
+                                             GeoMultiPolyTargetValuePtr>(
+              ptr, index, target_info.sql_type, geo_return_type_);
+        }
 
         return GeoTargetValueBuilder<kMULTIPOLYGON, GeoLazyFetchHandler>::build(
             target_info.sql_type,
@@ -1551,13 +2044,43 @@ TargetValue ResultSet::makeGeoTargetValue(const int8_t* geo_target_ptr,
             getPolyRingsPtr(geo_target_ptr),
             getPolyRingsLength(geo_target_ptr) * 4);
       }
-    } break;
+      break;
+    }
     default:
       throw std::runtime_error("Unknown Geometry type encountered: " +
                                target_info.sql_type.get_type_name());
   }
   UNREACHABLE();
   return TargetValue(nullptr);
+}
+
+std::string ResultSet::getString(SQLTypeInfo const& ti, int64_t const ival) const {
+  const auto& dict_key = ti.getStringDictKey();
+  StringDictionaryProxy* sdp;
+  if (dict_key.dict_id) {
+    constexpr bool with_generation = false;
+    sdp = dict_key.db_id > 0
+              ? row_set_mem_owner_->getOrAddStringDictProxy(dict_key, with_generation)
+              : row_set_mem_owner_->getStringDictProxy(
+                    dict_key);  // unit tests bypass the catalog
+  } else {
+    sdp = row_set_mem_owner_->getLiteralStringDictProxy();
+  }
+  return sdp->getString(ival);
+}
+
+ScalarTargetValue ResultSet::makeStringTargetValue(SQLTypeInfo const& chosen_type,
+                                                   bool const translate_strings,
+                                                   int64_t const ival) const {
+  if (translate_strings) {
+    if (static_cast<int32_t>(ival) == NULL_INT) {  // TODO(alex): this isn't nice, fix it
+      return NullableString(nullptr);
+    } else {
+      return NullableString(getString(chosen_type, ival));
+    }
+  } else {
+    return static_cast<int64_t>(static_cast<int32_t>(ival));
+  }
 }
 
 // Reads an integer or a float from ptr based on the type and the byte width.
@@ -1569,19 +2092,17 @@ TargetValue ResultSet::makeTargetValue(const int8_t* ptr,
                                        const bool decimal_to_double,
                                        const size_t entry_buff_idx) const {
   auto actual_compact_sz = compact_sz;
-  if (target_info.sql_type.get_type() == kFLOAT &&
-      !query_mem_desc_.forceFourByteFloat()) {
-    // TODO(Saman): this condition should eventually just be didOutputColumnar(), remove
-    // others once we can
-    if (query_mem_desc_.didOutputColumnar() && !g_cluster &&
-        query_mem_desc_.getQueryDescriptionType() == QueryDescriptionType::Projection) {
+  const auto& type_info = target_info.sql_type;
+  if (type_info.get_type() == kFLOAT && !query_mem_desc_.forceFourByteFloat()) {
+    if (query_mem_desc_.isLogicalSizedColumnsAllowed()) {
       actual_compact_sz = sizeof(float);
     } else {
       actual_compact_sz = sizeof(double);
     }
     if (target_info.is_agg &&
         (target_info.agg_kind == kAVG || target_info.agg_kind == kSUM ||
-         target_info.agg_kind == kMIN || target_info.agg_kind == kMAX)) {
+         target_info.agg_kind == kSUM_IF || target_info.agg_kind == kMIN ||
+         target_info.agg_kind == kMAX || target_info.agg_kind == kSINGLE_VALUE)) {
       // The above listed aggregates use two floats in a single 8-byte slot. Set the
       // padded size to 4 bytes to properly read each value.
       actual_compact_sz = sizeof(float);
@@ -1593,9 +2114,8 @@ TargetValue ResultSet::makeTargetValue(const int8_t* ptr,
   }
 
   // String dictionary keys are read as 32-bit values regardless of encoding
-  if (target_info.sql_type.is_string() &&
-      target_info.sql_type.get_compression() == kENCODING_DICT &&
-      target_info.sql_type.get_comp_param()) {
+  if (type_info.is_string() && type_info.get_compression() == kENCODING_DICT &&
+      type_info.getStringDictKey().dict_id) {
     actual_compact_sz = sizeof(int32_t);
   }
 
@@ -1607,9 +2127,10 @@ TargetValue ResultSet::makeTargetValue(const int8_t* ptr,
     if (col_lazy_fetch.is_lazily_fetched) {
       CHECK_GE(ival, 0);
       const auto storage_idx = getStorageIndex(entry_buff_idx);
-      CHECK_LT(static_cast<size_t>(storage_idx.first), col_buffers_.size());
+      CHECK_LT(storage_idx.first, col_buffers_.size());
       auto& frag_col_buffers = getColumnFrag(storage_idx.first, target_logical_idx, ival);
-      ival = lazy_decode(
+      CHECK_LT(size_t(col_lazy_fetch.local_col_id), frag_col_buffers.size());
+      ival = result_set::lazy_decode(
           col_lazy_fetch, frag_col_buffers[col_lazy_fetch.local_col_id], ival);
       if (chosen_type.is_fp()) {
         const auto dval = *reinterpret_cast<const double*>(may_alias_ptr(&ival));
@@ -1621,7 +2142,21 @@ TargetValue ResultSet::makeTargetValue(const int8_t* ptr,
       }
     }
   }
+  if (target_info.agg_kind == kMODE) {
+    if (!isNullIval(chosen_type, translate_strings, ival)) {
+      auto const* const* const agg_mode = reinterpret_cast<AggMode const* const*>(ptr);
+      if (std::optional<int64_t> const mode = (*agg_mode)->mode()) {
+        return convertToScalarTargetValue(chosen_type, translate_strings, *mode);
+      }
+    }
+    return nullScalarTargetValue(chosen_type, translate_strings);
+  }
   if (chosen_type.is_fp()) {
+    if (target_info.agg_kind == kAPPROX_QUANTILE) {
+      return *reinterpret_cast<double const*>(ptr) == NULL_DOUBLE
+                 ? NULL_DOUBLE  // sql_validate / just_validate
+                 : calculateQuantile(*reinterpret_cast<quantile::TDigest* const*>(ptr));
+    }
     switch (actual_compact_sz) {
       case 8: {
         const auto dval = *reinterpret_cast<const double*>(ptr);
@@ -1637,7 +2172,7 @@ TargetValue ResultSet::makeTargetValue(const int8_t* ptr,
         CHECK(false);
     }
   }
-  if (chosen_type.is_integer() | chosen_type.is_boolean() || chosen_type.is_time() ||
+  if (chosen_type.is_integer() || chosen_type.is_boolean() || chosen_type.is_time() ||
       chosen_type.is_timeinterval()) {
     if (is_distinct_target(target_info)) {
       return TargetValue(count_distinct_set_size(
@@ -1647,34 +2182,25 @@ TargetValue ResultSet::makeTargetValue(const int8_t* ptr,
     // right type instead
     if (inline_int_null_val(chosen_type) ==
         int_resize_cast(ival, chosen_type.get_logical_size())) {
-      return inline_int_null_val(target_info.sql_type);
+      return inline_int_null_val(type_info);
     }
     return ival;
   }
   if (chosen_type.is_string() && chosen_type.get_compression() == kENCODING_DICT) {
-    if (translate_strings) {
-      if (static_cast<int32_t>(ival) ==
-          NULL_INT) {  // TODO(alex): this isn't nice, fix it
-        return NullableString(nullptr);
-      }
-      StringDictionaryProxy* sdp{nullptr};
-      if (!chosen_type.get_comp_param()) {
-        sdp = row_set_mem_owner_->getLiteralStringDictProxy();
-      } else {
-        sdp = executor_
-                  ? executor_->getStringDictionaryProxy(
-                        chosen_type.get_comp_param(), row_set_mem_owner_, false)
-                  : row_set_mem_owner_->getStringDictProxy(chosen_type.get_comp_param());
-      }
-      return NullableString(sdp->getString(ival));
-    } else {
-      return static_cast<int64_t>(static_cast<int32_t>(ival));
-    }
+    return makeStringTargetValue(chosen_type, translate_strings, ival);
   }
   if (chosen_type.is_decimal()) {
     if (decimal_to_double) {
-      if (ival ==
-          inline_int_null_val(SQLTypeInfo(decimal_to_int_type(chosen_type), false))) {
+      if (target_info.is_agg &&
+          (target_info.agg_kind == kAVG || target_info.agg_kind == kSUM ||
+           target_info.agg_kind == kSUM_IF || target_info.agg_kind == kMIN ||
+           target_info.agg_kind == kMAX) &&
+          ival == inline_int_null_val(SQLTypeInfo(kBIGINT, false))) {
+        return NULL_DOUBLE;
+      }
+      if (!chosen_type.get_notnull() &&
+          ival ==
+              inline_int_null_val(SQLTypeInfo(decimal_to_int_type(chosen_type), false))) {
         return NULL_DOUBLE;
       }
       return static_cast<double>(ival) / exp_to_scale(chosen_type.get_scale());
@@ -1683,6 +2209,54 @@ TargetValue ResultSet::makeTargetValue(const int8_t* ptr,
   }
   CHECK(false);
   return TargetValue(int64_t(0));
+}
+
+TargetValue getTargetValueFromFlatBuffer(
+    const int8_t* col_ptr,
+    const TargetInfo& target_info,
+    const size_t slot_idx,
+    const size_t target_logical_idx,
+    const size_t global_entry_idx,
+    const size_t local_entry_idx,
+    const bool translate_strings,
+    const std::shared_ptr<RowSetMemoryOwner>& row_set_mem_owner_) {
+  CHECK(FlatBufferManager::isFlatBuffer(col_ptr));
+  FlatBufferManager m{const_cast<int8_t*>(col_ptr)};
+  FlatBufferManager::Status status{};
+  CHECK(m.isNestedArray());
+  switch (target_info.sql_type.get_type()) {
+    case kARRAY: {
+      ArrayDatum ad;
+      FlatBufferManager::NestedArrayItem<1> item;
+      status = m.getItem(local_entry_idx, item);
+      if (status == FlatBufferManager::Status::Success) {
+        ad.length = item.nof_values * m.getValueSize();
+        ad.pointer = item.values;
+        ad.is_null = item.is_null;
+      } else {
+        ad.length = 0;
+        ad.pointer = NULL;
+        ad.is_null = true;
+        CHECK_EQ(status, FlatBufferManager::Status::ItemUnspecifiedError);
+      }
+      if (ad.is_null) {
+        return ArrayTargetValue(boost::optional<std::vector<ScalarTargetValue>>{});
+      }
+      CHECK_GE(ad.length, 0u);
+      if (ad.length > 0) {
+        CHECK(ad.pointer);
+      }
+      return build_array_target_value(target_info.sql_type,
+                                      ad.pointer,
+                                      ad.length,
+                                      translate_strings,
+                                      row_set_mem_owner_);
+    } break;
+    default:
+      UNREACHABLE() << "ti=" << target_info.sql_type;
+  }
+  CHECK(false);
+  return {};
 }
 
 // Gets the TargetValue stored at position local_entry_idx in the col1_ptr and col2_ptr
@@ -1702,6 +2276,18 @@ TargetValue ResultSet::getTargetValueFromBufferColwise(
     const bool decimal_to_double) const {
   CHECK(query_mem_desc_.didOutputColumnar());
   const auto col1_ptr = col_ptr;
+  if (target_info.sql_type.usesFlatBuffer()) {
+    CHECK(FlatBufferManager::isFlatBuffer(col_ptr))
+        << "target_info.sql_type=" << target_info.sql_type;
+    return getTargetValueFromFlatBuffer(col_ptr,
+                                        target_info,
+                                        slot_idx,
+                                        target_logical_idx,
+                                        global_entry_idx,
+                                        local_entry_idx,
+                                        translate_strings,
+                                        row_set_mem_owner_);
+  }
   const auto compact_sz1 = query_mem_desc.getPaddedSlotWidthBytes(slot_idx);
   const auto next_col_ptr =
       advance_to_next_columnar_target_buff(col1_ptr, query_mem_desc, slot_idx);
@@ -1713,7 +2299,6 @@ TargetValue ResultSet::getTargetValueFromBufferColwise(
                             is_real_str_or_array(target_info))
                                ? query_mem_desc.getPaddedSlotWidthBytes(slot_idx + 1)
                                : 0;
-
   // TODO(Saman): add required logics for count distinct
   // geospatial target values:
   if (target_info.sql_type.is_geometry()) {
@@ -1772,6 +2357,11 @@ TargetValue ResultSet::getTargetValueFromBufferRowwise(
     const bool translate_strings,
     const bool decimal_to_double,
     const bool fixup_count_distinct_pointers) const {
+  // FlatBuffer can exists only in a columnar storage. If the
+  // following check fails it means that storage specific attributes
+  // of type info have leaked.
+  CHECK(!target_info.sql_type.usesFlatBuffer());
+
   if (UNLIKELY(fixup_count_distinct_pointers)) {
     if (is_distinct_target(target_info)) {
       auto count_distinct_ptr_ptr = reinterpret_cast<int64_t*>(rowwise_target_ptr);
@@ -1787,11 +2377,8 @@ TargetValue ResultSet::getTargetValueFromBufferRowwise(
           const auto bitmap_byte_sz = count_distinct_desc.sub_bitmap_count == 1
                                           ? count_distinct_desc.bitmapSizeBytes()
                                           : count_distinct_desc.bitmapPaddedSizeBytes();
-          auto count_distinct_buffer =
-              static_cast<int8_t*>(checked_malloc(bitmap_byte_sz));
-          memset(count_distinct_buffer, 0, bitmap_byte_sz);
-          row_set_mem_owner_->addCountDistinctBuffer(
-              count_distinct_buffer, bitmap_byte_sz, true);
+          auto count_distinct_buffer = row_set_mem_owner_->allocateCountDistinctBuffer(
+              bitmap_byte_sz, /*thread_idx=*/0);
           *count_distinct_ptr_ptr = reinterpret_cast<int64_t>(count_distinct_buffer);
         }
       }
@@ -1878,12 +2465,9 @@ bool ResultSetStorage::isEmptyEntry(const size_t entry_idx, const int8_t* buff) 
     CHECK_GE(query_mem_desc_.getTargetIdxForKey(), 0);
     CHECK_LT(static_cast<size_t>(query_mem_desc_.getTargetIdxForKey()),
              target_init_vals_.size());
-    const auto key_bytes_with_padding =
-        align_to_int64(get_key_bytes_rowwise(query_mem_desc_));
-    const auto rowwise_target_ptr =
-        row_ptr_rowwise(buff, query_mem_desc_, entry_idx) + key_bytes_with_padding;
-    const auto target_slot_off =
-        get_byteoff_of_slot(query_mem_desc_.getTargetIdxForKey(), query_mem_desc_);
+    const auto rowwise_target_ptr = row_ptr_rowwise(buff, query_mem_desc_, entry_idx);
+    const auto target_slot_off = result_set::get_byteoff_of_slot(
+        query_mem_desc_.getTargetIdxForKey(), query_mem_desc_);
     return read_int_from_buff(rowwise_target_ptr + target_slot_off,
                               query_mem_desc_.getPaddedSlotWidthBytes(
                                   query_mem_desc_.getTargetIdxForKey())) ==
@@ -1892,7 +2476,7 @@ bool ResultSetStorage::isEmptyEntry(const size_t entry_idx, const int8_t* buff) 
     const auto keys_ptr = row_ptr_rowwise(buff, query_mem_desc_, entry_idx);
     switch (query_mem_desc_.getEffectiveKeyWidth()) {
       case 4:
-        CHECK(QueryDescriptionType::GroupByBaselineHash ==
+        CHECK(QueryDescriptionType::GroupByPerfectHash !=
               query_mem_desc_.getQueryDescriptionType());
         return *reinterpret_cast<const int32_t*>(keys_ptr) == EMPTY_KEY_32;
       case 8:
@@ -1906,13 +2490,19 @@ bool ResultSetStorage::isEmptyEntry(const size_t entry_idx, const int8_t* buff) 
 
 /*
  * Returns true if the entry contain empty keys
- * This function should only be used with columanr format.
+ * This function should only be used with columnar format.
  */
 bool ResultSetStorage::isEmptyEntryColumnar(const size_t entry_idx,
                                             const int8_t* buff) const {
   CHECK(query_mem_desc_.didOutputColumnar());
   if (query_mem_desc_.getQueryDescriptionType() ==
       QueryDescriptionType::NonGroupedAggregate) {
+    return false;
+  }
+  if (query_mem_desc_.getQueryDescriptionType() == QueryDescriptionType::TableFunction) {
+    // For table functions the entry count should always be set to the actual output size
+    // (i.e. there are not empty entries), so just assume value is non-empty
+    CHECK_LT(entry_idx, getEntryCount());
     return false;
   }
   if (query_mem_desc_.hasKeylessHash()) {
@@ -1935,7 +2525,7 @@ bool ResultSetStorage::isEmptyEntryColumnar(const size_t entry_idx,
     if (query_mem_desc_.getQueryDescriptionType() == QueryDescriptionType::Projection) {
       return reinterpret_cast<const int64_t*>(buff)[entry_idx] == EMPTY_KEY_64;
     } else {
-      CHECK(query_mem_desc_.groupColWidthsSize() > 0);
+      CHECK(query_mem_desc_.getGroupbyColCount() > 0);
       const auto target_buff = buff + query_mem_desc_.getPrependedGroupColOffInBytes(0);
       switch (query_mem_desc_.groupColWidth(0)) {
         case 8:
@@ -1955,6 +2545,52 @@ bool ResultSetStorage::isEmptyEntryColumnar(const size_t entry_idx,
   return false;
 }
 
+namespace {
+
+template <typename T>
+inline size_t make_bin_search(size_t l, size_t r, T&& is_empty_fn) {
+  // Avoid search if there are no empty keys.
+  if (!is_empty_fn(r - 1)) {
+    return r;
+  }
+
+  --r;
+  while (l != r) {
+    size_t c = (l + r) / 2;
+    if (is_empty_fn(c)) {
+      r = c;
+    } else {
+      l = c + 1;
+    }
+  }
+
+  return r;
+}
+
+}  // namespace
+
+size_t ResultSetStorage::binSearchRowCount() const {
+  // Note that table function result sets should never use this path as the row count
+  // can be known statically (as the output buffers do not contain empty entries)
+  CHECK(query_mem_desc_.getQueryDescriptionType() == QueryDescriptionType::Projection);
+  CHECK_EQ(query_mem_desc_.getEffectiveKeyWidth(), size_t(8));
+
+  if (!query_mem_desc_.getEntryCount()) {
+    return 0;
+  }
+
+  if (query_mem_desc_.didOutputColumnar()) {
+    return make_bin_search(0, query_mem_desc_.getEntryCount(), [this](size_t idx) {
+      return reinterpret_cast<const int64_t*>(buff_)[idx] == EMPTY_KEY_64;
+    });
+  } else {
+    return make_bin_search(0, query_mem_desc_.getEntryCount(), [this](size_t idx) {
+      const auto keys_ptr = row_ptr_rowwise(buff_, query_mem_desc_, idx);
+      return *reinterpret_cast<const int64_t*>(keys_ptr) == EMPTY_KEY_64;
+    });
+  }
+}
+
 bool ResultSetStorage::isEmptyEntry(const size_t entry_idx) const {
   return isEmptyEntry(entry_idx, buff_);
 }
@@ -1969,8 +2605,7 @@ bool ResultSet::isNull(const SQLTypeInfo& ti,
     return val.i1 == null_val_bit_pattern(ti, float_argument_input);
   }
   if (val.isPair()) {
-    return !val.i2 ||
-           pair_to_double({val.i1, val.i2}, ti, float_argument_input) == NULL_DOUBLE;
+    return !val.i2;
   }
   if (val.isStr()) {
     return !val.i1;

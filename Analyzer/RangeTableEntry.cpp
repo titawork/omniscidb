@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 OmniSci, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -55,7 +55,10 @@ void RangeTableEntry::expand_star_in_targetlist(
       catalog.getAllColumnMetadataForTable(table_desc->tableId, false, true, true);
   for (auto col_desc : column_descs) {
     auto cv = makeExpr<ColumnVar>(
-        col_desc->columnType, table_desc->tableId, col_desc->columnId, rte_idx);
+        col_desc->columnType,
+        shared::ColumnKey{
+            catalog.getDatabaseId(), table_desc->tableId, col_desc->columnId},
+        rte_idx);
     auto tle = std::make_shared<TargetEntry>(col_desc->columnName, cv, false);
     tlist.push_back(tle);
   }

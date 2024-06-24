@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,7 +16,8 @@
 
 /**
  * @file		SqliteConnector.h
- * @author		Todd Mostak <todd@map-d.com>
+ * @brief
+ *
  */
 
 #ifndef SQLITE_CONNECTOR
@@ -27,15 +28,25 @@
 #include <string>
 #include <vector>
 
-#include "sqlite3.h"
+#include <sqlite3.h>
 
 class SqliteConnector {
  public:
   SqliteConnector(const std::string& dbName, const std::string& dir = ".");
-  ~SqliteConnector();
-  void query(const std::string& queryString);
+  SqliteConnector(sqlite3* db);
+  SqliteConnector() {}
+  virtual ~SqliteConnector();
 
-  void query_with_text_params(std::string const& query_only) { query(query_only); }
+  void reset(const std::string& path) {
+    sqlite3_close(db_);
+    sqlite3_open(path.c_str(), &db_);
+  }
+
+  virtual void query(const std::string& queryString);
+
+  virtual void query_with_text_params(std::string const& query_only) {
+    query(query_only);
+  }
   template <typename STRING_CONTAINER>
   void query_with_text_params(STRING_CONTAINER const& query_and_text_params) {
     query_with_text_params(
@@ -43,13 +54,22 @@ class SqliteConnector {
         std::vector<std::string>{std::next(query_and_text_params.begin()),
                                  query_and_text_params.end()});
   }
-  void query_with_text_params(const std::string& queryString,
-                              const std::vector<std::string>& text_param);
-  void query_with_text_param(const std::string& queryString,
-                             const std::string& text_param);
+  virtual void query_with_text_params(const std::string& queryString,
+                                      const std::vector<std::string>& text_param);
 
-  size_t getNumRows() const { return numRows_; }
-  size_t getNumCols() const { return numCols_; }
+  enum class BindType { TEXT = 1, BLOB, NULL_TYPE };
+  virtual void query_with_text_params(const std::string& queryString,
+                                      const std::vector<std::string>& text_params,
+                                      const std::vector<BindType>& bind_types);
+
+  virtual void query_with_text_param(const std::string& queryString,
+                                     const std::string& text_param);
+
+  virtual void batch_insert(const std::string& table_name,
+                            std::vector<std::vector<std::string>>& insert_vals);
+
+  virtual size_t getNumRows() const { return numRows_; }
+  virtual size_t getNumCols() const { return numCols_; }
 
   template <typename T>
   T getData(const int row, const int col) {
@@ -66,6 +86,8 @@ class SqliteConnector {
 
   std::vector<std::string> columnNames;  // make this public for easy access
   std::vector<int> columnTypes;
+
+  auto getSqlitePtr() const { return db_; }
 
  private:
   struct NullableResult {

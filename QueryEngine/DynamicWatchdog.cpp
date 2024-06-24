@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,10 +18,11 @@
 #include <chrono>
 #include <thread>
 
-#include <glog/logging.h>
 #include "DynamicWatchdog.h"
+#include "Logger/Logger.h"
+#include "Shared/funcannotations.h"
 
-static __inline__ uint64_t read_cycle_counter(void) {
+static FORCE_INLINE uint64_t read_cycle_counter(void) {
 #if (defined(__x86_64__) || defined(__x86_64))
   unsigned hi, lo;
   __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
@@ -32,16 +33,14 @@ static __inline__ uint64_t read_cycle_counter(void) {
 #endif
 }
 
-extern "C" uint64_t dynamic_watchdog_init(unsigned ms_budget) {
+extern "C" RUNTIME_EXPORT uint64_t dynamic_watchdog_init(unsigned ms_budget) {
   static uint64_t dw_cycle_start = 0ULL;
   static uint64_t dw_cycle_budget = 0ULL;
   static std::atomic_bool dw_abort{false};
 
   if (ms_budget == static_cast<unsigned>(DW_DEADLINE)) {
     if (dw_abort.load()) {
-      {
-        return 0LL;
-      }
+      { return 0LL; }
     }
     return dw_cycle_start + dw_cycle_budget;
   }
@@ -66,7 +65,7 @@ extern "C" uint64_t dynamic_watchdog_init(unsigned ms_budget) {
 }
 
 // timeout detection
-extern "C" bool dynamic_watchdog() {
+extern "C" RUNTIME_EXPORT bool dynamic_watchdog() {
   auto clock = read_cycle_counter();
   auto dw_deadline = dynamic_watchdog_init(static_cast<unsigned>(DW_DEADLINE));
   if (clock > dw_deadline) {

@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,16 +16,15 @@
 
 /**
  * @file		Regex.cpp
- * @author		Dmitri Shtilman <d@mapd.com>
  * @brief		Support the REGEX operator and REGEX_LIKE function in SQL.
  *
- * Copyright (c) 2016 MapD Technologies, Inc.  All rights reserved.
- **/
+ */
 
 #include "Regexp.h"
 
 #ifndef __CUDACC__
-#include <boost/regex.hpp>
+#include <stdexcept>
+#include "Shared/clean_boost_regex.hpp"
 #endif
 
 /*
@@ -37,11 +36,11 @@
  * @param escape_char the escape character.  '\\' is expected by default.
  * @return true if str matches pattern, false otherwise.
  */
-extern "C" DEVICE bool regexp_like(const char* str,
-                                   const int32_t str_len,
-                                   const char* pattern,
-                                   const int32_t pat_len,
-                                   const char escape_char) {
+extern "C" RUNTIME_EXPORT DEVICE bool regexp_like(const char* str,
+                                                  const int32_t str_len,
+                                                  const char* pattern,
+                                                  const int32_t pat_len,
+                                                  const char escape_char) {
 #ifndef __CUDACC__
   bool result;
   try {
@@ -58,12 +57,12 @@ extern "C" DEVICE bool regexp_like(const char* str,
 #endif
 }
 
-extern "C" DEVICE int8_t regexp_like_nullable(const char* str,
-                                              const int32_t str_len,
-                                              const char* pattern,
-                                              const int32_t pat_len,
-                                              const char escape_char,
-                                              const int8_t bool_null) {
+extern "C" RUNTIME_EXPORT DEVICE int8_t regexp_like_nullable(const char* str,
+                                                             const int32_t str_len,
+                                                             const char* pattern,
+                                                             const int32_t pat_len,
+                                                             const char escape_char,
+                                                             const int8_t bool_null) {
   if (!str || !pattern) {
     return bool_null;
   }

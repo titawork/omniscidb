@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,10 +15,9 @@
  */
 
 #include "RelLeftDeepInnerJoin.h"
-#include "RelAlgAbstractInterpreter.h"
+#include "Logger/Logger.h"
+#include "RelAlgDag.h"
 #include "RexVisitor.h"
-
-#include <glog/logging.h>
 
 #include <numeric>
 
@@ -46,7 +45,9 @@ RelLeftDeepInnerJoin::RelLeftDeepInnerJoin(
                               .get_notnull();
       }
       switch (original_join->getJoinType()) {
-        case JoinType::INNER: {
+        case JoinType::INNER:
+        case JoinType::SEMI:
+        case JoinType::ANTI: {
           if (original_join->getCondition()) {
             operands.emplace_back(original_join->getAndReleaseCondition());
           }
@@ -101,15 +102,31 @@ const RexScalar* RelLeftDeepInnerJoin::getOuterCondition(
       .get();
 }
 
-std::string RelLeftDeepInnerJoin::toString() const {
-  std::string result =
-      "(RelLeftDeepInnerJoin<" + std::to_string(reinterpret_cast<uint64_t>(this)) + ">(";
-  result += condition_->toString();
-  for (const auto& input : inputs_) {
-    result += " " + input->toString();
+const JoinType RelLeftDeepInnerJoin::getJoinType(const size_t nesting_level) const {
+  CHECK_LE(nesting_level, original_joins_.size());
+  return original_joins_[original_joins_.size() - nesting_level]->getJoinType();
+}
+
+std::string RelLeftDeepInnerJoin::toString(RelRexToStringConfig config) const {
+  if (!config.attributes_only) {
+    std::string ret = ::typeName(this) + "(";
+    ret += condition_->toString(config);
+    if (!config.skip_input_nodes) {
+      for (const auto& input : inputs_) {
+        ret += " " + input->toString(config);
+      }
+    } else {
+      ret += ", input node id={";
+      for (auto& input : inputs_) {
+        ret += std::to_string(input->getId()) + " ";
+      }
+      ret += "}";
+    }
+    ret += ")";
+    return ret;
+  } else {
+    return ::typeName(this) + "()";
   }
-  result += ")";
-  return result;
 }
 
 size_t RelLeftDeepInnerJoin::size() const {
@@ -118,6 +135,10 @@ size_t RelLeftDeepInnerJoin::size() const {
     total_size += input->size();
   }
   return total_size;
+}
+
+size_t RelLeftDeepInnerJoin::getOuterConditionsSize() const {
+  return outer_conditions_per_level_.size();
 }
 
 std::shared_ptr<RelAlgNode> RelLeftDeepInnerJoin::deepCopy() const {
@@ -135,6 +156,17 @@ bool RelLeftDeepInnerJoin::coversOriginalNode(const RelAlgNode* node) const {
     }
   }
   return false;
+}
+
+const RelFilter* RelLeftDeepInnerJoin::getOriginalFilter() const {
+  return original_filter_.get();
+}
+
+std::vector<std::shared_ptr<const RelJoin>> RelLeftDeepInnerJoin::getOriginalJoins()
+    const {
+  std::vector<std::shared_ptr<const RelJoin>> original_joins;
+  original_joins.assign(original_joins_.begin(), original_joins_.end());
+  return original_joins;
 }
 
 namespace {
@@ -230,7 +262,8 @@ std::shared_ptr<const RelAlgNode> get_left_deep_join_root(
     if (!join) {
       return nullptr;
     }
-    if (join->getJoinType() == JoinType::INNER) {
+    if (join->getJoinType() == JoinType::INNER || join->getJoinType() == JoinType::SEMI ||
+        join->getJoinType() == JoinType::ANTI) {
       return node;
     }
   }
@@ -251,7 +284,8 @@ void rebind_inputs_from_left_deep_join(const RexScalar* rex,
 }
 
 void create_left_deep_join(std::vector<std::shared_ptr<RelAlgNode>>& nodes) {
-  for (const auto& left_deep_join_candidate : nodes) {
+  std::list<std::shared_ptr<RelAlgNode>> new_nodes;
+  for (auto& left_deep_join_candidate : nodes) {
     std::shared_ptr<RelLeftDeepInnerJoin> left_deep_join;
     std::shared_ptr<const RelAlgNode> old_root;
     std::tie(left_deep_join, old_root) = create_left_deep_join(left_deep_join_candidate);
@@ -286,5 +320,12 @@ void create_left_deep_join(std::vector<std::shared_ptr<RelAlgNode>>& nodes) {
         }
       }
     }
+
+    new_nodes.emplace_back(std::move(left_deep_join));
   }
+
+  // insert the new left join nodes to the front of the owned RelAlgNode list.
+  // This is done to ensure all created RelAlgNodes exist in this list for later
+  // visitation, such as RelAlgDag::resetQueryExecutionState.
+  nodes.insert(nodes.begin(), new_nodes.begin(), new_nodes.end());
 }

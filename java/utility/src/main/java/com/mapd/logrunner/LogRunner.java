@@ -15,21 +15,6 @@
  */
 package com.mapd.logrunner;
 
-import com.mapd.thrift.server.MapD;
-import com.mapd.thrift.server.TColumn;
-import com.mapd.thrift.server.TColumnData;
-import com.mapd.thrift.server.TColumnType;
-import com.mapd.thrift.server.TDBInfo;
-import com.mapd.thrift.server.TDatum;
-import com.mapd.thrift.server.TExecuteMode;
-import com.mapd.thrift.server.TMapDException;
-import com.mapd.thrift.server.TPixel;
-import com.mapd.thrift.server.TQueryResult;
-import com.mapd.thrift.server.TRenderResult;
-import com.mapd.thrift.server.TRow;
-import com.mapd.thrift.server.TRowSet;
-import com.mapd.thrift.server.TTableDetails;
-
 import org.apache.thrift.TException;
 import org.apache.thrift.protocol.TJSONProtocol;
 import org.apache.thrift.protocol.TProtocol;
@@ -55,10 +40,21 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 
-/**
- *
- * @author michael
- */
+import ai.heavy.thrift.server.Heavy;
+import ai.heavy.thrift.server.TColumn;
+import ai.heavy.thrift.server.TColumnData;
+import ai.heavy.thrift.server.TColumnType;
+import ai.heavy.thrift.server.TDBException;
+import ai.heavy.thrift.server.TDBInfo;
+import ai.heavy.thrift.server.TDatum;
+import ai.heavy.thrift.server.TExecuteMode;
+import ai.heavy.thrift.server.TPixel;
+import ai.heavy.thrift.server.TQueryResult;
+import ai.heavy.thrift.server.TRenderResult;
+import ai.heavy.thrift.server.TRow;
+import ai.heavy.thrift.server.TRowSet;
+import ai.heavy.thrift.server.TTableDetails;
+
 public class LogRunner {
   final static Logger logger = LoggerFactory.getLogger(LogRunner.class);
   private HashMap<Integer, String> sqlquery;
@@ -89,14 +85,14 @@ public class LogRunner {
     logger.info("In doWork here");
 
     int numberThreads = 3;
-    //    Runnable[] worker = new Runnable[numberThreads];
+    // Runnable[] worker = new Runnable[numberThreads];
     //
-    //    for (int i = 0; i < numberThreads; i++){
+    // for (int i = 0; i < numberThreads; i++){
     //
-    MapD.Client client = getClient(args[0], Integer.valueOf(args[1]));
+    Heavy.Client client = getClient(args[0], Integer.valueOf(args[1]));
     String session = getSession(client);
-    //      worker[i] = new myThread(client, session);
-    //    }
+    // worker[i] = new myThread(client, session);
+    // }
 
     logger.info("got session");
     try {
@@ -108,7 +104,8 @@ public class LogRunner {
               new ArrayBlockingQueue<Runnable>(15),
               new ThreadPoolExecutor.CallerRunsPolicy());
       while (true) {
-        // BufferedReader in = new BufferedReader(new FileReader("/data/logfiles/log1"));
+        // BufferedReader in = new BufferedReader(new
+        // FileReader("/data/logfiles/log1"));
         BufferedReader in = new BufferedReader(new FileReader(args[2]));
         String str;
         int current = 0;
@@ -126,7 +123,7 @@ public class LogRunner {
     }
   }
 
-  private MapD.Client getClient(String hostname, int port) throws TTransportException {
+  private Heavy.Client getClient(String hostname, int port) throws TTransportException {
     TTransport transport = null;
 
     // transport = new TSocket("localhost", 6274);
@@ -138,24 +135,24 @@ public class LogRunner {
     TProtocol protocol = new TJSONProtocol(transport);
     // TProtocol protocol = new TProtocol(transport);
 
-    return new MapD.Client(protocol);
+    return new Heavy.Client(protocol);
   }
 
-  private String getSession(MapD.Client client)
-          throws TTransportException, TMapDException, TException {
+  private String getSession(Heavy.Client client)
+          throws TTransportException, TDBException, TException {
     String session = client.connect("mapd", "HyperInteractive", "mapd");
     logger.info("Connected session is " + session);
     return session;
   }
 
-  private void closeSession(MapD.Client client, String session)
-          throws TMapDException, TException {
+  private void closeSession(Heavy.Client client, String session)
+          throws TDBException, TException {
     // Now disconnect
     logger.info("Trying to disconnect session " + session);
     client.disconnect(session);
   }
 
-  private void theRest(MapD.Client client, String session) throws TException {
+  private void theRest(Heavy.Client client, String session) throws TException {
     // lets fetch databases from mapd
     List<TDBInfo> dbs = client.get_databases(session);
 
@@ -192,7 +189,7 @@ public class LogRunner {
             null,
             -1,
             -1);
-    // client.send_sql_execute(session, "Select BRAND  from ACV ;", true);
+    // client.send_sql_execute(session, "Select BRAND from ACV ;", true);
     // logger.info(" -- before query recv -- ");
     // TQueryResult sql_execute = client.recv_sql_execute();
 
@@ -240,10 +237,10 @@ public class LogRunner {
 
   public class myThread implements Runnable {
     private String str;
-    private MapD.Client client;
+    private Heavy.Client client;
     private String session;
 
-    myThread(String str1, MapD.Client client1, String session1) {
+    myThread(String str1, Heavy.Client client1, String session1) {
       str = str1;
       client = client1;
       session = session1;
@@ -257,7 +254,7 @@ public class LogRunner {
         String header = str.substring(0, logStart).trim();
 
         String[] headDet = header.split(" .");
-        // logger.info("header "+ header + " count " + headDet.length +  " detail " + det
+        // logger.info("header "+ header + " count " + headDet.length + " detail " + det
         // );
         if (headDet.length != 4 || headDet[0].equals("Log")) {
           return;
@@ -270,8 +267,9 @@ public class LogRunner {
           logger.info("run query " + sl[1]);
           try {
             client.sql_execute(session, sl[1], true, null, -1, -1);
-          } catch (TMapDException ex1) {
-            logger.error("Failed to execute " + sl[1] + " exception " + ex1.toString());
+          } catch (TDBException ex1) {
+            logger.error(
+                    "Failed to execute " + sl[1] + " exception " + ex1.getError_msg());
           } catch (TException ex) {
             logger.error("Failed to execute " + sl[1] + " exception " + ex.toString());
           }
@@ -280,7 +278,7 @@ public class LogRunner {
 
         // get_result_row_for_pixel
         // :5pFFQUCKs17GLHOqI7ykK09U8mX7GnLF:widget_id:3:pixel.x:396:pixel.y:53:column_format:1
-        //:PixelRadius:2:table_col_names::points,dest,conv_4326_900913_x(dest_lon) as
+        // :PixelRadius:2:table_col_names::points,dest,conv_4326_900913_x(dest_lon) as
         // x,conv_4326_900913_y(dest_lat) as y,arrdelay as size
         if (det.contains("get_result_row_for_pixel :")) {
           logger.info("det " + det);
@@ -306,9 +304,9 @@ public class LogRunner {
                     Boolean.TRUE,
                     Integer.parseInt(ss[11]),
                     null);
-          } catch (TMapDException ex1) {
+          } catch (TDBException ex1) {
             logger.error("Failed to execute get_result_row_for_pixel exception "
-                    + ex1.toString());
+                    + ex1.getError_msg());
           } catch (TException ex) {
             logger.error("Failed to execute get_result_row_for_pixel exception "
                     + ex.toString());

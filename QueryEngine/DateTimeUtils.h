@@ -1,5 +1,5 @@
 /*
- * Copyright 2018 OmniSci, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,9 +22,9 @@
 #include <cstdint>
 #include <ctime>
 #include <map>
+#include <string>
 
 #include "../Shared/sqldefs.h"
-#include "../Shared/unreachable.h"
 
 namespace {
 
@@ -45,6 +45,9 @@ static const std::map<std::pair<int32_t, DatetruncField>, int64_t>
 
 namespace DateTimeUtils {
 
+// Enum helpers for precision scaling up/down.
+enum ScalingType { ScaleUp, ScaleDown };
+
 constexpr inline int64_t get_timestamp_precision_scale(const int32_t dimen) {
   switch (dimen) {
     case 0:
@@ -56,7 +59,7 @@ constexpr inline int64_t get_timestamp_precision_scale(const int32_t dimen) {
     case 9:
       return kNanoSecsPerSec;
     default:
-      UNREACHABLE();
+      throw std::runtime_error("Unknown dimen = " + std::to_string(dimen));
   }
   return -1;
 }
@@ -70,7 +73,7 @@ constexpr inline int64_t get_dateadd_timestamp_precision_scale(const DateaddFiel
     case daNANOSECOND:
       return kNanoSecsPerSec;
     default:
-      UNREACHABLE();
+      throw std::runtime_error("Unknown field = " + std::to_string(field));
   }
   return -1;
 }
@@ -84,7 +87,7 @@ constexpr inline int64_t get_extract_timestamp_precision_scale(const ExtractFiel
     case kNANOSECOND:
       return kNanoSecsPerSec;
     default:
-      UNREACHABLE();
+      throw std::runtime_error("Unknown field = " + std::to_string(field));
   }
   return -1;
 }
@@ -114,7 +117,7 @@ const inline std::pair<SQLOps, int64_t> get_dateadd_high_precision_adjusted_scal
         case 3:
           return {kDIVIDE, kMicroSecsPerSec};
         default:
-          UNREACHABLE();
+          throw std::runtime_error("Unknown dimen = " + std::to_string(dimen));
       }
     case daMICROSECOND:
       switch (dimen) {
@@ -125,7 +128,7 @@ const inline std::pair<SQLOps, int64_t> get_dateadd_high_precision_adjusted_scal
         case 3:
           return {kDIVIDE, kMilliSecsPerSec};
         default:
-          UNREACHABLE();
+          throw std::runtime_error("Unknown dimen = " + std::to_string(dimen));
       }
     case daMILLISECOND:
       switch (dimen) {
@@ -136,10 +139,10 @@ const inline std::pair<SQLOps, int64_t> get_dateadd_high_precision_adjusted_scal
         case 3:
           return {};
         default:
-          UNREACHABLE();
+          throw std::runtime_error("Unknown dimen = " + std::to_string(dimen));
       }
     default:
-      UNREACHABLE();
+      throw std::runtime_error("Unknown field = " + std::to_string(field));
   }
   return {};
 }
@@ -161,6 +164,26 @@ const inline int64_t get_datetrunc_high_precision_scale(const DatetruncField& fi
     return result->second;
   }
   return -1;
+}
+
+constexpr inline int64_t get_datetime_scaled_epoch(const ScalingType direction,
+                                                   const int64_t epoch,
+                                                   const int32_t dimen) {
+  switch (direction) {
+    case ScaleUp: {
+      const auto scaled_epoch = epoch * get_timestamp_precision_scale(dimen);
+      if (epoch && epoch != scaled_epoch / get_timestamp_precision_scale(dimen)) {
+        throw std::runtime_error(
+            "Value Overflow/underflow detected while scaling DateTime precision.");
+      }
+      return scaled_epoch;
+    }
+    case ScaleDown:
+      return epoch / get_timestamp_precision_scale(dimen);
+    default:
+      abort();
+  }
+  return std::numeric_limits<int64_t>::min();
 }
 
 }  // namespace DateTimeUtils

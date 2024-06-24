@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,8 +30,8 @@ bool is_qualified_identifier_part(const char ch) {
 }  // namespace
 
 // Straightforward port from SqlAdvisor.getCompletionHints.
-std::string find_last_word_from_cursor(const std::string& sql, const ssize_t cursor) {
-  if (cursor > static_cast<ssize_t>(sql.size())) {
+std::string find_last_word_from_cursor(const std::string& sql, const int64_t cursor) {
+  if (cursor > static_cast<int64_t>(sql.size())) {
     return "";
   }
   auto word_start = cursor;
@@ -51,11 +51,11 @@ std::string find_last_word_from_cursor(const std::string& sql, const ssize_t cur
   // Search forwards to the end of the word we should remove. Eat up
   // trailing double-quote, if any
   auto word_end = cursor;
-  while (word_end < static_cast<ssize_t>(sql.size()) &&
+  while (word_end < static_cast<int64_t>(sql.size()) &&
          is_qualified_identifier_part(sql[word_end - 1])) {
     ++word_end;
   }
-  if (quoted && (word_end < static_cast<ssize_t>(sql.size())) && (sql[word_end] == '"')) {
+  if (quoted && (word_end < static_cast<int64_t>(sql.size())) && (sql[word_end] == '"')) {
     ++word_end;
   }
   std::string last_word(sql.begin() + word_start + (quoted ? 1 : 0),
@@ -79,7 +79,7 @@ std::vector<TCompletionHint> just_whitelisted_keyword_hints(
     }
     auto filtered_hint = original_hint;
     filtered_hint.hints.clear();
-    for (const auto hint_token : original_hint.hints) {
+    for (const auto& hint_token : original_hint.hints) {
       if (whitelisted_keywords.find(to_upper(hint_token)) != whitelisted_keywords.end()) {
         filtered_hint.hints.push_back(hint_token);
       }

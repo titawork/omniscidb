@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,15 +30,12 @@
 #include "../Catalog/Catalog.h"
 #include "../DataMgr/DataMgr.h"
 #include "../Fragmenter/Fragmenter.h"
-#include "../Parser/ParserNode.h"
-#include "../Parser/parser.h"
 #include "../QueryRunner/QueryRunner.h"
 #include "PopulateTableRandom.h"
 #include "ScanTable.h"
-#include "Shared/MapDParameters.h"
+#include "TestHelpers.h"
 #include "boost/filesystem.hpp"
 #include "boost/program_options.hpp"
-#include "glog/logging.h"
 #include "gtest/gtest.h"
 
 using namespace std;
@@ -50,25 +47,25 @@ using namespace Fragmenter_Namespace;
 #define BASE_PATH "./tmp"
 #endif
 
+using QR = QueryRunner::QueryRunner;
 namespace {
-std::unique_ptr<SessionInfo> g_session;
 
 inline void run_ddl_statement(const string& input_str) {
-  QueryRunner::run_ddl_statement(input_str, g_session);
+  QR::get()->runDDLStatement(input_str);
 }
 
 bool storage_test(const string& table_name, size_t num_rows) {
   vector<size_t> insert_col_hashs =
-      populate_table_random(table_name, num_rows, g_session->getCatalog());
+      populate_table_random(table_name, num_rows, *QR::get()->getCatalog());
   vector<size_t> scan_col_hashs =
-      scan_table_return_hash(table_name, g_session->getCatalog());
+      scan_table_return_hash(table_name, *QR::get()->getCatalog());
   vector<size_t> scan_col_hashs2 =
-      scan_table_return_hash_non_iter(table_name, g_session->getCatalog());
+      scan_table_return_hash_non_iter(table_name, *QR::get()->getCatalog());
   return insert_col_hashs == scan_col_hashs && insert_col_hashs == scan_col_hashs2;
 }
 
 void simple_thread_wrapper(const string& table_name, size_t num_rows, size_t thread_id) {
-  populate_table_random(table_name, num_rows, g_session->getCatalog());
+  populate_table_random(table_name, num_rows, *QR::get()->getCatalog());
 }
 
 bool storage_test_parallel(const string& table_name,
@@ -83,9 +80,9 @@ bool storage_test_parallel(const string& table_name,
     t.join();
   }
   vector<size_t> scan_col_hashs =
-      scan_table_return_hash(table_name, g_session->getCatalog());
+      scan_table_return_hash(table_name, *QR::get()->getCatalog());
   vector<size_t> scan_col_hashs2 =
-      scan_table_return_hash_non_iter(table_name, g_session->getCatalog());
+      scan_table_return_hash_non_iter(table_name, *QR::get()->getCatalog());
   return scan_col_hashs == scan_col_hashs2;
 }
 }  // namespace
@@ -174,10 +171,10 @@ TEST(StorageSmallParallel, AllTypes) {
 }
 
 int main(int argc, char* argv[]) {
-  google::InitGoogleLogging(argv[0]);
+  TestHelpers::init_logger_stderr_only(argc, argv);
   ::testing::InitGoogleTest(&argc, argv);
 
-  g_session.reset(QueryRunner::get_session(BASE_PATH));
+  QR::init(BASE_PATH);
 
   int err{0};
   try {
@@ -185,6 +182,6 @@ int main(int argc, char* argv[]) {
   } catch (const std::exception& e) {
     LOG(ERROR) << e.what();
   }
-  g_session.reset(nullptr);
+  QR::reset();
   return err;
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,7 +18,6 @@
 #define AUTHMETADATA_H
 
 #include <string>
-
 struct AuthMetadata {
   AuthMetadata() {}
   int32_t port;
@@ -28,8 +27,8 @@ struct AuthMetadata {
   std::string ldapRoleRegex;
   std::string ldapSuperUserRole;
   std::string domainComp;
-  std::string restUrl;
-  std::string restToken;
+  bool pki_db_client_auth = false;
+  std::string ca_file_name;
   bool allowLocalAuthFallback;
 };
 

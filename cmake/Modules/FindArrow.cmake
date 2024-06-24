@@ -61,8 +61,8 @@ find_library(Arrow_DC_LIBRARY
   /usr/local/homebrew/lib
   /opt/local/lib)
 
-find_library(Arrow_GPU_LIBRARY
-  NAMES arrow_gpu
+find_library(Arrow_GPU_CUDA_LIBRARY
+  NAMES arrow_cuda
   HINTS
   ENV LD_LIBRARY_PATH
   ENV DYLD_LIBRARY_PATH
@@ -72,34 +72,44 @@ find_library(Arrow_GPU_LIBRARY
   /usr/local/homebrew/lib
   /opt/local/lib)
 
-get_filename_component(Arrow_LIBRARY_DIR ${Arrow_LIBRARY} DIRECTORY)
-
-# Set standard CMake FindPackage variables if found.
-set(Arrow_LIBRARIES ${Arrow_LIBRARY} ${Arrow_DC_LIBRARY})
-set(Arrow_GPU_LIBRARIES ${Arrow_GPU_LIBRARY})
-set(Arrow_LIBRARY_DIRS ${Arrow_LIBRARY_DIR})
-set(Arrow_INCLUDE_DIRS ${Arrow_LIBRARY_DIR}/../include)
-
-find_package(Snappy)
-if(Snappy_FOUND)
-  list(APPEND Arrow_LIBRARIES ${Snappy_LIBRARIES})
+if(Arrow_USE_STATIC_LIBS)
+  find_library(Arrow_DEPS_LIBRARY
+    NAMES arrow_bundled_dependencies
+    HINTS
+    ENV LD_LIBRARY_PATH
+    ENV DYLD_LIBRARY_PATH
+    PATHS
+    /usr/lib
+    /usr/local/lib
+    /usr/local/homebrew/lib
+    /opt/local/lib)
+else()
+  set(Arrow_DEPS_LIBRARY "")
 endif()
+
+get_filename_component(Arrow_LIBRARY_DIR ${Arrow_LIBRARY} DIRECTORY)
 
 if(Arrow_USE_STATIC_LIBS)
   set(CMAKE_FIND_LIBRARY_SUFFIXES ${_CMAKE_FIND_LIBRARY_SUFFIXES})
 endif()
 
-try_compile(HAVE_ARROW_STATIC_RECORDBATCH_CTOR
-  ${CMAKE_CURRENT_BINARY_DIR}
-  ${CMAKE_SOURCE_DIR}/cmake/Modules/arrow_static_recordbatch.cpp
-  COMPILE_DEFINITIONS -I${Arrow_INCLUDE_DIRS} -std=c++14
-  LINK_LIBRARIES ${Arrow_LIBRARY})
+# Set standard CMake FindPackage variables if found.
+set(Arrow_LIBRARIES ${Arrow_LIBRARY} ${Arrow_DC_LIBRARY} ${Arrow_DEPS_LIBRARY})
+set(Arrow_GPU_CUDA_LIBRARIES ${Arrow_GPU_CUDA_LIBRARY})
+set(Arrow_LIBRARY_DIRS ${Arrow_LIBRARY_DIR})
 
-try_compile(HAVE_ARROW_APPENDVALUES
+if(CMAKE_BUILD_TYPE STREQUAL "Debug" AND MSVC)
+  set(Arrow_INCLUDE_DIRS ${Arrow_LIBRARY_DIR}/../../include)
+else()
+  set(Arrow_INCLUDE_DIRS ${Arrow_LIBRARY_DIR}/../include)
+endif()
+
+# Arrow 4+ defines the default io context slightly differently
+try_compile(HAVE_ARROW_4_IO_CONTEXT
   ${CMAKE_CURRENT_BINARY_DIR}
-  ${CMAKE_SOURCE_DIR}/cmake/Modules/arrow_appendvalues.cpp
-  COMPILE_DEFINITIONS -I${Arrow_INCLUDE_DIRS} -std=c++14
-  LINK_LIBRARIES ${Arrow_LIBRARY})
+  ${CMAKE_SOURCE_DIR}/cmake/Modules/arrow_4_io_context.cpp
+  COMPILE_DEFINITIONS -I${Arrow_INCLUDE_DIRS} -std=c++17
+  LINK_LIBRARIES ${Arrow_LIBRARY} ${Arrow_DEPS_LIBRARY})
 
 include(FindPackageHandleStandardArgs)
 find_package_handle_standard_args(Arrow REQUIRED_VARS Arrow_LIBRARY)

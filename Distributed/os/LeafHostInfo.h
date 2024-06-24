@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,11 +16,9 @@
 
 /*
  * @file    LeafHostInfo.h
- * @author  Alex Suhan <alex@mapd.com>
  * @brief   Information about leaf nodes and utilities to parse a cluster configuration
  * file.
  *
- * Copyright (c) 2016 MapD Technologies, Inc.  All rights reserved.
  */
 
 #ifndef LEAFHOSTINFO_H
@@ -29,12 +27,11 @@
 #include <string>
 #include <vector>
 
-enum class NodeRole { DbLeaf, String };
+enum class NodeRole { NA };
 
 class LeafHostInfo {
  public:
-  LeafHostInfo(const std::string& host, const uint16_t port, const NodeRole role)
-      : host_(host), port_(port), role_(role) {}
+  LeafHostInfo(const std::string& host, const uint16_t port, const NodeRole role) {}
 
   const std::string& getHost() const { return host_; }
 
@@ -42,7 +39,15 @@ class LeafHostInfo {
 
   NodeRole getRole() const { return role_; }
 
-  static std::vector<LeafHostInfo> parseClusterConfig(const std::string& file_path) {
+  unsigned getConnectTimeout(unsigned connect_timeout) { return 0; }
+  unsigned getRecvTimeout(unsigned recv_timeout) { return 0; }
+  unsigned getSendTimeout() { return 0; }
+  std::string& getSSLCertFile() { return host_; }
+  static std::vector<LeafHostInfo> parseClusterConfig(const std::string& file_path,
+                                                      const unsigned connect_timeout,
+                                                      const unsigned recv_timeout,
+                                                      const unsigned send_timeout,
+                                                      const std::string& ca_cert) {
     return std::vector<LeafHostInfo>{};
   };
 

@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,7 +17,11 @@
 #ifndef RW_LOCKS_H
 #define RW_LOCKS_H
 
-#include "../Shared/mapd_shared_mutex.h"
+#include "OSDependent/heavyai_locks.h"
+#include "Shared/heavyai_shared_mutex.h"
+
+#include <atomic>
+#include <thread>
 
 namespace Catalog_Namespace {
 
@@ -36,7 +40,8 @@ namespace Catalog_Namespace {
 template <typename T>
 class read_lock {
   const T* catalog;
-  mapd_shared_lock<mapd_shared_mutex> lock;
+  heavyai::shared_lock<heavyai::shared_mutex> lock;
+  heavyai::shared_lock<heavyai::DistributedSharedMutex> dlock;
   bool holds_lock;
 
   template <typename inner_type>
@@ -44,7 +49,12 @@ class read_lock {
     std::thread::id tid = std::this_thread::get_id();
 
     if (cat->thread_holding_write_lock != tid && !inner_type::thread_holds_read_lock) {
-      lock = mapd_shared_lock<mapd_shared_mutex>(cat->sharedMutex_);
+      if (!g_multi_instance) {
+        lock = heavyai::shared_lock<heavyai::shared_mutex>(cat->sharedMutex_);
+      } else {
+        dlock =
+            heavyai::shared_lock<heavyai::DistributedSharedMutex>(*cat->dcatalogMutex_);
+      }
       inner_type::thread_holds_read_lock = true;
       holds_lock = true;
     }
@@ -53,9 +63,17 @@ class read_lock {
  public:
   read_lock(const T* cat) : catalog(cat), holds_lock(false) { lock_catalog(cat); }
 
-  ~read_lock() {
+  ~read_lock() { unlock(); }
+
+  void unlock() {
     if (holds_lock) {
       T::thread_holds_read_lock = false;
+      if (!g_multi_instance) {
+        lock.unlock();
+      } else {
+        dlock.unlock();
+      }
+      holds_lock = false;
     }
   }
 };
@@ -66,7 +84,8 @@ class sqlite_lock {
   // to ensure correct locking order
   read_lock<T> cat_read_lock;
   const T* catalog;
-  std::unique_lock<std::mutex> lock;
+  heavyai::unique_lock<std::mutex> lock;
+  heavyai::unique_lock<heavyai::DistributedSharedMutex> dlock;
   bool holds_lock;
 
   template <typename inner_type>
@@ -74,7 +93,12 @@ class sqlite_lock {
     std::thread::id tid = std::this_thread::get_id();
 
     if (cat->thread_holding_sqlite_lock != tid) {
-      lock = std::unique_lock<std::mutex>(cat->sqliteMutex_);
+      if (!g_multi_instance) {
+        lock = heavyai::unique_lock<std::mutex>(cat->sqliteMutex_);
+      } else {
+        dlock =
+            heavyai::unique_lock<heavyai::DistributedSharedMutex>(*cat->dsqliteMutex_);
+      }
       cat->thread_holding_sqlite_lock = tid;
       holds_lock = true;
     }
@@ -85,10 +109,19 @@ class sqlite_lock {
     lock_catalog(cat);
   }
 
-  ~sqlite_lock() {
+  ~sqlite_lock() { unlock(); }
+
+  void unlock() {
     if (holds_lock) {
       std::thread::id no_thread;
       catalog->thread_holding_sqlite_lock = no_thread;
+      if (!g_multi_instance) {
+        lock.unlock();
+      } else {
+        dlock.unlock();
+      }
+      cat_read_lock.unlock();
+      holds_lock = false;
     }
   }
 };
@@ -96,7 +129,8 @@ class sqlite_lock {
 template <typename T>
 class write_lock {
   const T* catalog;
-  mapd_unique_lock<mapd_shared_mutex> lock;
+  heavyai::unique_lock<heavyai::shared_mutex> lock;
+  heavyai::unique_lock<heavyai::DistributedSharedMutex> dlock;
   bool holds_lock;
 
   template <typename inner_type>
@@ -104,7 +138,12 @@ class write_lock {
     std::thread::id tid = std::this_thread::get_id();
 
     if (cat->thread_holding_write_lock != tid) {
-      lock = mapd_unique_lock<mapd_shared_mutex>(cat->sharedMutex_);
+      if (!g_multi_instance) {
+        lock = heavyai::unique_lock<heavyai::shared_mutex>(cat->sharedMutex_);
+      } else {
+        dlock =
+            heavyai::unique_lock<heavyai::DistributedSharedMutex>(*cat->dcatalogMutex_);
+      }
       cat->thread_holding_write_lock = tid;
       holds_lock = true;
     }
@@ -113,10 +152,18 @@ class write_lock {
  public:
   write_lock(const T* cat) : catalog(cat), holds_lock(false) { lock_catalog(cat); }
 
-  ~write_lock() {
+  ~write_lock() { unlock(); }
+
+  void unlock() {
     if (holds_lock) {
       std::thread::id no_thread;
       catalog->thread_holding_write_lock = no_thread;
+      if (!g_multi_instance) {
+        lock.unlock();
+      } else {
+        dlock.unlock();
+      }
+      holds_lock = false;
     }
   }
 };

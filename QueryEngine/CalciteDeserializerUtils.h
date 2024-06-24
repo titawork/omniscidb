@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,12 +22,14 @@
 
 #include "../Shared/sqldefs.h"
 #include "../Shared/sqltypes.h"
-
-#include <glog/logging.h>
+#include "Logger/Logger.h"
 
 inline SQLOps to_sql_op(const std::string& op_str) {
   if (op_str == std::string(">")) {
     return kGT;
+  }
+  if (op_str == std::string("IS NOT DISTINCT FROM")) {
+    return kBW_EQ;
   }
   if (op_str == std::string(">=")) {
     return kGE;
@@ -67,6 +69,9 @@ inline SQLOps to_sql_op(const std::string& op_str) {
   }
   if (op_str == std::string("CAST")) {
     return kCAST;
+  }
+  if (op_str == std::string("ENCODE_TEXT")) {
+    return kENCODE_TEXT;
   }
   if (op_str == std::string("NOT")) {
     return kNOT;
@@ -108,8 +113,25 @@ inline SQLAgg to_agg_kind(const std::string& agg_name) {
   if (agg_name == std::string("APPROX_COUNT_DISTINCT")) {
     return kAPPROX_COUNT_DISTINCT;
   }
-  if (agg_name == std::string("SAMPLE") || agg_name == std::string("LAST_SAMPLE")) {
+  if (agg_name == "APPROX_MEDIAN" || agg_name == "APPROX_PERCENTILE" ||
+      agg_name == "APPROX_QUANTILE") {
+    return kAPPROX_QUANTILE;
+  }
+  if (agg_name == std::string("ANY_VALUE") || agg_name == std::string("SAMPLE") ||
+      agg_name == std::string("LAST_SAMPLE")) {
     return kSAMPLE;
+  }
+  if (agg_name == std::string("SINGLE_VALUE")) {
+    return kSINGLE_VALUE;
+  }
+  if (agg_name == "MODE") {
+    return kMODE;
+  }
+  if (agg_name == "COUNT_IF") {
+    return kCOUNT_IF;
+  }
+  if (agg_name == "SUM_IF") {
+    return kSUM_IF;
   }
   throw std::runtime_error("Aggregate function " + agg_name + " not supported");
 }
@@ -130,13 +152,17 @@ inline SQLTypes to_sql_type(const std::string& type_name) {
   if (type_name == std::string("FLOAT")) {
     return kFLOAT;
   }
+  if (type_name == std::string("REAL")) {
+    return kFLOAT;
+  }
   if (type_name == std::string("DOUBLE")) {
     return kDOUBLE;
   }
   if (type_name == std::string("DECIMAL")) {
     return kDECIMAL;
   }
-  if (type_name == std::string("CHAR") || type_name == std::string("VARCHAR")) {
+  if (type_name == std::string("CHAR") || type_name == std::string("VARCHAR") ||
+      type_name == std::string("SYMBOL")) {
     return kTEXT;
   }
   if (type_name == std::string("BOOLEAN")) {
@@ -169,6 +195,33 @@ inline SQLTypes to_sql_type(const std::string& type_name) {
   }
   if (type_name == std::string("ANY")) {
     return kEVAL_CONTEXT_TYPE;
+  }
+  if (type_name == std::string("TEXT")) {
+    return kTEXT;
+  }
+  if (type_name == std::string("POINT")) {
+    return kPOINT;
+  }
+  if (type_name == std::string("MULTIPOINT")) {
+    return kMULTIPOINT;
+  }
+  if (type_name == std::string("LINESTRING")) {
+    return kLINESTRING;
+  }
+  if (type_name == std::string("MULTILINESTRING")) {
+    return kMULTILINESTRING;
+  }
+  if (type_name == std::string("POLYGON")) {
+    return kPOLYGON;
+  }
+  if (type_name == std::string("MULTIPOLYGON")) {
+    return kMULTIPOLYGON;
+  }
+  if (type_name == std::string("GEOMETRY")) {
+    return kGEOMETRY;
+  }
+  if (type_name == std::string("GEOGRAPHY")) {
+    return kGEOGRAPHY;
   }
 
   throw std::runtime_error("Unsupported type: " + type_name);

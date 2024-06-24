@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@ class ScalarExprVisitor {
  public:
   T visit(const Analyzer::Expr* expr) const {
     CHECK(expr);
+    visitBegin();
     const auto var = dynamic_cast<const Analyzer::Var*>(expr);
     if (var) {
       return visitVar(var);
@@ -48,6 +49,10 @@ class ScalarExprVisitor {
     if (bin_oper) {
       return visitBinOper(bin_oper);
     }
+    const auto geo_expr = dynamic_cast<const Analyzer::GeoExpr*>(expr);
+    if (geo_expr) {
+      return visitGeoExpr(geo_expr);
+    }
     const auto in_values = dynamic_cast<const Analyzer::InValues*>(expr);
     if (in_values) {
       return visitInValues(in_values);
@@ -63,6 +68,26 @@ class ScalarExprVisitor {
     const auto key_for_string = dynamic_cast<const Analyzer::KeyForStringExpr*>(expr);
     if (key_for_string) {
       return visitKeyForString(key_for_string);
+    }
+    const auto sample_ratio = dynamic_cast<const Analyzer::SampleRatioExpr*>(expr);
+    if (sample_ratio) {
+      return visitSampleRatio(sample_ratio);
+    }
+    const auto width_bucket = dynamic_cast<const Analyzer::WidthBucketExpr*>(expr);
+    if (width_bucket) {
+      return visitWidthBucket(width_bucket);
+    }
+    const auto ml_predict = dynamic_cast<const Analyzer::MLPredictExpr*>(expr);
+    if (ml_predict) {
+      return visitMLPredict(ml_predict);
+    }
+    const auto pca_project = dynamic_cast<const Analyzer::PCAProjectExpr*>(expr);
+    if (pca_project) {
+      return visitPCAProject(pca_project);
+    }
+    const auto string_oper = dynamic_cast<const Analyzer::StringOper*>(expr);
+    if (string_oper) {
+      return visitStringOper(string_oper);
     }
     const auto cardinality = dynamic_cast<const Analyzer::CardinalityExpr*>(expr);
     if (cardinality) {
@@ -105,6 +130,14 @@ class ScalarExprVisitor {
     if (array) {
       return visitArrayOper(array);
     }
+    const auto geo_uop = dynamic_cast<const Analyzer::GeoUOper*>(expr);
+    if (geo_uop) {
+      return visitGeoUOper(geo_uop);
+    }
+    const auto geo_binop = dynamic_cast<const Analyzer::GeoBinOper*>(expr);
+    if (geo_binop) {
+      return visitGeoBinOper(geo_binop);
+    }
     const auto datediff = dynamic_cast<const Analyzer::DatediffExpr*>(expr);
     if (datediff) {
       return visitDatediffExpr(datediff);
@@ -124,6 +157,10 @@ class ScalarExprVisitor {
     const auto agg = dynamic_cast<const Analyzer::AggExpr*>(expr);
     if (agg) {
       return visitAggExpr(agg);
+    }
+    const auto range_join_oper = dynamic_cast<const Analyzer::RangeOper*>(expr);
+    if (range_join_oper) {
+      return visitRangeJoinOper(range_join_oper);
     }
     return defaultResult();
   }
@@ -152,10 +189,19 @@ class ScalarExprVisitor {
     return result;
   }
 
+  virtual T visitGeoExpr(const Analyzer::GeoExpr* geo_expr) const {
+    T result = defaultResult();
+    const auto geo_expr_children = geo_expr->getChildExprs();
+    for (const auto expr : geo_expr_children) {
+      result = aggregateResult(result, visit(expr));
+    }
+    return result;
+  }
+
   virtual T visitInValues(const Analyzer::InValues* in_values) const {
     T result = visit(in_values->get_arg());
     const auto& value_list = in_values->get_value_list();
-    for (const auto in_value : value_list) {
+    for (const auto& in_value : value_list) {
       result = aggregateResult(result, visit(in_value.get()));
     }
     return result;
@@ -174,6 +220,20 @@ class ScalarExprVisitor {
   virtual T visitKeyForString(const Analyzer::KeyForStringExpr* key_for_string) const {
     T result = defaultResult();
     result = aggregateResult(result, visit(key_for_string->get_arg()));
+    return result;
+  }
+
+  virtual T visitSampleRatio(const Analyzer::SampleRatioExpr* sample_ratio) const {
+    T result = defaultResult();
+    result = aggregateResult(result, visit(sample_ratio->get_arg()));
+    return result;
+  }
+
+  virtual T visitStringOper(const Analyzer::StringOper* string_oper) const {
+    T result = defaultResult();
+    for (const auto& arg : string_oper->getOwnArgs()) {
+      result = aggregateResult(result, visit(arg.get()));
+    }
     return result;
   }
 
@@ -200,6 +260,36 @@ class ScalarExprVisitor {
     if (regexp->get_escape_expr()) {
       result = aggregateResult(result, visit(regexp->get_escape_expr()));
     }
+    return result;
+  }
+
+  virtual T visitWidthBucket(const Analyzer::WidthBucketExpr* width_bucket_expr) const {
+    T result = defaultResult();
+    result = aggregateResult(result, visit(width_bucket_expr->get_target_value()));
+    result = aggregateResult(result, visit(width_bucket_expr->get_lower_bound()));
+    result = aggregateResult(result, visit(width_bucket_expr->get_upper_bound()));
+    result = aggregateResult(result, visit(width_bucket_expr->get_partition_count()));
+    return result;
+  }
+
+  virtual T visitMLPredict(const Analyzer::MLPredictExpr* ml_predict_expr) const {
+    T result = defaultResult();
+    result = aggregateResult(result, visit(ml_predict_expr->get_model_value()));
+    const auto& regressor_values = ml_predict_expr->get_regressor_values();
+    for (const auto& regressor_value : regressor_values) {
+      result = aggregateResult(result, visit(regressor_value.get()));
+    }
+    return result;
+  }
+
+  virtual T visitPCAProject(const Analyzer::PCAProjectExpr* pca_project_expr) const {
+    T result = defaultResult();
+    result = aggregateResult(result, visit(pca_project_expr->get_model_value()));
+    const auto& feature_values = pca_project_expr->get_feature_values();
+    for (const auto& feature_value : feature_values) {
+      result = aggregateResult(result, visit(feature_value.get()));
+    }
+    result = aggregateResult(result, visit(pca_project_expr->get_pc_dimension_value()));
     return result;
   }
 
@@ -235,6 +325,25 @@ class ScalarExprVisitor {
     T result = defaultResult();
     for (size_t i = 0; i < array_expr->getElementCount(); ++i) {
       result = aggregateResult(result, visit(array_expr->getElement(i)));
+    }
+    return result;
+  }
+
+  virtual T visitGeoUOper(const Analyzer::GeoUOper* geo_expr) const {
+    T result = defaultResult();
+    for (const auto& arg : geo_expr->getArgs0()) {
+      result = aggregateResult(result, visit(arg.get()));
+    }
+    return result;
+  }
+
+  virtual T visitGeoBinOper(const Analyzer::GeoBinOper* geo_expr) const {
+    T result = defaultResult();
+    for (const auto& arg : geo_expr->getArgs0()) {
+      result = aggregateResult(result, visit(arg.get()));
+    }
+    for (const auto& arg : geo_expr->getArgs1()) {
+      result = aggregateResult(result, visit(arg.get()));
     }
     return result;
   }
@@ -285,13 +394,25 @@ class ScalarExprVisitor {
 
   virtual T visitAggExpr(const Analyzer::AggExpr* agg) const {
     T result = defaultResult();
-    return aggregateResult(result, visit(agg->get_arg()));
+    if (agg->get_arg()) {
+      return aggregateResult(result, visit(agg->get_arg()));
+    }
+    return defaultResult();
+  }
+
+  virtual T visitRangeJoinOper(const Analyzer::RangeOper* range_oper) const {
+    T result = defaultResult();
+    result = aggregateResult(result, visit(range_oper->get_left_operand()));
+    result = aggregateResult(result, visit(range_oper->get_right_operand()));
+    return result;
   }
 
  protected:
   virtual T aggregateResult(const T& aggregate, const T& next_result) const {
     return next_result;
   }
+
+  virtual void visitBegin() const {}
 
   virtual T defaultResult() const { return T{}; }
 };

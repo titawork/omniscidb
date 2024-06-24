@@ -1,5 +1,5 @@
 /*
- * Copyright 2018 OmniSci, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,20 +14,26 @@
  * limitations under the License.
  */
 
-#include <glog/logging.h>
 #include "CudaMgr.h"
+#include "Logger/Logger.h"
 
 namespace CudaMgr_Namespace {
 
-CudaMgr::CudaMgr(const int, const int)
-    : device_count_(-1)
-    , gpu_driver_version_(-1)
-    , start_gpu_(-1)
-    , max_shared_memory_for_all_(0) {
+CudaMgr::CudaMgr(const int, const int) : device_count_(-1), start_gpu_(-1) {
   CHECK(false);
 }
 
 CudaMgr::~CudaMgr() {}
+
+size_t CudaMgr::computePaddedBufferSize(size_t buf_size, size_t granularity) const {
+  CHECK(false);
+  return 0;
+}
+
+size_t CudaMgr::getGranularity(const int device_num) const {
+  CHECK(false);
+  return 0;
+}
 
 void CudaMgr::synchronizeDevices() const {
   CHECK(false);
@@ -36,20 +42,22 @@ void CudaMgr::synchronizeDevices() const {
 void CudaMgr::copyHostToDevice(int8_t* device_ptr,
                                const int8_t* host_ptr,
                                const size_t num_bytes,
-                               const int device_num) {
+                               const int device_num,
+                               CUstream cuda_stream) {
   CHECK(false);
 }
 void CudaMgr::copyDeviceToHost(int8_t* host_ptr,
                                const int8_t* device_ptr,
                                const size_t num_bytes,
-                               const int device_num) {
+                               CUstream cuda_stream) {
   CHECK(false);
 }
 void CudaMgr::copyDeviceToDevice(int8_t* dest_ptr,
                                  int8_t* src_ptr,
                                  const size_t num_bytes,
                                  const int dest_device_num,
-                                 const int src_device_num) {
+                                 const int src_device_num,
+                                 CUstream cuda_stream) {
   CHECK(false);
 }
 
@@ -57,7 +65,9 @@ int8_t* CudaMgr::allocatePinnedHostMem(const size_t num_bytes) {
   CHECK(false);
   return nullptr;
 }
-int8_t* CudaMgr::allocateDeviceMem(const size_t num_bytes, const int device_num) {
+int8_t* CudaMgr::allocateDeviceMem(const size_t num_bytes,
+                                   const int device_num,
+                                   const bool is_slab) {
   CHECK(false);
   return nullptr;
 }
@@ -69,13 +79,15 @@ void CudaMgr::freeDeviceMem(int8_t* device_ptr) {
 }
 void CudaMgr::zeroDeviceMem(int8_t* device_ptr,
                             const size_t num_bytes,
-                            const int device_num) {
+                            const int device_num,
+                            CUstream cuda_stream) {
   CHECK(false);
 }
 void CudaMgr::setDeviceMem(int8_t* device_ptr,
                            const unsigned char uc,
                            const size_t num_bytes,
-                           const int device_num) {
+                           const int device_num,
+                           CUstream cuda_stream) {
   CHECK(false);
 }
 
@@ -83,13 +95,18 @@ bool CudaMgr::isArchMaxwellOrLaterForAll() const {
   CHECK(false);
   return false;
 }
-bool CudaMgr::isArchVoltaForAll() const {
+bool CudaMgr::isArchVoltaOrGreaterForAll() const {
   CHECK(false);
   return false;
 }
 
 void CudaMgr::setContext(const int) const {
   CHECK(false);
+}
+
+int CudaMgr::getContext() const {
+  CHECK(false);
+  return 0;
 }
 
 }  // namespace CudaMgr_Namespace

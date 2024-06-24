@@ -1,5 +1,5 @@
 /*
- * Copyright 2018 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,15 +16,15 @@
 
 /**
  * @file		FixedLengthArrayNoneEncoder.h
- * @author		Dmitri Shtilman <d@mapd.com>
  * @brief		unencoded fixed length array encoder
  *
- * Copyright (c) 2018 MapD Technologies, Inc.  All rights reserved.
- **/
+ */
+
 #ifndef FIXED_LENGTH_ARRAY_NONE_ENCODER_H
 #define FIXED_LENGTH_ARRAY_NONE_ENCODER_H
 
-#include <glog/logging.h>
+#include "Logger/Logger.h"
+
 #include <cassert>
 #include <cstring>
 #include <memory>
@@ -42,6 +42,16 @@ class FixedLengthArrayNoneEncoder : public Encoder {
   FixedLengthArrayNoneEncoder(AbstractBuffer* buffer, size_t as)
       : Encoder(buffer), has_nulls(false), initialized(false), array_size(as) {}
 
+  size_t getNumElemsForBytesEncodedDataAtIndices(const int8_t* index_data,
+                                                 const std::vector<size_t>& selected_idx,
+                                                 const size_t byte_limit) override {
+    size_t data_size = selected_idx.size() * array_size;
+    if (data_size > byte_limit) {
+      data_size = byte_limit;
+    }
+    return data_size / array_size;
+  }
+
   size_t getNumElemsForBytesInsertData(const std::vector<ArrayDatum>* srcData,
                                        const int start_idx,
                                        const size_t numAppendElems,
@@ -54,33 +64,90 @@ class FixedLengthArrayNoneEncoder : public Encoder {
     return dataSize / array_size;
   }
 
-  ChunkMetadata appendData(int8_t*& srcData,
-                           const size_t numAppendElems,
-                           const SQLTypeInfo&,
-                           const bool replicating = false) override {
-    CHECK(false);  // should never be called for arrays
-    return ChunkMetadata{};
+  std::shared_ptr<ChunkMetadata> appendEncodedDataAtIndices(
+      const int8_t* index_data,
+      int8_t* data,
+      const std::vector<size_t>& selected_idx) override {
+    std::vector<ArrayDatum> data_subset;
+    data_subset.reserve(selected_idx.size());
+    for (const auto& index : selected_idx) {
+      auto current_data = data + array_size * (index);
+      data_subset.emplace_back(ArrayDatum(array_size,
+                                          current_data,
+                                          is_null_ignore_not_null(current_data),
+                                          DoNothingDeleter{}));
+    }
+    return appendData(&data_subset, 0, selected_idx.size(), false);
   }
 
-  ChunkMetadata appendData(const std::vector<ArrayDatum>* srcData,
-                           const int start_idx,
-                           const size_t numAppendElems,
-                           const bool replicating = false) {
-    size_t data_size = array_size * numAppendElems;
-    buffer_->reserve(data_size);
-
-    for (size_t i = start_idx; i < start_idx + numAppendElems; i++) {
-      size_t len = (*srcData)[replicating ? 0 : i].length;
-      // Length of the appended array should be equal to the fixed length,
-      // all others should have been discarded, assert if something slips through
-      CHECK_EQ(len, array_size);
-      // NULL arrays have been filled with subtype's NULL sentinels,
-      // should be appended as regular data, same size
-      buffer_->append((*srcData)[replicating ? 0 : i].pointer, len);
-
-      // keep Chunk statistics with array elements
-      update_elem_stats((*srcData)[replicating ? 0 : i]);
+  std::shared_ptr<ChunkMetadata> appendEncodedData(const int8_t* index_data,
+                                                   int8_t* data,
+                                                   const size_t start_idx,
+                                                   const size_t num_elements) override {
+    std::vector<ArrayDatum> data_subset;
+    data_subset.reserve(num_elements);
+    for (size_t count = 0; count < num_elements; ++count) {
+      auto current_data = data + array_size * (start_idx + count);
+      data_subset.emplace_back(
+          ArrayDatum(array_size, current_data, false, DoNothingDeleter{}));
     }
+    return appendData(&data_subset, 0, num_elements, false);
+  }
+
+  std::shared_ptr<ChunkMetadata> appendData(int8_t*& src_data,
+                                            const size_t num_elems_to_append,
+                                            const SQLTypeInfo& ti,
+                                            const bool replicating = false,
+                                            const int64_t offset = -1) override {
+    UNREACHABLE();  // should never be called for arrays
+    return nullptr;
+  }
+
+  std::shared_ptr<ChunkMetadata> appendData(const std::vector<ArrayDatum>* srcData,
+                                            const int start_idx,
+                                            const size_t numAppendElems,
+                                            const bool replicating = false) {
+    const size_t existing_data_size = num_elems_ * array_size;
+    const size_t append_data_size = array_size * numAppendElems;
+    buffer_->reserve(existing_data_size + append_data_size);
+    std::vector<int8_t> append_buffer(append_data_size);
+    int8_t* append_ptr = append_buffer.data();
+
+    // There was some worry about the change implemented to write the append data to an
+    // intermediate buffer, but testing on import and ctas of 20M points, we never append
+    // more than 1.6MB and 1MB of data at a time, respectively, so at least for fixed
+    // length types this should not be an issue (varlen types, which can be massive even
+    // for a single field/row, are a different story however)
+
+    if (replicating) {
+      const size_t len = (*srcData)[0].length;
+      CHECK_EQ(len, array_size);
+      const int8_t* replicated_ptr = (*srcData)[0].pointer;
+      for (size_t i = 0; i < numAppendElems; ++i) {
+        std::memcpy(append_ptr + i * array_size, replicated_ptr, array_size);
+      }
+    } else {
+      for (size_t i = 0; i < numAppendElems; ++i) {
+        // Length of the appended array should be equal to the fixed length,
+        // all others should have been discarded, assert if something slips through
+        const size_t source_idx = start_idx + i;
+        const size_t len = (*srcData)[source_idx].length;
+        CHECK_EQ(len, array_size);
+        // NULL arrays have been filled with subtype's NULL sentinels,
+        // should be appended as regular data, same size
+        std::memcpy(
+            append_ptr + i * array_size, (*srcData)[source_idx].pointer, array_size);
+      }
+    }
+
+    buffer_->append(append_ptr, append_data_size);
+
+    if (replicating) {
+      updateStats(srcData, 0, 1);
+    } else {
+      updateStats(srcData, start_idx, numAppendElems);
+    }
+
     // make sure buffer_ is flushed even if no new data is appended to it
     // (e.g. empty strings) because the metadata needs to be flushed.
     if (!buffer_->isDirty()) {
@@ -88,19 +155,20 @@ class FixedLengthArrayNoneEncoder : public Encoder {
     }
 
     num_elems_ += numAppendElems;
-    ChunkMetadata chunkMetadata;
-    getMetadata(chunkMetadata);
-    return chunkMetadata;
+    auto chunk_metadata = std::make_shared<ChunkMetadata>();
+    getMetadata(chunk_metadata);
+    return chunk_metadata;
   }
 
-  void getMetadata(ChunkMetadata& chunkMetadata) override {
+  void getMetadata(const std::shared_ptr<ChunkMetadata>& chunkMetadata) override {
     Encoder::getMetadata(chunkMetadata);  // call on parent class
-    chunkMetadata.fillChunkStats(elem_min, elem_max, has_nulls);
+    chunkMetadata->fillChunkStats(elem_min, elem_max, has_nulls);
   }
 
   // Only called from the executor for synthesized meta-information.
-  ChunkMetadata getMetadata(const SQLTypeInfo& ti) override {
-    ChunkMetadata chunk_metadata{ti, 0, 0, ChunkStats{elem_min, elem_max, has_nulls}};
+  std::shared_ptr<ChunkMetadata> getMetadata(const SQLTypeInfo& ti) override {
+    auto chunk_metadata = std::make_shared<ChunkMetadata>(
+        ti, 0, 0, ChunkStats{elem_min, elem_max, has_nulls});
     return chunk_metadata;
   }
 
@@ -109,6 +177,24 @@ class FixedLengthArrayNoneEncoder : public Encoder {
   void updateStats(const double, const bool) override { CHECK(false); }
 
   void reduceStats(const Encoder&) override { CHECK(false); }
+
+  void updateStats(const int8_t* const src_data, const size_t num_elements) override {
+    UNREACHABLE();
+  }
+
+  void updateStats(const std::vector<std::string>* const src_data,
+                   const size_t start_idx,
+                   const size_t num_elements) override {
+    UNREACHABLE();
+  }
+
+  void updateStats(const std::vector<ArrayDatum>* const src_data,
+                   const size_t start_idx,
+                   const size_t num_elements) override {
+    for (size_t n = start_idx; n < start_idx + num_elements; n++) {
+      update_elem_stats((*src_data)[n]);
+    }
+  }
 
   void writeMetadata(FILE* f) override {
     // assumes pointer is already in right place
@@ -139,7 +225,81 @@ class FixedLengthArrayNoneEncoder : public Encoder {
   }
 
   void updateMetadata(int8_t* array) {
-    update_elem_stats(ArrayDatum(array_size, array, DoNothingDeleter()));
+    update_elem_stats(ArrayDatum(array_size, array, is_null(array), DoNothingDeleter()));
+  }
+
+  static bool is_null_ignore_not_null(const SQLTypeInfo& type, int8_t* array) {
+    switch (type.get_subtype()) {
+      case kBOOLEAN: {
+        return (array[0] == NULL_ARRAY_BOOLEAN);
+      }
+      case kINT: {
+        const int32_t* int_array = (int32_t*)array;
+        return (int_array[0] == NULL_ARRAY_INT);
+      }
+      case kSMALLINT: {
+        const int16_t* smallint_array = (int16_t*)array;
+        return (smallint_array[0] == NULL_ARRAY_SMALLINT);
+      }
+      case kTINYINT: {
+        const int8_t* tinyint_array = (int8_t*)array;
+        return (tinyint_array[0] == NULL_ARRAY_TINYINT);
+      }
+      case kBIGINT:
+      case kNUMERIC:
+      case kDECIMAL: {
+        const int64_t* bigint_array = (int64_t*)array;
+        return (bigint_array[0] == NULL_ARRAY_BIGINT);
+      }
+      case kFLOAT: {
+        const float* flt_array = (float*)array;
+        return (flt_array[0] == NULL_ARRAY_FLOAT);
+      }
+      case kDOUBLE: {
+        const double* dbl_array = (double*)array;
+        return (dbl_array[0] == NULL_ARRAY_DOUBLE);
+      }
+      case kTIME:
+      case kTIMESTAMP:
+      case kDATE: {
+        const int64_t* tm_array = reinterpret_cast<int64_t*>(array);
+        return (tm_array[0] == NULL_ARRAY_BIGINT);
+      }
+      case kCHAR:
+      case kVARCHAR:
+      case kTEXT: {
+        CHECK_EQ(type.get_compression(), kENCODING_DICT);
+        const int32_t* int_array = (int32_t*)array;
+        return (int_array[0] == NULL_ARRAY_INT);
+      }
+      default:
+        UNREACHABLE();
+    }
+    return false;
+  }
+
+  static bool is_null(const SQLTypeInfo& type, int8_t* array) {
+    if (type.get_notnull()) {
+      return false;
+    }
+    return is_null_ignore_not_null(type, array);
+  }
+
+  bool resetChunkStats(const ChunkStats& stats) override {
+    auto elem_type = buffer_->getSqlType().get_elem_type();
+    if (initialized && DatumEqual(elem_min, stats.min, elem_type) &&
+        DatumEqual(elem_max, stats.max, elem_type) && has_nulls == stats.has_nulls) {
+      return false;
+    }
+    elem_min = stats.min;
+    elem_max = stats.max;
+    has_nulls = stats.has_nulls;
+    return true;
+  }
+
+  void resetChunkStats() override {
+    has_nulls = false;
+    initialized = false;
   }
 
   Datum elem_min;
@@ -149,18 +309,31 @@ class FixedLengthArrayNoneEncoder : public Encoder {
 
  private:
   std::mutex EncoderMutex_;
+  std::mutex print_mutex_;
   size_t array_size;
+
+  bool is_null(int8_t* array) { return is_null(buffer_->getSqlType(), array); }
+
+  bool is_null_ignore_not_null(int8_t* array) {
+    return is_null_ignore_not_null(buffer_->getSqlType(), array);
+  }
 
   void update_elem_stats(const ArrayDatum& array) {
     if (array.is_null) {
       has_nulls = true;
-      return;
     }
-    switch (buffer_->sqlType.get_subtype()) {
+    switch (buffer_->getSqlType().get_subtype()) {
       case kBOOLEAN: {
-        const bool* bool_array = (bool*)array.pointer;
+        if (!initialized) {
+          elem_min.boolval = true;
+          elem_max.boolval = false;
+        }
+        if (array.is_null) {
+          break;
+        }
+        const int8_t* bool_array = array.pointer;
         for (size_t i = 0; i < array.length / sizeof(bool); i++) {
-          if ((int8_t)bool_array[i] == NULL_BOOLEAN) {
+          if (bool_array[i] == NULL_BOOLEAN) {
             has_nulls = true;
           } else if (initialized) {
             elem_min.boolval = std::min(elem_min.boolval, bool_array[i]);
@@ -171,8 +344,16 @@ class FixedLengthArrayNoneEncoder : public Encoder {
             initialized = true;
           }
         }
-      } break;
+        break;
+      }
       case kINT: {
+        if (!initialized) {
+          elem_min.intval = 1;
+          elem_max.intval = 0;
+        }
+        if (array.is_null) {
+          break;
+        }
         const int32_t* int_array = (int32_t*)array.pointer;
         for (size_t i = 0; i < array.length / sizeof(int32_t); i++) {
           if (int_array[i] == NULL_INT) {
@@ -186,57 +367,89 @@ class FixedLengthArrayNoneEncoder : public Encoder {
             initialized = true;
           }
         }
-      } break;
+        break;
+      }
       case kSMALLINT: {
-        const int16_t* int_array = (int16_t*)array.pointer;
+        if (!initialized) {
+          elem_min.smallintval = 1;
+          elem_max.smallintval = 0;
+        }
+        if (array.is_null) {
+          break;
+        }
+        const int16_t* smallint_array = (int16_t*)array.pointer;
         for (size_t i = 0; i < array.length / sizeof(int16_t); i++) {
-          if (int_array[i] == NULL_SMALLINT) {
+          if (smallint_array[i] == NULL_SMALLINT) {
             has_nulls = true;
           } else if (initialized) {
-            elem_min.smallintval = std::min(elem_min.smallintval, int_array[i]);
-            elem_max.smallintval = std::max(elem_max.smallintval, int_array[i]);
+            elem_min.smallintval = std::min(elem_min.smallintval, smallint_array[i]);
+            elem_max.smallintval = std::max(elem_max.smallintval, smallint_array[i]);
           } else {
-            elem_min.smallintval = int_array[i];
-            elem_max.smallintval = int_array[i];
+            elem_min.smallintval = smallint_array[i];
+            elem_max.smallintval = smallint_array[i];
             initialized = true;
           }
         }
-      } break;
+        break;
+      }
       case kTINYINT: {
-        const int8_t* int_array = (int8_t*)array.pointer;
+        if (!initialized) {
+          elem_min.tinyintval = 1;
+          elem_max.tinyintval = 0;
+        }
+        if (array.is_null) {
+          break;
+        }
+        const int8_t* tinyint_array = (int8_t*)array.pointer;
         for (size_t i = 0; i < array.length / sizeof(int8_t); i++) {
-          if (int_array[i] == NULL_TINYINT) {
+          if (tinyint_array[i] == NULL_TINYINT) {
             has_nulls = true;
           } else if (initialized) {
-            elem_min.tinyintval = std::min(elem_min.tinyintval, int_array[i]);
-            elem_max.tinyintval = std::max(elem_max.tinyintval, int_array[i]);
+            elem_min.tinyintval = std::min(elem_min.tinyintval, tinyint_array[i]);
+            elem_max.tinyintval = std::max(elem_max.tinyintval, tinyint_array[i]);
           } else {
-            elem_min.tinyintval = int_array[i];
-            elem_max.tinyintval = int_array[i];
+            elem_min.tinyintval = tinyint_array[i];
+            elem_max.tinyintval = tinyint_array[i];
             initialized = true;
           }
         }
-      } break;
+        break;
+      }
       case kBIGINT:
       case kNUMERIC:
       case kDECIMAL: {
-        const int64_t* int_array = (int64_t*)array.pointer;
+        if (!initialized) {
+          elem_min.bigintval = 1;
+          elem_max.bigintval = 0;
+        }
+        if (array.is_null) {
+          break;
+        }
+        const int64_t* bigint_array = (int64_t*)array.pointer;
         for (size_t i = 0; i < array.length / sizeof(int64_t); i++) {
-          if (int_array[i] == NULL_BIGINT) {
+          if (bigint_array[i] == NULL_BIGINT) {
             has_nulls = true;
           } else if (initialized) {
-            decimal_overflow_validator_.validate(int_array[i]);
-            elem_min.bigintval = std::min(elem_min.bigintval, int_array[i]);
-            elem_max.bigintval = std::max(elem_max.bigintval, int_array[i]);
+            decimal_overflow_validator_.validate(bigint_array[i]);
+            elem_min.bigintval = std::min(elem_min.bigintval, bigint_array[i]);
+            elem_max.bigintval = std::max(elem_max.bigintval, bigint_array[i]);
           } else {
-            decimal_overflow_validator_.validate(int_array[i]);
-            elem_min.bigintval = int_array[i];
-            elem_max.bigintval = int_array[i];
+            decimal_overflow_validator_.validate(bigint_array[i]);
+            elem_min.bigintval = bigint_array[i];
+            elem_max.bigintval = bigint_array[i];
             initialized = true;
           }
         }
-      } break;
+        break;
+      }
       case kFLOAT: {
+        if (!initialized) {
+          elem_min.floatval = 1.0;
+          elem_max.floatval = 0.0;
+        }
+        if (array.is_null) {
+          break;
+        }
         const float* flt_array = (float*)array.pointer;
         for (size_t i = 0; i < array.length / sizeof(float); i++) {
           if (flt_array[i] == NULL_FLOAT) {
@@ -250,8 +463,16 @@ class FixedLengthArrayNoneEncoder : public Encoder {
             initialized = true;
           }
         }
-      } break;
+        break;
+      }
       case kDOUBLE: {
+        if (!initialized) {
+          elem_min.doubleval = 1.0;
+          elem_max.doubleval = 0.0;
+        }
+        if (array.is_null) {
+          break;
+        }
         const double* dbl_array = (double*)array.pointer;
         for (size_t i = 0; i < array.length / sizeof(double); i++) {
           if (dbl_array[i] == NULL_DOUBLE) {
@@ -265,10 +486,18 @@ class FixedLengthArrayNoneEncoder : public Encoder {
             initialized = true;
           }
         }
-      } break;
+        break;
+      }
       case kTIME:
       case kTIMESTAMP:
       case kDATE: {
+        if (!initialized) {
+          elem_min.bigintval = 1;
+          elem_max.bigintval = 0;
+        }
+        if (array.is_null) {
+          break;
+        }
         const int64_t* tm_array = reinterpret_cast<int64_t*>(array.pointer);
         for (size_t i = 0; i < array.length / sizeof(int64_t); i++) {
           if (tm_array[i] == NULL_BIGINT) {
@@ -282,11 +511,19 @@ class FixedLengthArrayNoneEncoder : public Encoder {
             initialized = true;
           }
         }
-      } break;
+        break;
+      }
       case kCHAR:
       case kVARCHAR:
       case kTEXT: {
-        assert(buffer_->sqlType.get_compression() == kENCODING_DICT);
+        CHECK_EQ(buffer_->getSqlType().get_compression(), kENCODING_DICT);
+        if (!initialized) {
+          elem_min.intval = 1;
+          elem_max.intval = 0;
+        }
+        if (array.is_null) {
+          break;
+        }
         const int32_t* int_array = (int32_t*)array.pointer;
         for (size_t i = 0; i < array.length / sizeof(int32_t); i++) {
           if (int_array[i] == NULL_INT) {
@@ -300,9 +537,10 @@ class FixedLengthArrayNoneEncoder : public Encoder {
             initialized = true;
           }
         }
-      } break;
+        break;
+      }
       default:
-        assert(false);
+        UNREACHABLE();
     }
   };
 

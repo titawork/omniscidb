@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 OmniSci, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -54,6 +54,12 @@ std::string from_extract_field(const ExtractField& fieldno) {
       return "quarterday";
     case kWEEK:
       return "week";
+    case kWEEK_SUNDAY:
+      return "week_sunday";
+    case kWEEK_SATURDAY:
+      return "week_saturday";
+    case kDATEEPOCH:
+      return "dateepoch";
     default:
       UNREACHABLE();
   }
@@ -92,6 +98,10 @@ std::string from_datetrunc_field(const DatetruncField& fieldno) {
       return "nanosecond";
     case dtWEEK:
       return "week";
+    case dtWEEK_SUNDAY:
+      return "week_sunday";
+    case dtWEEK_SATURDAY:
+      return "week_saturday";
     case dtINVALID:
     default:
       UNREACHABLE();
@@ -135,6 +145,12 @@ ExtractField ExtractExpr::to_extract_field(const std::string& field) {
     fieldno = kEPOCH;
   } else if (boost::iequals(field, "week")) {
     fieldno = kWEEK;
+  } else if (boost::iequals(field, "week_sunday")) {
+    fieldno = kWEEK_SUNDAY;
+  } else if (boost::iequals(field, "week_saturday")) {
+    fieldno = kWEEK_SATURDAY;
+  } else if (boost::iequals(field, "dateepoch")) {
+    fieldno = kDATEEPOCH;
   } else {
     throw std::runtime_error("Unsupported field in EXTRACT function " + field);
   }
@@ -166,7 +182,8 @@ std::shared_ptr<Analyzer::Expr> ExtractExpr::generate(
   if (constant != nullptr) {
     Datum d;
     d.bigintval = field == kEPOCH
-                      ? constant->get_constval().bigintval
+                      ? floor_div(constant->get_constval().bigintval,
+                                  get_timestamp_precision_scale(expr_ti.get_dimension()))
                       : getExtractFromTimeConstantValue(
                             constant->get_constval().bigintval, field, expr_ti);
     constant->set_constval(d);
@@ -209,6 +226,10 @@ DatetruncField DateTruncExpr::to_datetrunc_field(const std::string& field) {
     fieldno = dtNANOSECOND;
   } else if (boost::iequals(field, "week")) {
     fieldno = dtWEEK;
+  } else if (boost::iequals(field, "week_sunday")) {
+    fieldno = dtWEEK_SUNDAY;
+  } else if (boost::iequals(field, "week_saturday")) {
+    fieldno = dtWEEK_SATURDAY;
   } else {
     throw std::runtime_error("Invalid field in DATE_TRUNC function " + field);
   }

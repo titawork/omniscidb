@@ -28,15 +28,40 @@ public class EagainConcurrencyTest {
     test.testCatalogConcurrency();
   }
 
-  private void run_test(MapdTestClient dba, MapdTestClient user, String prefix, int max)
-          throws Exception {
+  private void run_test(HeavyDBTestClient dba,
+          String db,
+          String dbUser,
+          String dbPassword,
+          String prefix,
+          int max) throws Exception {
     String tableName = "table_" + prefix + "_";
+    String viewName = "view_" + prefix + "_";
     long tid = Thread.currentThread().getId();
+
+    logger.info("[" + tid + "]"
+            + "FIRST USER CONNECT");
+    HeavyDBTestClient first_user =
+            HeavyDBTestClient.getClient("localhost", 6274, db, dbUser, dbPassword);
+
     logger.info("[" + tid + "]"
             + "CREATE " + tableName);
-    user.runSql("CREATE TABLE " + tableName + " (id integer);");
+    first_user.runSql("CREATE TABLE " + tableName + " (id integer);");
+
+    logger.info("[" + tid + "]"
+            + "CREATE VIEW " + viewName);
+    first_user.runSql(
+            "CREATE VIEW " + viewName + " AS (SELECT id * 2 FROM " + tableName + ");");
+
+    logger.info("[" + tid + "]"
+            + "FIRST USER DISCONNECT");
+    first_user.disconnect();
 
     for (int i = 0; i < max; i++) {
+      logger.info("[" + tid + "]"
+              + "USER CONNECT");
+      HeavyDBTestClient user =
+              HeavyDBTestClient.getClient("localhost", 6274, db, dbUser, dbPassword);
+
       logger.info("[" + tid + "]"
               + "INSERT INTO " + tableName);
       user.runSql("INSERT INTO " + tableName + " VALUES (" + i + ");");
@@ -48,7 +73,20 @@ public class EagainConcurrencyTest {
       logger.info("[" + tid + "]"
               + "SELECT FROM " + tableName);
       user.runSql("SELECT * FROM " + tableName + ";");
+
+      user.get_memory("cpu");
+      user.get_dashboards();
+      //       user.get_tables_meta(); // TODO(adb): re-enable after fixing up catalog/db
+      //       locking
+
+      logger.info("[" + tid + "]"
+              + "USER DISCONNECT");
+      user.disconnect();
     }
+
+    logger.info("[" + tid + "]"
+            + "DROP " + viewName);
+    dba.runSql("DROP VIEW " + viewName + ";");
 
     logger.info("[" + tid + "]"
             + "DROP " + tableName);
@@ -71,11 +109,9 @@ public class EagainConcurrencyTest {
         @Override
         public void run() {
           try {
-            MapdTestClient dba =
-                    MapdTestClient.getClient("localhost", 6274, db, dbaUser, dbaPassword);
-            MapdTestClient user =
-                    MapdTestClient.getClient("localhost", 6274, db, dbUser, dbPassword);
-            run_test(dba, user, prefix, runs);
+            HeavyDBTestClient dba = HeavyDBTestClient.getClient(
+                    "localhost", 6274, db, dbaUser, dbaPassword);
+            run_test(dba, db, dbUser, dbPassword, prefix, runs);
           } catch (Exception e) {
             logger.error("[" + Thread.currentThread().getId() + "]"
                             + "Caught Exception: " + e.getMessage(),
@@ -103,18 +139,18 @@ public class EagainConcurrencyTest {
   public void testCatalogConcurrency() throws Exception {
     logger.info("testCatalogConcurrency()");
 
-    MapdTestClient su = MapdTestClient.getClient(
-            "localhost", 6274, "omnisci", "admin", "HyperInteractive");
+    HeavyDBTestClient su = HeavyDBTestClient.getClient(
+            "localhost", 6274, "heavyai", "admin", "HyperInteractive");
     su.runSql("CREATE USER dba (password = 'password', is_super = 'true');");
     su.runSql("CREATE USER bob (password = 'password', is_super = 'false');");
 
-    su.runSql("GRANT CREATE on DATABASE omnisci TO bob;");
-    su.runSql("GRANT CREATE VIEW on DATABASE omnisci TO bob;");
-    su.runSql("GRANT CREATE DASHBOARD on DATABASE omnisci TO bob;");
+    su.runSql("GRANT CREATE on DATABASE heavyai TO bob;");
+    su.runSql("GRANT CREATE VIEW on DATABASE heavyai TO bob;");
+    su.runSql("GRANT CREATE DASHBOARD on DATABASE heavyai TO bob;");
 
-    su.runSql("GRANT DROP on DATABASE omnisci TO bob;");
-    su.runSql("GRANT DROP VIEW on DATABASE omnisci TO bob;");
-    su.runSql("GRANT DELETE DASHBOARD on DATABASE omnisci TO bob;");
+    su.runSql("GRANT DROP on DATABASE heavyai TO bob;");
+    su.runSql("GRANT DROP VIEW on DATABASE heavyai TO bob;");
+    su.runSql("GRANT DELETE DASHBOARD on DATABASE heavyai TO bob;");
 
     su.runSql("CREATE DATABASE db1;");
 
@@ -126,8 +162,8 @@ public class EagainConcurrencyTest {
     su.runSql("GRANT DROP VIEW on DATABASE db1 TO bob;");
     su.runSql("GRANT DELETE DASHBOARD on DATABASE db1 TO bob;");
 
-    su.runSql("GRANT ACCESS on database omnisci TO dba;");
-    su.runSql("GRANT ACCESS on database omnisci TO bob;");
+    su.runSql("GRANT ACCESS on database heavyai TO dba;");
+    su.runSql("GRANT ACCESS on database heavyai TO bob;");
     su.runSql("GRANT ACCESS on database db1 TO dba;");
     su.runSql("GRANT ACCESS on database db1 TO bob;");
 
@@ -137,14 +173,16 @@ public class EagainConcurrencyTest {
     runTest("db1", "dba", "password", "admin", "HyperInteractive");
     runTest("db1", "dba", "password", "bob", "password");
 
-    runTest("omnisci", "admin", "HyperInteractive", "admin", "HyperInteractive");
-    runTest("omnisci", "admin", "HyperInteractive", "dba", "password");
-    runTest("omnisci", "admin", "HyperInteractive", "bob", "password");
-    runTest("omnisci", "dba", "password", "admin", "HyperInteractive");
-    runTest("omnisci", "dba", "password", "bob", "password");
+    runTest("heavyai", "admin", "HyperInteractive", "admin", "HyperInteractive");
+    runTest("heavyai", "admin", "HyperInteractive", "dba", "password");
+    runTest("heavyai", "admin", "HyperInteractive", "bob", "password");
+    runTest("heavyai", "dba", "password", "admin", "HyperInteractive");
+    runTest("heavyai", "dba", "password", "bob", "password");
 
     su.runSql("DROP DATABASE db1;");
     su.runSql("DROP USER bob;");
     su.runSql("DROP USER dba;");
+
+    logger.info("testCatalogConcurrency() done");
   }
 }

@@ -9,8 +9,8 @@ PREFIX=/usr/local/mapd-deps
 source /etc/os-release
 if [ "$ID" == "ubuntu" ] ; then
   PACKAGER="apt -y"
-  if [ "$VERSION_ID" != "19.04" ] && [ "$VERSION_ID" != "18.04" ] && [ "$VERSION_ID" != "16.04" ]; then
-    echo "Ubuntu 19.04, 18.04, and 16.04 are the only debian-based releases supported by this script"
+  if [ "$VERSION_ID" != "20.04" ] && [ "$VERSION_ID" != "19.10" ] && [ "$VERSION_ID" != "19.04" ] && [ "$VERSION_ID" != "18.04" ]; then
+    echo "Ubuntu 20.04, 19.10, 19.04, and 18.04 are the only debian-based releases supported by this script"
     exit 1
   fi
 elif [ "$ID" == "centos" ] ; then
@@ -50,19 +50,15 @@ done
 # Distro-specific installations
 if [ "$ID" == "ubuntu" ] ; then
   sudo $PACKAGER update
+
   sudo $PACKAGER install \
       software-properties-common \
       build-essential \
       ccache \
-      cmake \
-      cmake-curses-gui \
       git \
       wget \
       curl \
-      gcc \
-      g++ \
       libboost-all-dev \
-      libgoogle-glog-dev \
       golang \
       libssl-dev \
       libevent-dev \
@@ -81,7 +77,6 @@ if [ "$ID" == "ubuntu" ] ; then
       libgoogle-perftools-dev \
       libiberty-dev \
       libjemalloc-dev \
-      libglu1-mesa-dev \
       liblz4-dev \
       liblzma-dev \
       libbz2-dev \
@@ -102,22 +97,34 @@ if [ "$ID" == "ubuntu" ] ; then
       jq \
       python-dev \
       python-yaml \
+      libxerces-c-dev \
       swig
 
-  if [ "$VERSION_ID" == "19.04" ] || [ "$VERSION_ID" == "18.04" ] ; then
-    sudo $PACKAGER install \
-      libxerces-c-dev \
-      libxmlsec1-dev
-  elif [ "$VERSION_ID" == "16.04" ]; then
-    sudo $PACKAGER install libtool
-     # Install gcc 6
-    sudo add-apt-repository ppa:ubuntu-toolchain-r/test -y
-    sudo $PACKAGER update
-    sudo $PACKAGER install g++-6
-    sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-6 60 \
-                             --slave /usr/bin/g++ g++ /usr/bin/g++-6
-    sudo update-alternatives --config gcc
+  # required for gcc-11 on Ubuntu < 22.04
+  if [ "$VERSION_ID" == "20.04" ] || [ "$VERSION_ID" == "19.04" ] || [ "$VERSION_ID" == "18.04" ]; then
+    DEBIAN_FRONTEND=noninteractive sudo add-apt-repository ppa:ubuntu-toolchain-r/test
   fi
+
+  sudo $PACKAGER install \
+      gcc-11 \
+      g++-11
+
+# Set up gcc-11 as default gcc
+sudo update-alternatives \
+  --install /usr/bin/gcc gcc /usr/bin/gcc-11 1100 \
+  --slave /usr/bin/g++ g++ /usr/bin/g++-11
+sudo update-alternatives --auto gcc
+
+if [ "$VERSION_ID" == "19.04" ] || [ "$VERSION_ID" == "18.04" ] ; then
+  sudo $PACKAGER install -y \
+    libxerces-c-dev \
+    libxmlsec1-dev \
+    libegl1-mesa-dev
+fi
+
+if [ "$VERSION_ID" == "20.04" ] ; then
+  sudo $PACKAGER install -y libegl-dev
+fi
 
   sudo mkdir -p $PREFIX
   pushd $PREFIX
@@ -127,19 +134,19 @@ if [ "$ID" == "ubuntu" ] ; then
   popd
 
   cat << EOF | sudo tee -a $PREFIX/mapd-deps.sh
-PREFIX=$PREFIX
+HEAVY_PREFIX=$PREFIX
 
 LD_LIBRARY_PATH=/usr/local/cuda/lib64:\$LD_LIBRARY_PATH
-LD_LIBRARY_PATH=\$PREFIX/lib:\$LD_LIBRARY_PATH
-LD_LIBRARY_PATH=\$PREFIX/lib64:\$LD_LIBRARY_PATH
+LD_LIBRARY_PATH=\$HEAVY_PREFIX/lib:\$LD_LIBRARY_PATH
+LD_LIBRARY_PATH=\$HEAVY_PREFIX/lib64:\$LD_LIBRARY_PATH
 
 PATH=/usr/local/cuda/bin:\$PATH
-PATH=\$PREFIX/bin:\$PATH
+PATH=\$HEAVY_PREFIX/bin:\$PATH
 
-VULKAN_SDK=\$PREFIX
-VK_LAYER_PATH=\$PREFIX/etc/explicit_layer.d
+VULKAN_SDK=\$HEAVY_PREFIX
+VK_LAYER_PATH=\$HEAVY_PREFIX/etc/vulkan/explicit_layer.d
 
-CMAKE_PREFIX_PATH=\$PREFIX:\$CMAKE_PREFIX_PATH
+CMAKE_PREFIX_PATH=\$HEAVY_PREFIX:\$CMAKE_PREFIX_PATH
 
 export LD_LIBRARY_PATH PATH VULKAN_SDK VK_LAYER_PATH CMAKE_PREFIX_PATH
 EOF
@@ -158,6 +165,7 @@ elif [ "$ID" == "centos" ] ; then
   sudo yum install -y \
     zlib-devel \
     epel-release \
+    which \
     libssh \
     openssl-devel \
     ncurses-devel \
@@ -173,14 +181,16 @@ elif [ "$ID" == "centos" ] ; then
     curl \
     python-yaml \
     libX11-devel \
-    mesa-libGL-devel \
     environment-modules \
     valgrind \
-    openldap-devel
+    openldap-devel \
+    patchelf
+
   # Install packages from EPEL
   sudo yum install -y \
     cloc \
-    jq
+    jq \
+    pxz
 
   if ! type module >/dev/null 2>&1 ; then
     sudo $PACKAGER install environment-modules

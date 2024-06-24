@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,12 +17,14 @@
 #ifndef QUERYENGINE_DYNAMICWATCHDOG_H
 #define QUERYENGINE_DYNAMICWATCHDOG_H
 
+#include "Shared/funcannotations.h"
+
 #include <cstdint>
 
 enum DynamicWatchdogFlags { DW_DEADLINE = 0, DW_ABORT = -1, DW_RESET = -2 };
 
-extern "C" uint64_t dynamic_watchdog_init(unsigned ms_budget);
+extern "C" RUNTIME_EXPORT uint64_t dynamic_watchdog_init(unsigned ms_budget);
 
-extern "C" bool dynamic_watchdog();
+extern "C" RUNTIME_EXPORT bool dynamic_watchdog();
 
 #endif  // QUERYENGINE_DYNAMICWATCHDOG_H

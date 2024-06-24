@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 OmniSci, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,32 +20,36 @@
 #include "InValuesBitmap.h"
 #include "InputMetadata.h"
 #include "LLVMGlobalContext.h"
+#include "StringDictionaryTranslationMgr.h"
+#include "TreeModelPredictionMgr.h"
 
 #include "../Analyzer/Analyzer.h"
+#include "../Shared/InsertionOrderedMap.h"
 
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/Transforms/Utils/ValueMapper.h>
 
+#include "Shared/DbObjectKeys.h"
+
+struct ArrayLoadCodegen {
+  llvm::Value* buffer;
+  llvm::Value* size;
+  llvm::Value* is_null;
+};
+
 struct CgenState {
  public:
-  CgenState(const std::vector<InputTableInfo>& query_infos,
-            const bool contains_left_deep_outer_join)
-      : module_(nullptr)
-      , row_func_(nullptr)
-      , context_(getGlobalLLVMContext())
-      , ir_builder_(context_)
-      , contains_left_deep_outer_join_(contains_left_deep_outer_join)
-      , outer_join_match_found_per_level_(std::max(query_infos.size(), size_t(1)) - 1)
-      , query_infos_(query_infos)
-      , needs_error_check_(false)
-      , query_func_(nullptr)
-      , query_func_entry_ir_builder_(context_){};
+  CgenState(const size_t num_query_infos,
+            const bool contains_left_deep_outer_join,
+            Executor* executor);
+  CgenState(const size_t num_query_infos, const bool contains_left_deep_outer_join);
+  CgenState(llvm::LLVMContext& context);
 
-  size_t getOrAddLiteral(const Analyzer::Constant* constant,
-                         const EncodingType enc_type,
-                         const int dict_id,
-                         const int device_id) {
+  std::tuple<size_t, size_t> getOrAddLiteral(const Analyzer::Constant* constant,
+                                             const EncodingType enc_type,
+                                             const shared::StringDictKey& dict_id,
+                                             const int device_id) {
     const auto& ti = constant->get_type_info();
     const auto type = ti.is_decimal() ? decimal_to_int_type(ti) : ti.get_type();
     switch (type) {
@@ -173,7 +177,7 @@ struct CgenState {
                                       int64_t,
                                       float,
                                       double,
-                                      std::pair<std::string, int>,
+                                      std::pair<std::string, shared::StringDictKey>,
                                       std::string,
                                       std::vector<double>,
                                       std::vector<int32_t>,
@@ -192,30 +196,42 @@ struct CgenState {
     return str_lv;
   }
 
+  const StringDictionaryTranslationMgr* moveStringDictionaryTranslationMgr(
+      std::unique_ptr<const StringDictionaryTranslationMgr>&& str_dict_translation_mgr) {
+    str_dict_translation_mgrs_.emplace_back(std::move(str_dict_translation_mgr));
+    return str_dict_translation_mgrs_.back().get();
+  }
+
+  const TreeModelPredictionMgr* moveTreeModelPredictionMgr(
+      std::unique_ptr<const TreeModelPredictionMgr>&& tree_model_prediction_mgr) {
+    tree_model_prediction_mgrs_.emplace_back(std::move(tree_model_prediction_mgr));
+    return tree_model_prediction_mgrs_.back().get();
+  }
+
   const InValuesBitmap* addInValuesBitmap(
       std::unique_ptr<InValuesBitmap>& in_values_bitmap) {
+    if (in_values_bitmap->isEmpty()) {
+      return in_values_bitmap.get();
+    }
     in_values_bitmaps_.emplace_back(std::move(in_values_bitmap));
     return in_values_bitmaps_.back().get();
   }
+  void moveInValuesBitmap(std::unique_ptr<const InValuesBitmap>& in_values_bitmap) {
+    if (!in_values_bitmap->isEmpty()) {
+      in_values_bitmaps_.emplace_back(std::move(in_values_bitmap));
+    }
+  }
   // look up a runtime function based on the name, return type and type of
   // the arguments and call it; x64 only, don't call from GPU codegen
-  llvm::Value* emitExternalCall(const std::string& fname,
-                                llvm::Type* ret_type,
-                                const std::vector<llvm::Value*> args) {
-    std::vector<llvm::Type*> arg_types;
-    for (const auto arg : args) {
-      arg_types.push_back(arg->getType());
-    }
-    auto func_ty = llvm::FunctionType::get(ret_type, arg_types, false);
-    auto func_p = module_->getOrInsertFunction(fname, func_ty);
-    CHECK(func_p);
-    llvm::Value* result = ir_builder_.CreateCall(func_p, args);
-    // check the assumed type
-    CHECK_EQ(result->getType(), ret_type);
-    return result;
-  }
-
+  llvm::Value* emitExternalCall(
+      const std::string& fname,
+      llvm::Type* ret_type,
+      const std::vector<llvm::Value*> args,
+      const std::vector<llvm::Attribute::AttrKind>& fnattrs = {},
+      const bool has_struct_return = false);
   llvm::Value* emitCall(const std::string& fname, const std::vector<llvm::Value*>& args);
+  llvm::Value* emitEntryCall(const std::string& fname,
+                             const std::vector<llvm::Value*>& args);
 
   size_t getLiteralBufferUsage(const int device_id) { return literal_bytes_[device_id]; }
 
@@ -226,8 +242,8 @@ struct CgenState {
       const bool is_signed);
 
   llvm::ConstantInt* inlineIntNull(const SQLTypeInfo&);
-
   llvm::ConstantFP* inlineFpNull(const SQLTypeInfo&);
+  llvm::Constant* inlineNull(const SQLTypeInfo&);
 
   template <class T>
   llvm::ConstantInt* llInt(const T v) const {
@@ -246,13 +262,127 @@ struct CgenState {
 
   llvm::ConstantInt* llBool(const bool v) const { return ::ll_bool(v, context_); }
 
+  void emitErrorCheck(llvm::Value* condition, llvm::Value* errorCode, std::string label);
+
+  std::vector<std::string> gpuFunctionsToReplace(llvm::Function* fn);
+
+  void replaceFunctionForGpu(const std::string& fcn_to_replace, llvm::Function* fn);
+
+  std::shared_ptr<Executor> getExecutor() const;
+  llvm::LLVMContext& getExecutorContext() const;
+  void set_module_shallow_copy(const std::unique_ptr<llvm::Module>& module,
+                               bool always_clone = false);
+
+  size_t executor_id_;
+
+  /*
+    Managing LLVM modules
+    ---------------------
+
+    Quoting https://groups.google.com/g/llvm-dev/c/kuil5XjasUs/m/7PBpOWZFDAAJ :
+    """
+    The state of Module/Context ownership is very muddled in the
+    codebase. As you have discovered: LLVMContext’s notionally own
+    their modules (via raw pointers deleted upon destruction of the
+    context), however in practice we always hold llvm Modules by
+    unique_ptr. Since the Module destructor removes the raw pointer
+    from the Context, this doesn’t usually blow up. It’s pretty broken
+    though.
+
+    I would argue that you should use unique_ptr and ignore
+    LLVMContext ownership.
+    """
+
+    Here we follow the last argument only partially for reasons
+    explained below.
+
+    HeavyDB supports concurrent query executions. For that, a global
+    cache of Executor instances is used. Each instance is able to
+    generate LLVM code, compile it to machine code (with code
+    caching), and execute the code --- all that concurrently with
+    other Executor instances.
+
+    Each Executor instance holds as set of extension modules (LLVM
+    Module instances) that are either loaded at Executor construction
+    time (template module from RuntimeFunctions.bc, rt_geos from
+    GeosRuntime.bc, rt_libdevice from libdevice.10.bc, udf_cpu/gpu
+    modules from LLVM IR file), or at run-time (rt_udf_cpu/gpu modules
+    from LLVM IR string).  All these extension modules are owned by
+    the Executor instance via unique_ptr. Since Executor also owns the
+    LLVM Context instance that technically also owns these extension
+    modules, then the LLVM Context-Module ownership can be ignored
+    (see the quote above).
+
+    Code generation is a process that compiles
+    (generated/user-provided) LLVM IR code into machine code that can
+    be executed on a CPU or GPU.
+
+    Typically, a copy of the template module (let's call this copy as
+    a worker module) is used as an input to code generation that is
+    updated with generated/user-provided LLVM Functions and with other
+    extension modules being linked in. The worker module is created by
+    set_module_shallow_copy and is owned by an Executor instance as a
+    raw pointer (via cgen_state member). Notice that
+    set_module_shallow_copy clones the template module and then
+    releases unique_ptr as a raw pointer.  This means that Executor is
+    now responsible of deleting the worker module after the
+    compilation process completes.
+
+    The reason why the worker module is stored via raw pointer value
+    (rather than using unique_ptr as suggested in the quote above) is
+    as follows.  First, the code generation in HeavyDB can be a
+    recursive process (e.g. in the case of multi-step
+    multi-subqueries) that involves temporary "shelving" of parent
+    compilation processes (the corresponding worker modules are put on
+    hold). In addition, the Executor may trigger threaded compilations
+    that involve "resetting" the worker module for different threads
+    (btw, these compilations cannot be concurrent because LLVM Context
+    is not threadsafe.  The shelving and resetting of worker modules
+    makes the scope of a worker module dynamic (only one worker module
+    instance can be in scope while other worker modules are on hold)
+    that contradicts with the purpose of unique_ptr (out-of-scope
+    worker modules can be destroyed) and would make managing all
+    worker modules very painful if these would be stored as unique_ptr
+    instances.
+
+    An entry point to the code generation is Executor::compileWorkUnit
+    method. Its scope includes creating an Executor::CgenStateManager
+    instance that uses RAII pattern to manage the CgenState instance
+    held by an Executor instance. In addition, the CgenStateManager
+    locks other compilations within the same Executor instance. The
+    compilation lock enables the threaded compilation feature.
+
+    Construction of CgenStateManager (i) stores the existing CgenState
+    instance held by the Executor instance, and (ii) creates an new
+    CgenState instance with un-instantiated worker module.  The worker
+    module is instantiated after the construction (unless
+    QueryMustRunOnCpu is thrown) via set_module_shallow_copy, followed
+    by updating the worker module according to the given query and
+    compiling it to machine code. Destruction of CgenStateManager
+    (read: when leaving the compileWorkUnit method) will delete the
+    instantiated worker module and restores the previous CgenState
+    instance.  This CgenState management enables the recursive
+    compilation feature.
+
+    Finally, we note that the worker module compilation caches the
+    compilation results using the full LLVM IR as the cache
+    key. Caching compilation results is especially effective for CUDA
+    target due to a considerable overhead from the CUDA compilation.
+   */
+
   llvm::Module* module_;
   llvm::Function* row_func_;
+  llvm::Function* filter_func_;
+  llvm::Function* current_func_;
+  llvm::BasicBlock* row_func_bb_;
+  llvm::BasicBlock* filter_func_bb_;
+  llvm::CallInst* row_func_call_;
+  llvm::CallInst* filter_func_call_;
   std::vector<llvm::Function*> helper_functions_;
-  llvm::LLVMContext& context_;
+  llvm::LLVMContext& context_;    // LLVMContext instance is held by an Executor instance.
   llvm::ValueToValueMapTy vmap_;  // used for cloning the runtime module
   llvm::IRBuilder<> ir_builder_;
-  std::unordered_map<int, std::vector<llvm::Value*>> fetch_cache_;
+  std::unordered_map<size_t, std::vector<llvm::Value*>> fetch_cache_;
   struct FunctionOperValue {
     const Analyzer::FunctionOper* foper;
     llvm::Value* lv;
@@ -264,9 +394,16 @@ struct CgenState {
   const bool contains_left_deep_outer_join_;
   std::vector<llvm::Value*> outer_join_match_found_per_level_;
   std::unordered_map<int, llvm::Value*> scan_idx_to_hash_pos_;
+  InsertionOrderedMap filter_func_args_;
   std::vector<std::unique_ptr<const InValuesBitmap>> in_values_bitmaps_;
-  const std::vector<InputTableInfo>& query_infos_;
+  std::vector<std::unique_ptr<const TreeModelPredictionMgr>> tree_model_prediction_mgrs_;
+  std::vector<std::unique_ptr<const StringDictionaryTranslationMgr>>
+      str_dict_translation_mgrs_;
+  std::map<std::pair<llvm::Value*, llvm::Value*>, ArrayLoadCodegen>
+      array_load_cache_;  // byte stream to array info
+  std::unordered_map<std::string, llvm::Value*> geo_target_cache_;
   bool needs_error_check_;
+  bool needs_geos_;
 
   llvm::Function* query_func_;
   llvm::IRBuilder<> query_func_entry_ir_builder_;
@@ -317,9 +454,12 @@ struct CgenState {
     return off + alignment;
   }
 
+  void maybeCloneFunctionRecursive(llvm::Function* fn);
+
  private:
+  // todo (yoonmin) : avoid linear scanning of `literals` map
   template <class T>
-  size_t getOrAddLiteral(const T& val, const int device_id) {
+  std::tuple<size_t, size_t> getOrAddLiteral(const T& val, const int device_id) {
     const LiteralValue var_val(val);
     size_t literal_found_off{0};
     auto& literals = literals_[device_id];
@@ -327,15 +467,17 @@ struct CgenState {
       const auto lit_bytes = literalBytes(literal);
       literal_found_off = addAligned(literal_found_off, lit_bytes);
       if (literal == var_val) {
-        return literal_found_off - lit_bytes;
+        return {literal_found_off - lit_bytes, lit_bytes};
       }
     }
     literals.emplace_back(val);
     const auto lit_bytes = literalBytes(var_val);
     literal_bytes_[device_id] = addAligned(literal_bytes_[device_id], lit_bytes);
-    return literal_bytes_[device_id] - lit_bytes;
+    return {literal_bytes_[device_id] - lit_bytes, lit_bytes};
   }
 
   std::unordered_map<int, LiteralValues> literals_;
   std::unordered_map<int, size_t> literal_bytes_;
 };
+
+#include "AutomaticIRMetadataGuard.h"

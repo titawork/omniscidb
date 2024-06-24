@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,13 +18,15 @@
 #define THRIFTHANDLER_TOKENCOMPLETIONHINTS_H
 
 #include "gen-cpp/completion_hints_types.h"
+// completion_hints_types.h > Thrift.h > PlatformSocket.h > winsock2.h > windows.h
+#include "Shared/cleanup_global_namespace.h"
 
 #include <unordered_map>
 #include <unordered_set>
 
 // Find last "word" (can contain: alphanumeric, underscore, dot) from position
 // `cursor` inside or at the end of `sql`.
-std::string find_last_word_from_cursor(const std::string& sql, const ssize_t cursor);
+std::string find_last_word_from_cursor(const std::string& sql, const int64_t cursor);
 
 // Only allows a few whitelisted keywords, filters out everything else.
 std::vector<TCompletionHint> just_whitelisted_keyword_hints(

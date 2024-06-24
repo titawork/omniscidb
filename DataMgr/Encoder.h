@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,16 +17,16 @@
 #ifndef ENCODER_H
 #define ENCODER_H
 
-#include "../Shared/DateConverters.h"
-#include "../Shared/sqltypes.h"
-#include "../Shared/types.h"
-#include "ChunkMetadata.h"
-
 #include <cmath>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <vector>
+
+#include "ChunkMetadata.h"
+#include "Shared/DateConverters.h"
+#include "Shared/sqltypes.h"
+#include "Shared/types.h"
 
 namespace Data_Namespace {
 class AbstractBuffer;
@@ -51,25 +51,27 @@ class DecimalOverflowValidator {
   }
 
   template <typename T>
-  void validate(T value) {
+  void validate(T value) const {
     if (std::is_integral<T>::value) {
       do_validate(static_cast<int64_t>(value));
     }
   }
 
-  void do_validate(int64_t value) {
+  void do_validate(int64_t value) const {
     if (!do_check_) {
       return;
     }
 
     if (value >= max_) {
       throw std::runtime_error("Decimal overflow: value is greater than 10^" +
-                               std::to_string(pow10_));
+                               std::to_string(pow10_) + " max " + std::to_string(max_) +
+                               " value " + std::to_string(value));
     }
 
     if (value <= min_) {
       throw std::runtime_error("Decimal overflow: value is less than -10^" +
-                               std::to_string(pow10_));
+                               std::to_string(pow10_) + " min " + std::to_string(min_) +
+                               " value " + std::to_string(value));
     }
   }
 
@@ -130,7 +132,7 @@ class DateDaysOverflowValidator {
     }
     if (days < min_) {
       throw std::runtime_error("Date encoding underflow: Epoch days " +
-                               std::to_string(days) + " less than minumum capacity " +
+                               std::to_string(days) + " less than minimum capacity " +
                                std::to_string(min_));
     }
   }
@@ -148,15 +150,116 @@ class Encoder {
   Encoder(Data_Namespace::AbstractBuffer* buffer);
   virtual ~Encoder() {}
 
-  virtual ChunkMetadata appendData(int8_t*& srcData,
-                                   const size_t numAppendElems,
-                                   const SQLTypeInfo&,
-                                   const bool replicating = false) = 0;
-  virtual void getMetadata(ChunkMetadata& chunkMetadata);
+  /**
+   * Compute the maximum number of variable length encoded elements given a
+   * byte limit
+   *
+   * @param index_data - (optional) index data for the encoded type
+   * @param selected_idx - which indices in the encoded data to consider
+   * @param byte_limit - byte limit that must be respected
+   *
+   * @return the number of elements
+   *
+   * NOTE: optional parameters above may be ignored by the implementation, but
+   * may or may not be required depending on the encoder type backing the
+   * implementation.
+   */
+  virtual size_t getNumElemsForBytesEncodedDataAtIndices(
+      const int8_t* index_data,
+      const std::vector<size_t>& selected_idx,
+      const size_t byte_limit) = 0;
+
+  /**
+   * Append selected encoded data to the chunk buffer backing this encoder.
+   *
+   * @param index_data - (optional) the index data of data to append
+   * @param data - the data to append
+   * @param selected_idx - which indices in the encoded data to append
+   *
+   * @return updated chunk metadata for the chunk buffer backing this encoder
+   *
+   * NOTE: `index_data` must be non-null for varlen encoder types.
+   */
+  virtual std::shared_ptr<ChunkMetadata> appendEncodedDataAtIndices(
+      const int8_t* index_data,
+      int8_t* data,
+      const std::vector<size_t>& selected_idx) = 0;
+
+  /**
+   * Append encoded data to the chunk buffer backing this encoder.
+   *
+   * @param index_data - (optional) the index data of data to append
+   * @param data - the data to append
+   * @param start_idx - the position to start encoding from in the `data` array
+   * @param num_elements - the number of elements to encode from the `data` array
+   * @return updated chunk metadata for the chunk buffer backing this encoder
+   *
+   * NOTE: `index_data` must be non-null for varlen encoder types.
+   */
+  virtual std::shared_ptr<ChunkMetadata> appendEncodedData(const int8_t* index_data,
+                                                           int8_t* data,
+                                                           const size_t start_idx,
+                                                           const size_t num_elements) = 0;
+
+  //! Append data to the chunk buffer backing this encoder.
+  //! @param src_data Source data for the append
+  //! @param num_elems_to_append Number of elements to append
+  //! @param ti SQL Type Info for the column TODO(adb): used?
+  //! @param replicating Pass one value and fill the chunk with it
+  //! @param offset Write data starting at a given offset. Default is -1 which indicates
+  //! an append, an offset of 0 rewrites the chunk up to `num_elems_to_append`.
+  virtual std::shared_ptr<ChunkMetadata> appendData(int8_t*& src_data,
+                                                    const size_t num_elems_to_append,
+                                                    const SQLTypeInfo& ti,
+                                                    const bool replicating = false,
+                                                    const int64_t offset = -1) = 0;
+  virtual void getMetadata(const std::shared_ptr<ChunkMetadata>& chunkMetadata);
   // Only called from the executor for synthesized meta-information.
-  virtual ChunkMetadata getMetadata(const SQLTypeInfo& ti) = 0;
+  virtual std::shared_ptr<ChunkMetadata> getMetadata(const SQLTypeInfo& ti) = 0;
   virtual void updateStats(const int64_t val, const bool is_null) = 0;
   virtual void updateStats(const double val, const bool is_null) = 0;
+
+  /**
+   * Update statistics for data without appending.
+   *
+   * @param src_data - the data with which to update statistics
+   * @param num_elements - the number of elements to scan in the data
+   */
+  virtual void updateStats(const int8_t* const src_data, const size_t num_elements) = 0;
+
+  /**
+   * Update statistics for encoded data without appending.
+   *
+   * @param dst_data - the data with which to update statistics
+   * @param num_elements - the number of elements to scan in the data
+   */
+  virtual void updateStatsEncoded(const int8_t* const dst_data,
+                                  const size_t num_elements) {
+    UNREACHABLE();
+  }
+
+  /**
+   * Update statistics for string data without appending.
+   *
+   * @param src_data - the string data with which to update statistics
+   * @param start_idx - the offset into `src_data` to start the update
+   * @param num_elements - the number of elements to scan in the string data
+   */
+  virtual void updateStats(const std::vector<std::string>* const src_data,
+                           const size_t start_idx,
+                           const size_t num_elements) = 0;
+
+  /**
+   * Update statistics for array data without appending.
+   *
+   * @param src_data - the array data with which to update statistics
+   * @param start_idx - the offset into `src_data` to start the update
+   * @param num_elements - the number of elements to scan in the array data
+   */
+  virtual void updateStats(const std::vector<ArrayDatum>* const src_data,
+                           const size_t start_idx,
+                           const size_t num_elements) = 0;
+
   virtual void reduceStats(const Encoder&) = 0;
   virtual void copyMetadata(const Encoder* copyFromEncoder) = 0;
   virtual void writeMetadata(FILE* f /*, const size_t offset*/) = 0;
@@ -168,7 +271,15 @@ class Encoder {
    * otherwise. Default false if metadata update is unsupported. Only reset chunk stats if
    * the incoming stats differ from the current stats.
    */
-  virtual bool resetChunkStats(const ChunkStats&) { return false; }
+  virtual bool resetChunkStats(const ChunkStats&) {
+    UNREACHABLE() << "Attempting to reset stats for unsupported type.";
+    return false;
+  }
+
+  /**
+   * Resets chunk metadata stats to their default values.
+   */
+  virtual void resetChunkStats() = 0;
 
   size_t getNumElems() const { return num_elems_; }
   void setNumElems(const size_t num_elems) { num_elems_ = num_elems; }
@@ -177,7 +288,6 @@ class Encoder {
   size_t num_elems_;
 
   Data_Namespace::AbstractBuffer* buffer_;
-  // ChunkMetadata metadataTemplate_;
 
   DecimalOverflowValidator decimal_overflow_validator_;
   DateDaysOverflowValidator date_days_overflow_validator_;

@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -179,10 +179,57 @@ std::shared_ptr<Analyzer::BinOper> lower_multicol_compare(
   return acc;
 }
 
+void check_array_comp_cond(const Analyzer::BinOper* bin_oper) {
+  auto lhs_cv = dynamic_cast<const Analyzer::ColumnVar*>(bin_oper->get_left_operand());
+  auto rhs_cv = dynamic_cast<const Analyzer::ColumnVar*>(bin_oper->get_right_operand());
+  auto comp_op = IS_COMPARISON(bin_oper->get_optype());
+  if (lhs_cv && rhs_cv && comp_op) {
+    auto lhs_ti = lhs_cv->get_type_info();
+    auto rhs_ti = rhs_cv->get_type_info();
+    if (lhs_ti.is_array() && rhs_ti.is_array()) {
+      throw std::runtime_error(
+          "Comparing two full array columns is not supported yet. Please consider "
+          "rewriting the full array comparison to a comparison between indexed array "
+          "columns "
+          "(i.e., arr1[1] {<, <=, >, >=} arr2[1]).");
+    }
+  }
+  auto lhs_bin_oper =
+      dynamic_cast<const Analyzer::BinOper*>(bin_oper->get_left_operand());
+  auto rhs_bin_oper =
+      dynamic_cast<const Analyzer::BinOper*>(bin_oper->get_right_operand());
+  // we can do (non-)equivalence check of two encoded string
+  // even if they are (indexed) array cols
+  auto theta_comp = IS_COMPARISON(bin_oper->get_optype()) &&
+                    !IS_EQUIVALENCE(bin_oper->get_optype()) &&
+                    bin_oper->get_optype() != SQLOps::kNE;
+  if (lhs_bin_oper && rhs_bin_oper && theta_comp &&
+      lhs_bin_oper->get_optype() == SQLOps::kARRAY_AT &&
+      rhs_bin_oper->get_optype() == SQLOps::kARRAY_AT) {
+    auto lhs_arr_cv =
+        dynamic_cast<const Analyzer::ColumnVar*>(lhs_bin_oper->get_left_operand());
+    auto lhs_arr_idx =
+        dynamic_cast<const Analyzer::Constant*>(lhs_bin_oper->get_right_operand());
+    auto rhs_arr_cv =
+        dynamic_cast<const Analyzer::ColumnVar*>(rhs_bin_oper->get_left_operand());
+    auto rhs_arr_idx =
+        dynamic_cast<const Analyzer::Constant*>(rhs_bin_oper->get_right_operand());
+    if (lhs_arr_cv && rhs_arr_cv && lhs_arr_idx && rhs_arr_idx &&
+        ((lhs_arr_cv->get_type_info().is_array() &&
+          lhs_arr_cv->get_type_info().get_subtype() == SQLTypes::kTEXT) ||
+         (rhs_arr_cv->get_type_info().is_string() &&
+          rhs_arr_cv->get_type_info().get_subtype() == SQLTypes::kTEXT))) {
+      throw std::runtime_error(
+          "Comparison between string array columns is not supported yet.");
+    }
+  }
+}
+
 }  // namespace
 
 llvm::Value* CodeGenerator::codegenCmp(const Analyzer::BinOper* bin_oper,
                                        const CompilationOptions& co) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   const auto qualifier = bin_oper->get_qualifier();
   const auto lhs = bin_oper->get_left_operand();
   const auto rhs = bin_oper->get_right_operand();
@@ -198,16 +245,17 @@ llvm::Value* CodeGenerator::codegenCmp(const Analyzer::BinOper* bin_oper,
     const auto bw_eq_oper = lower_bw_eq(bin_oper);
     return codegenLogical(bw_eq_oper.get(), co);
   }
-  if (optype == kOVERLAPS) {
-    return codegenOverlaps(optype,
-                           qualifier,
-                           bin_oper->get_own_left_operand(),
-                           bin_oper->get_own_right_operand(),
-                           co);
+  if (optype == kBBOX_INTERSECT) {
+    return codegenBoundingBoxIntersect(optype,
+                                       qualifier,
+                                       bin_oper->get_own_left_operand(),
+                                       bin_oper->get_own_right_operand(),
+                                       co);
   }
   if (is_unnest(lhs) || is_unnest(rhs)) {
     throw std::runtime_error("Unnest not supported in comparisons");
   }
+  check_array_comp_cond(bin_oper);
   const auto& lhs_ti = lhs->get_type_info();
   const auto& rhs_ti = rhs->get_type_info();
 
@@ -230,19 +278,28 @@ llvm::Value* CodeGenerator::codegenCmp(const Analyzer::BinOper* bin_oper,
       return cmp_decimal_const;
     }
   }
-
   auto lhs_lvs = codegen(lhs, true, co);
   return codegenCmp(optype, qualifier, lhs_lvs, lhs_ti, rhs, co);
 }
 
-llvm::Value* CodeGenerator::codegenOverlaps(const SQLOps optype,
-                                            const SQLQualifier qualifier,
-                                            const std::shared_ptr<Analyzer::Expr> lhs,
-                                            const std::shared_ptr<Analyzer::Expr> rhs,
-                                            const CompilationOptions& co) {
+llvm::Value* CodeGenerator::codegenBoundingBoxIntersect(
+    const SQLOps optype,
+    const SQLQualifier qualifier,
+    const std::shared_ptr<Analyzer::Expr> lhs,
+    const std::shared_ptr<Analyzer::Expr> rhs,
+    const CompilationOptions& co) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
+  const auto lhs_ti = lhs->get_type_info();
+  if (g_enable_bbox_intersect_hashjoin) {
+    // failed to build a suitable hash table. short circuit the bounding box interesect
+    // expression by always returning true. this will fall into the ST_Contains check,
+    // which will do bounding box intersection before the heavier contains computation.
+    VLOG(1) << "Failed to build bounding box intersect hash table, short circuiting "
+               "bounding box intersect operator.";
+    return llvm::ConstantInt::get(get_int_type(8, cgen_state_->context_), true);
+  }
   // TODO(adb): we should never get here, but going to leave this in place for now since
   // it will likely be useful in factoring the bounds check out of ST_Contains
-  const auto lhs_ti = lhs->get_type_info();
   CHECK(lhs_ti.is_geometry());
 
   if (lhs_ti.is_geometry()) {
@@ -252,15 +309,16 @@ llvm::Value* CodeGenerator::codegenOverlaps(const SQLOps optype,
     CHECK(lhs_col);
 
     // Get the actual point data column descriptor
-    const auto coords_cd = executor()->getCatalog()->getMetadataForColumn(
-        lhs_col->get_table_id(), lhs_col->get_column_id() + 1);
+    auto lhs_column_key = lhs_col->getColumnKey();
+    lhs_column_key.column_id = lhs_column_key.column_id + 1;
+    const auto coords_cd = Catalog_Namespace::get_metadata_for_column(lhs_column_key);
     CHECK(coords_cd);
 
     std::vector<std::shared_ptr<Analyzer::Expr>> geoargs;
-    geoargs.push_back(makeExpr<Analyzer::ColumnVar>(coords_cd->columnType,
-                                                    coords_cd->tableId,
-                                                    coords_cd->columnId,
-                                                    lhs_col->get_rte_idx()));
+    geoargs.push_back(makeExpr<Analyzer::ColumnVar>(
+        coords_cd->columnType,
+        shared::ColumnKey{lhs_col->getTableKey(), coords_cd->columnId},
+        lhs_col->get_rte_idx()));
 
     Datum input_compression;
     input_compression.intval =
@@ -285,15 +343,17 @@ llvm::Value* CodeGenerator::codegenOverlaps(const SQLOps optype,
     const auto rhs_col = dynamic_cast<Analyzer::ColumnVar*>(rhs.get());
     CHECK(rhs_col);
 
-    const auto poly_bounds_cd = executor()->getCatalog()->getMetadataForColumn(
-        rhs_col->get_table_id(),
-        rhs_col->get_column_id() + rhs_ti.get_physical_coord_cols() + 1);
+    auto rhs_column_key = rhs_col->getColumnKey();
+    rhs_column_key.column_id =
+        rhs_column_key.column_id + rhs_ti.get_physical_coord_cols() + 1;
+    const auto poly_bounds_cd =
+        Catalog_Namespace::get_metadata_for_column(rhs_column_key);
     CHECK(poly_bounds_cd);
 
-    auto bbox_col_var = makeExpr<Analyzer::ColumnVar>(poly_bounds_cd->columnType,
-                                                      poly_bounds_cd->tableId,
-                                                      poly_bounds_cd->columnId,
-                                                      rhs_col->get_rte_idx());
+    auto bbox_col_var = makeExpr<Analyzer::ColumnVar>(
+        poly_bounds_cd->columnType,
+        shared::ColumnKey{rhs_col->getTableKey(), poly_bounds_cd->columnId},
+        rhs_col->get_rte_idx());
 
     const auto bbox_contains_func_oper =
         makeExpr<Analyzer::FunctionOper>(SQLTypeInfo(kBOOLEAN, false),
@@ -304,7 +364,8 @@ llvm::Value* CodeGenerator::codegenOverlaps(const SQLOps optype,
     return codegenFunctionOper(bbox_contains_func_oper.get(), co);
   }
 
-  CHECK(false) << "Unsupported type for overlaps operator: " << lhs_ti.get_type_name();
+  CHECK(false) << "Unsupported type for bounding box intersect operator: "
+               << lhs_ti.get_type_name();
   return nullptr;
 }
 
@@ -313,6 +374,7 @@ llvm::Value* CodeGenerator::codegenStrCmp(const SQLOps optype,
                                           const std::shared_ptr<Analyzer::Expr> lhs,
                                           const std::shared_ptr<Analyzer::Expr> rhs,
                                           const CompilationOptions& co) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   const auto lhs_ti = lhs->get_type_info();
   const auto rhs_ti = rhs->get_type_info();
 
@@ -322,7 +384,7 @@ llvm::Value* CodeGenerator::codegenStrCmp(const SQLOps optype,
   const auto null_check_suffix = get_null_check_suffix(lhs_ti, rhs_ti);
   if (lhs_ti.get_compression() == kENCODING_DICT &&
       rhs_ti.get_compression() == kENCODING_DICT) {
-    if (lhs_ti.get_comp_param() == rhs_ti.get_comp_param()) {
+    if (lhs_ti.getStringDictKey() == rhs_ti.getStringDictKey()) {
       // Both operands share a dictionary
 
       // check if query is trying to compare a columnt against literal
@@ -338,12 +400,14 @@ llvm::Value* CodeGenerator::codegenStrCmp(const SQLOps optype,
   }
   return nullptr;
 }
+
 llvm::Value* CodeGenerator::codegenCmpDecimalConst(const SQLOps optype,
                                                    const SQLQualifier qualifier,
                                                    const Analyzer::Expr* lhs,
                                                    const SQLTypeInfo& lhs_ti,
                                                    const Analyzer::Expr* rhs,
                                                    const CompilationOptions& co) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   auto u_oper = dynamic_cast<const Analyzer::UOper*>(lhs);
   if (!u_oper || u_oper->get_optype() != kCAST) {
     return nullptr;
@@ -374,8 +438,10 @@ llvm::Value* CodeGenerator::codegenCmpDecimalConst(const SQLOps optype,
   if (truncated_decimal % 10 == 0 && decimal_tail > 0) {
     truncated_decimal += 1;
   }
-  SQLTypeInfo new_ti = SQLTypeInfo(
-      kDECIMAL, 19, lhs_ti.get_scale() - scale_diff, operand_ti.get_notnull());
+  SQLTypeInfo new_ti = SQLTypeInfo(kDECIMAL,
+                                   sql_constants::kMaxRepresentableNumericPrecision,
+                                   lhs_ti.get_scale() - scale_diff,
+                                   operand_ti.get_notnull());
   if (negative) {
     truncated_decimal = -truncated_decimal;
   }
@@ -394,6 +460,7 @@ llvm::Value* CodeGenerator::codegenCmp(const SQLOps optype,
                                        const SQLTypeInfo& lhs_ti,
                                        const Analyzer::Expr* rhs,
                                        const CompilationOptions& co) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   CHECK(IS_COMPARISON(optype));
   const auto& rhs_ti = rhs->get_type_info();
   if (rhs_ti.is_array()) {
@@ -401,7 +468,7 @@ llvm::Value* CodeGenerator::codegenCmp(const SQLOps optype,
   }
   auto rhs_lvs = codegen(rhs, true, co);
   CHECK_EQ(kONE, qualifier);
-  if (optype == kOVERLAPS) {
+  if (optype == kBBOX_INTERSECT) {
     CHECK(lhs_ti.is_geometry());
     CHECK(rhs_ti.is_array() ||
           rhs_ti.is_geometry());  // allow geo col or bounds col to pass
@@ -419,13 +486,17 @@ llvm::Value* CodeGenerator::codegenCmp(const SQLOps optype,
         // unpack pointer + length if necessary
         if (lhs_lvs.size() != 3) {
           CHECK_EQ(size_t(1), lhs_lvs.size());
-          lhs_lvs.push_back(cgen_state_->emitCall("extract_str_ptr", {lhs_lvs.front()}));
-          lhs_lvs.push_back(cgen_state_->emitCall("extract_str_len", {lhs_lvs.front()}));
+          lhs_lvs.push_back(cgen_state_->ir_builder_.CreateExtractValue(lhs_lvs[0], 0));
+          lhs_lvs.push_back(cgen_state_->ir_builder_.CreateExtractValue(lhs_lvs[0], 1));
+          lhs_lvs.back() = cgen_state_->ir_builder_.CreateTrunc(
+              lhs_lvs.back(), llvm::Type::getInt32Ty(cgen_state_->context_));
         }
         if (rhs_lvs.size() != 3) {
           CHECK_EQ(size_t(1), rhs_lvs.size());
-          rhs_lvs.push_back(cgen_state_->emitCall("extract_str_ptr", {rhs_lvs.front()}));
-          rhs_lvs.push_back(cgen_state_->emitCall("extract_str_len", {rhs_lvs.front()}));
+          rhs_lvs.push_back(cgen_state_->ir_builder_.CreateExtractValue(rhs_lvs[0], 0));
+          rhs_lvs.push_back(cgen_state_->ir_builder_.CreateExtractValue(rhs_lvs[0], 1));
+          rhs_lvs.back() = cgen_state_->ir_builder_.CreateTrunc(
+              rhs_lvs.back(), llvm::Type::getInt32Ty(cgen_state_->context_));
         }
         std::vector<llvm::Value*> str_cmp_args{
             lhs_lvs[1], lhs_lvs[2], rhs_lvs[1], rhs_lvs[2]};
@@ -440,6 +511,22 @@ llvm::Value* CodeGenerator::codegenCmp(const SQLOps optype,
         CHECK(optype == kEQ || optype == kNE);
       }
     }
+
+    if (lhs_ti.is_boolean() && rhs_ti.is_boolean()) {
+      auto& lhs_lv = lhs_lvs.front();
+      auto& rhs_lv = rhs_lvs.front();
+      CHECK(lhs_lv->getType()->isIntegerTy());
+      CHECK(rhs_lv->getType()->isIntegerTy());
+      if (lhs_lv->getType()->getIntegerBitWidth() <
+          rhs_lv->getType()->getIntegerBitWidth()) {
+        lhs_lv =
+            cgen_state_->castToTypeIn(lhs_lv, rhs_lv->getType()->getIntegerBitWidth());
+      } else {
+        rhs_lv =
+            cgen_state_->castToTypeIn(rhs_lv, lhs_lv->getType()->getIntegerBitWidth());
+      }
+    }
+
     return null_check_suffix.empty()
                ? cgen_state_->ir_builder_.CreateICmp(
                      llvm_icmp_pred(optype), lhs_lvs.front(), rhs_lvs.front())
@@ -473,6 +560,7 @@ llvm::Value* CodeGenerator::codegenQualifierCmp(const SQLOps optype,
                                                 std::vector<llvm::Value*> lhs_lvs,
                                                 const Analyzer::Expr* rhs,
                                                 const CompilationOptions& co) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   const auto& rhs_ti = rhs->get_type_info();
   const Analyzer::Expr* arr_expr{rhs};
   if (dynamic_cast<const Analyzer::UOper*>(rhs)) {
@@ -500,13 +588,14 @@ llvm::Value* CodeGenerator::codegenQualifierCmp(const SQLOps optype,
           "Comparison between a dictionary-encoded and a none-encoded string would be "
           "slow");
     }
-    if (co.device_type_ == ExecutorDeviceType::GPU) {
+    if (co.device_type == ExecutorDeviceType::GPU) {
       throw QueryMustRunOnCpu();
     }
     CHECK_EQ(kENCODING_NONE, target_ti.get_compression());
     fname += "_str";
   }
-  if (elem_ti.is_integer() || elem_ti.is_boolean() || elem_ti.is_string()) {
+  if (elem_ti.is_integer() || elem_ti.is_boolean() || elem_ti.is_string() ||
+      elem_ti.is_decimal()) {
     fname += ("_" + numeric_type_name(elem_ti));
   } else {
     CHECK(elem_ti.is_fp());
@@ -522,10 +611,11 @@ llvm::Value* CodeGenerator::codegenQualifierCmp(const SQLOps optype,
          lhs_lvs[1],
          lhs_lvs[2],
          cgen_state_->llInt(int64_t(executor()->getStringDictionaryProxy(
-             elem_ti.get_comp_param(), executor()->getRowSetMemoryOwner(), true))),
+             elem_ti.getStringDictKey(), executor()->getRowSetMemoryOwner(), true))),
          cgen_state_->inlineIntNull(elem_ti)});
   }
-  if (target_ti.is_integer() || target_ti.is_boolean() || target_ti.is_string()) {
+  if (target_ti.is_integer() || target_ti.is_boolean() || target_ti.is_string() ||
+      target_ti.is_decimal()) {
     fname += ("_" + numeric_type_name(target_ti));
   } else {
     CHECK(target_ti.is_fp());

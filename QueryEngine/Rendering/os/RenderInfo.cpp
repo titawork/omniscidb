@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,44 +14,41 @@
  * limitations under the License.
  */
 
-#include "../RenderInfo.h"
+#include "QueryEngine/Rendering/RenderInfo.h"
+#include "Shared/Rendering/RenderQueryOptions.h"
 
-RenderInfo::RenderInfo(
-    const std::shared_ptr<const ::QueryRenderer::RenderSession> in_render_session,
-    const bool force_non_in_situ_data)
-    : render_session(in_render_session) {
+RenderInfo::RenderInfo(const ::QueryRenderer::RenderSessionKey& in_render_session_key,
+                       const RenderQueryOptions& in_render_query_opts,
+                       const heavyai::InSituFlags in_insitu_flags)
+    : heavyai::InSituFlagsOwnerInterface(in_insitu_flags)
+    , render_session_key(in_render_session_key)
+    , render_query_opts_(in_render_query_opts) {
   CHECK(false);
 }
 
 const Catalog_Namespace::SessionInfo& RenderInfo::getSessionInfo() const {
   CHECK(false);
   static const Catalog_Namespace::SessionInfo tmp(
-      nullptr, Catalog_Namespace::UserMetadata(), ExecutorDeviceType::CPU, "");
+      nullptr,
+      //Catalog_Namespace::UserMetadata(-1, "", "", false, -1, false),
+      Catalog_Namespace::UserMetadata(-1, "", "", false, -1, false, ""),
+      ExecutorDeviceType::CPU,
+      "");
   return tmp;
 }
 
-void RenderInfo::setForceNonInSituData() {
+std::shared_ptr<Catalog_Namespace::SessionInfo const> RenderInfo::getSessionInfoPtr()
+    const {
+  UNREACHABLE();
+  return {};
+}
+
+void RenderInfo::forceNonInSitu() {
   CHECK(false);
 }
 
-bool RenderInfo::queryRanWithInSituData() const {
+void RenderInfo::setNonInSitu() {
   CHECK(false);
-  return false;
-}
-
-bool RenderInfo::hasInSituData() const {
-  CHECK(false);
-  return false;
-}
-
-bool RenderInfo::isInSituDataFlagUnset() const {
-  CHECK(false);
-  return false;
-}
-
-bool RenderInfo::isPotentialInSituRender() const {
-  CHECK(false);
-  return false;
 }
 
 bool RenderInfo::useCudaBuffers() const {
@@ -83,11 +80,12 @@ void RenderInfo::setQuerySsboLayout(
   CHECK(false);
 }
 
-bool RenderInfo::setInSituDataIfUnset(const bool is_in_situ_data) {
+const RenderQueryOptions& RenderInfo::getRenderQueryOptions() const {
   CHECK(false);
-  return false;
+  return render_query_opts_;
 }
 
-void RenderInfo::reset(const bool disallow_in_situ_only_if_final_ED_is_aggregate_in) {
+void RenderInfo::reset(std::unique_ptr<RenderQueryOptions> in_query_opts,
+                       const heavyai::InSituFlags in_insitu_flags) {
   CHECK(false);
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,37 +16,16 @@
 
 #include "LLVMFunctionAttributesUtil.h"
 
-#if LLVM_VERSION_MAJOR >= 6
 void mark_function_always_inline(llvm::Function* func) {
-  func->addAttribute(llvm::AttributeList::AttrIndex::FunctionIndex,
-                     llvm::Attribute::AlwaysInline);
+  func->addFnAttr(llvm::Attribute::AlwaysInline);
 }
 
 void mark_function_never_inline(llvm::Function* func) {
   clear_function_attributes(func);
-  func->addAttribute(llvm::AttributeList::AttrIndex::FunctionIndex,
-                     llvm::Attribute::NoInline);
+  func->addFnAttr(llvm::Attribute::NoInline);
 }
 
 void clear_function_attributes(llvm::Function* func) {
   llvm::AttributeList no_attributes;
   func->setAttributes(no_attributes);
 }
-#else
-void mark_function_always_inline(llvm::Function* func) {
-  func->addAttribute(llvm::AttributeSet::AttrIndex::FunctionIndex,
-                     llvm::Attribute::AlwaysInline);
-}
-
-void mark_function_never_inline(llvm::Function* func) {
-  llvm::AttributeSet no_inline_attrs;
-  no_inline_attrs =
-      no_inline_attrs.addAttribute(func->getContext(), 0, llvm::Attribute::NoInline);
-  func->setAttributes(no_inline_attrs);
-}
-
-void clear_function_attributes(llvm::Function* func) {
-  llvm::AttributeSet no_attributes;
-  func->setAttributes(no_attributes);
-}
-#endif

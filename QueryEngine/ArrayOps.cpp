@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,11 +16,9 @@
 
 /**
  * @file    ArrayOps.cpp
- * @author  Alex Suhan <alex@mapd.com>
  * @brief   Functions to support array operations used by the executor.
  *
- * Copyright (c) 2014 MapD Technologies, Inc.  All rights reserved.
- **/
+ */
 
 #include <cstdint>
 #include "../Shared/funcannotations.h"
@@ -29,9 +27,12 @@
 
 #ifdef EXECUTE_INCLUDE
 
-extern "C" DEVICE int32_t array_size(int8_t* chunk_iter_,
-                                     const uint64_t row_pos,
-                                     const uint32_t elem_log_sz) {
+extern "C" DEVICE RUNTIME_EXPORT int32_t array_size(int8_t* chunk_iter_,
+                                                    const uint64_t row_pos,
+                                                    const uint32_t elem_log_sz) {
+  if (!chunk_iter_) {
+    return 0;
+  }
   ChunkIter* chunk_iter = reinterpret_cast<ChunkIter*>(chunk_iter_);
   ArrayDatum ad;
   bool is_end;
@@ -39,10 +40,10 @@ extern "C" DEVICE int32_t array_size(int8_t* chunk_iter_,
   return ad.is_null ? 0 : ad.length >> elem_log_sz;
 }
 
-extern "C" DEVICE int32_t array_size_nullable(int8_t* chunk_iter_,
-                                              const uint64_t row_pos,
-                                              const uint32_t elem_log_sz,
-                                              const int32_t null_val) {
+extern "C" DEVICE RUNTIME_EXPORT int32_t array_size_nullable(int8_t* chunk_iter_,
+                                                             const uint64_t row_pos,
+                                                             const uint32_t elem_log_sz,
+                                                             const int32_t null_val) {
   ChunkIter* chunk_iter = reinterpret_cast<ChunkIter*>(chunk_iter_);
   ArrayDatum ad;
   bool is_end;
@@ -50,7 +51,18 @@ extern "C" DEVICE int32_t array_size_nullable(int8_t* chunk_iter_,
   return ad.is_null ? null_val : ad.length >> elem_log_sz;
 }
 
-extern "C" DEVICE bool array_is_null(int8_t* chunk_iter_, const uint64_t row_pos) {
+extern "C" DEVICE RUNTIME_EXPORT int32_t array_size_1_nullable(int8_t* chunk_iter_,
+                                                               const uint64_t row_pos,
+                                                               const int32_t null_val) {
+  ChunkIter* chunk_iter = reinterpret_cast<ChunkIter*>(chunk_iter_);
+  ArrayDatum ad;
+  bool is_end;
+  ChunkIter_get_nth(chunk_iter, row_pos, &ad, &is_end);
+  return ad.is_null ? null_val : 1;
+}
+
+extern "C" DEVICE RUNTIME_EXPORT bool array_is_null(int8_t* chunk_iter_,
+                                                    const uint64_t row_pos) {
   ChunkIter* chunk_iter = reinterpret_cast<ChunkIter*>(chunk_iter_);
   ArrayDatum ad;
   bool is_end;
@@ -58,8 +70,17 @@ extern "C" DEVICE bool array_is_null(int8_t* chunk_iter_, const uint64_t row_pos
   return ad.is_null;
 }
 
+extern "C" DEVICE RUNTIME_EXPORT bool point_coord_array_is_null(int8_t* chunk_iter_,
+                                                                const uint64_t row_pos) {
+  ChunkIter* chunk_iter = reinterpret_cast<ChunkIter*>(chunk_iter_);
+  ArrayDatum ad;
+  bool is_end;
+  ChunkIter_get_nth_point_coords(chunk_iter, row_pos, &ad, &is_end);
+  return ad.is_null;
+}
+
 #define ARRAY_AT(type)                                                        \
-  extern "C" DEVICE type array_at_##type(                                     \
+  extern "C" DEVICE RUNTIME_EXPORT type array_at_##type(                      \
       int8_t* chunk_iter_, const uint64_t row_pos, const uint32_t elem_idx) { \
     ChunkIter* chunk_iter = reinterpret_cast<ChunkIter*>(chunk_iter_);        \
     ArrayDatum ad;                                                            \
@@ -77,44 +98,82 @@ ARRAY_AT(double)
 
 #undef ARRAY_AT
 
-#define ARRAY_ANY(type, needle_type, oper_name, oper)                    \
-  extern "C" DEVICE bool array_any_##oper_name##_##type##_##needle_type( \
-      int8_t* chunk_iter_,                                               \
-      const uint64_t row_pos,                                            \
-      const needle_type needle,                                          \
-      const type null_val) {                                             \
-    ChunkIter* chunk_iter = reinterpret_cast<ChunkIter*>(chunk_iter_);   \
-    ArrayDatum ad;                                                       \
-    bool is_end;                                                         \
-    ChunkIter_get_nth(chunk_iter, row_pos, &ad, &is_end);                \
-    const size_t elem_count = ad.length / sizeof(type);                  \
-    for (size_t i = 0; i < elem_count; ++i) {                            \
-      const needle_type val = reinterpret_cast<type*>(ad.pointer)[i];    \
-      if (val != null_val && val oper needle) {                          \
-        return true;                                                     \
-      }                                                                  \
-    }                                                                    \
-    return false;                                                        \
+#define VARLEN_ARRAY_AT(type)                                                 \
+  extern "C" DEVICE RUNTIME_EXPORT type varlen_array_at_##type(               \
+      int8_t* chunk_iter_, const uint64_t row_pos, const uint32_t elem_idx) { \
+    ChunkIter* chunk_iter = reinterpret_cast<ChunkIter*>(chunk_iter_);        \
+    ArrayDatum ad;                                                            \
+    bool is_end;                                                              \
+    ChunkIter_get_nth_varlen(chunk_iter, row_pos, &ad, &is_end);              \
+    return reinterpret_cast<type*>(ad.pointer)[elem_idx];                     \
   }
 
-#define ARRAY_ALL(type, needle_type, oper_name, oper)                    \
-  extern "C" DEVICE bool array_all_##oper_name##_##type##_##needle_type( \
-      int8_t* chunk_iter_,                                               \
-      const uint64_t row_pos,                                            \
-      const needle_type needle,                                          \
-      const type null_val) {                                             \
-    ChunkIter* chunk_iter = reinterpret_cast<ChunkIter*>(chunk_iter_);   \
-    ArrayDatum ad;                                                       \
-    bool is_end;                                                         \
-    ChunkIter_get_nth(chunk_iter, row_pos, &ad, &is_end);                \
-    const size_t elem_count = ad.length / sizeof(type);                  \
-    for (size_t i = 0; i < elem_count; ++i) {                            \
-      const needle_type val = reinterpret_cast<type*>(ad.pointer)[i];    \
-      if (!(val != null_val && val oper needle)) {                       \
-        return false;                                                    \
-      }                                                                  \
-    }                                                                    \
-    return true;                                                         \
+VARLEN_ARRAY_AT(int8_t)
+VARLEN_ARRAY_AT(int16_t)
+VARLEN_ARRAY_AT(int32_t)
+VARLEN_ARRAY_AT(int64_t)
+VARLEN_ARRAY_AT(float)
+VARLEN_ARRAY_AT(double)
+
+#undef VARLEN_ARRAY_AT
+
+#define VARLEN_NOTNULL_ARRAY_AT(type)                                         \
+  extern "C" DEVICE RUNTIME_EXPORT type varlen_notnull_array_at_##type(       \
+      int8_t* chunk_iter_, const uint64_t row_pos, const uint32_t elem_idx) { \
+    ChunkIter* chunk_iter = reinterpret_cast<ChunkIter*>(chunk_iter_);        \
+    ArrayDatum ad;                                                            \
+    bool is_end;                                                              \
+    ChunkIter_get_nth_varlen_notnull(chunk_iter, row_pos, &ad, &is_end);      \
+    return reinterpret_cast<type*>(ad.pointer)[elem_idx];                     \
+  }
+
+VARLEN_NOTNULL_ARRAY_AT(int8_t)
+VARLEN_NOTNULL_ARRAY_AT(int16_t)
+VARLEN_NOTNULL_ARRAY_AT(int32_t)
+VARLEN_NOTNULL_ARRAY_AT(int64_t)
+VARLEN_NOTNULL_ARRAY_AT(float)
+VARLEN_NOTNULL_ARRAY_AT(double)
+
+#undef VARLEN_NOTNULL_ARRAY_AT
+
+#define ARRAY_ANY(type, needle_type, oper_name, oper)                                   \
+  extern "C" DEVICE RUNTIME_EXPORT bool array_any_##oper_name##_##type##_##needle_type( \
+      int8_t* chunk_iter_,                                                              \
+      const uint64_t row_pos,                                                           \
+      const needle_type needle,                                                         \
+      const type null_val) {                                                            \
+    ChunkIter* chunk_iter = reinterpret_cast<ChunkIter*>(chunk_iter_);                  \
+    ArrayDatum ad;                                                                      \
+    bool is_end;                                                                        \
+    ChunkIter_get_nth(chunk_iter, row_pos, &ad, &is_end);                               \
+    const size_t elem_count = ad.length / sizeof(type);                                 \
+    for (size_t i = 0; i < elem_count; ++i) {                                           \
+      const needle_type val = reinterpret_cast<type*>(ad.pointer)[i];                   \
+      if (val != null_val && val oper needle) {                                         \
+        return true;                                                                    \
+      }                                                                                 \
+    }                                                                                   \
+    return false;                                                                       \
+  }
+
+#define ARRAY_ALL(type, needle_type, oper_name, oper)                                   \
+  extern "C" DEVICE RUNTIME_EXPORT bool array_all_##oper_name##_##type##_##needle_type( \
+      int8_t* chunk_iter_,                                                              \
+      const uint64_t row_pos,                                                           \
+      const needle_type needle,                                                         \
+      const type null_val) {                                                            \
+    ChunkIter* chunk_iter = reinterpret_cast<ChunkIter*>(chunk_iter_);                  \
+    ArrayDatum ad;                                                                      \
+    bool is_end;                                                                        \
+    ChunkIter_get_nth(chunk_iter, row_pos, &ad, &is_end);                               \
+    const size_t elem_count = ad.length / sizeof(type);                                 \
+    for (size_t i = 0; i < elem_count; ++i) {                                           \
+      const needle_type val = reinterpret_cast<type*>(ad.pointer)[i];                   \
+      if (!(val != null_val && val oper needle)) {                                      \
+        return false;                                                                   \
+      }                                                                                 \
+    }                                                                                   \
+    return true;                                                                        \
   }
 
 #define ARRAY_ALL_ANY_ALL_TYPES(oper_name, oper, needle_type) \
@@ -178,10 +237,11 @@ ARRAY_ALL_ANY_ALL_TYPES(ge, >=, double)
 #undef ARRAY_ANY
 
 #define ARRAY_AT_CHECKED(type)                                                    \
-  extern "C" DEVICE type array_at_##type##_checked(int8_t* chunk_iter_,           \
-                                                   const uint64_t row_pos,        \
-                                                   const int64_t elem_idx,        \
-                                                   const type null_val) {         \
+  extern "C" DEVICE RUNTIME_EXPORT type array_at_##type##_checked(                \
+      int8_t* chunk_iter_,                                                        \
+      const uint64_t row_pos,                                                     \
+      const int64_t elem_idx,                                                     \
+      const type null_val) {                                                      \
     if (elem_idx <= 0) {                                                          \
       return null_val;                                                            \
     }                                                                             \
@@ -204,8 +264,8 @@ ARRAY_AT_CHECKED(double)
 
 #undef ARRAY_AT_CHECKED
 
-extern "C" DEVICE int8_t* allocate_varlen_buffer(int64_t element_count,
-                                                 int64_t element_size) {
+extern "C" DEVICE RUNTIME_EXPORT int8_t* allocate_varlen_buffer(int64_t element_count,
+                                                                int64_t element_size) {
 #ifndef __CUDACC__
   int8_t* varlen_buffer =
       reinterpret_cast<int8_t*>(checked_malloc((element_count + 1) * element_size));
@@ -215,21 +275,34 @@ extern "C" DEVICE int8_t* allocate_varlen_buffer(int64_t element_count,
 #endif
 }
 
-extern "C" DEVICE ALWAYS_INLINE int32_t
+extern "C" DEVICE RUNTIME_EXPORT ALWAYS_INLINE int32_t
 fast_fixlen_array_size(int8_t* chunk_iter_, const uint32_t elem_log_sz) {
   ChunkIter* it = reinterpret_cast<ChunkIter*>(chunk_iter_);
   return it->skip_size >> elem_log_sz;
 }
 
-extern "C" DEVICE ALWAYS_INLINE int8_t* fast_fixlen_array_buff(int8_t* chunk_iter_,
-                                                               const uint64_t row_pos) {
+extern "C" DEVICE RUNTIME_EXPORT ALWAYS_INLINE int8_t* fast_fixlen_array_buff(
+    int8_t* chunk_iter_,
+    const uint64_t row_pos) {
+  if (!chunk_iter_) {
+    return nullptr;
+  }
   ChunkIter* it = reinterpret_cast<ChunkIter*>(chunk_iter_);
   auto n = static_cast<int>(row_pos);
   int8_t* current_pos = it->start_pos + n * it->skip_size;
   return current_pos;
 }
 
-extern "C" DEVICE int8_t* array_buff(int8_t* chunk_iter_, const uint64_t row_pos) {
+extern "C" DEVICE RUNTIME_EXPORT ALWAYS_INLINE int64_t
+determine_fixed_array_len(int8_t* chunk_iter, int64_t valid_len) {
+  return chunk_iter ? valid_len : 0;
+}
+
+extern "C" DEVICE RUNTIME_EXPORT int8_t* array_buff(int8_t* chunk_iter_,
+                                                    const uint64_t row_pos) {
+  if (!chunk_iter_) {
+    return nullptr;
+  }
   ChunkIter* chunk_iter = reinterpret_cast<ChunkIter*>(chunk_iter_);
   ArrayDatum ad;
   bool is_end;
@@ -239,35 +312,33 @@ extern "C" DEVICE int8_t* array_buff(int8_t* chunk_iter_, const uint64_t row_pos
 
 #ifndef __CUDACC__
 
-#include <set>
-
-extern "C" ALWAYS_INLINE int64_t elem_bitcast_int8_t(const int8_t val) {
+extern "C" RUNTIME_EXPORT ALWAYS_INLINE int64_t elem_bitcast_int8_t(const int8_t val) {
   return val;
 }
 
-extern "C" ALWAYS_INLINE int64_t elem_bitcast_int16_t(const int16_t val) {
+extern "C" RUNTIME_EXPORT ALWAYS_INLINE int64_t elem_bitcast_int16_t(const int16_t val) {
   return val;
 }
 
-extern "C" ALWAYS_INLINE int64_t elem_bitcast_int32_t(const int32_t val) {
+extern "C" RUNTIME_EXPORT ALWAYS_INLINE int64_t elem_bitcast_int32_t(const int32_t val) {
   return val;
 }
 
-extern "C" ALWAYS_INLINE int64_t elem_bitcast_int64_t(const int64_t val) {
+extern "C" RUNTIME_EXPORT ALWAYS_INLINE int64_t elem_bitcast_int64_t(const int64_t val) {
   return val;
 }
 
-extern "C" ALWAYS_INLINE int64_t elem_bitcast_float(const float val) {
+extern "C" RUNTIME_EXPORT ALWAYS_INLINE int64_t elem_bitcast_float(const float val) {
   const double dval{val};
   return *reinterpret_cast<const int64_t*>(may_alias_ptr(&dval));
 }
 
-extern "C" ALWAYS_INLINE int64_t elem_bitcast_double(const double val) {
+extern "C" RUNTIME_EXPORT ALWAYS_INLINE int64_t elem_bitcast_double(const double val) {
   return *reinterpret_cast<const int64_t*>(may_alias_ptr(&val));
 }
 
 #define COUNT_DISTINCT_ARRAY(type)                                                      \
-  extern "C" void agg_count_distinct_array_##type(                                      \
+  extern "C" RUNTIME_EXPORT void agg_count_distinct_array_##type(                       \
       int64_t* agg, int8_t* chunk_iter_, const uint64_t row_pos, const type null_val) { \
     ChunkIter* chunk_iter = reinterpret_cast<ChunkIter*>(chunk_iter_);                  \
     ArrayDatum ad;                                                                      \
@@ -277,7 +348,7 @@ extern "C" ALWAYS_INLINE int64_t elem_bitcast_double(const double val) {
     for (size_t i = 0; i < elem_count; ++i) {                                           \
       const auto val = reinterpret_cast<type*>(ad.pointer)[i];                          \
       if (val != null_val) {                                                            \
-        reinterpret_cast<std::set<int64_t>*>(*agg)->insert(elem_bitcast_##type(val));   \
+        reinterpret_cast<CountDistinctSet*>(*agg)->insert(elem_bitcast_##type(val));    \
       }                                                                                 \
     }                                                                                   \
   }
@@ -291,66 +362,91 @@ COUNT_DISTINCT_ARRAY(double)
 
 #undef COUNT_DISTINCT_ARRAY
 
-#include <string>
+#include <functional>
+#include <string_view>
 
-extern "C" uint64_t string_decompress(const int32_t string_id,
-                                      const int64_t string_dict_handle);
+extern "C" RUNTIME_EXPORT StringView string_decompress(const int32_t string_id,
+                                                       const int64_t string_dict_handle);
 
-#define ARRAY_STR_ANY(type, oper_name, oper)                                           \
-  extern "C" bool array_any_##oper_name##_str_##type(int8_t* chunk_iter_,              \
-                                                     const uint64_t row_pos,           \
-                                                     const char* needle_ptr,           \
-                                                     const uint32_t needle_len,        \
-                                                     const int64_t string_dict_handle, \
-                                                     const type null_val) {            \
-    ChunkIter* chunk_iter = reinterpret_cast<ChunkIter*>(chunk_iter_);                 \
-    ArrayDatum ad;                                                                     \
-    bool is_end;                                                                       \
-    ChunkIter_get_nth(chunk_iter, row_pos, &ad, &is_end);                              \
-    const size_t elem_count = ad.length / sizeof(type);                                \
-    std::string needle_str(needle_ptr, needle_len);                                    \
-    for (size_t i = 0; i < elem_count; ++i) {                                          \
-      const type val = reinterpret_cast<type*>(ad.pointer)[i];                         \
-      if (val != null_val) {                                                           \
-        uint64_t str_and_len = string_decompress(val, string_dict_handle);             \
-        const char* str = reinterpret_cast<const char*>(str_and_len & 0xffffffffffff); \
-        const uint16_t len = str_and_len >> 48;                                        \
-        std::string val_str(str, len);                                                 \
-        if (val_str oper needle_str) {                                                 \
-          return true;                                                                 \
-        }                                                                              \
-      }                                                                                \
-    }                                                                                  \
-    return false;                                                                      \
+template <typename T>
+bool array_any(int8_t* const chunk_iter_i8,
+               uint64_t const row_pos,
+               std::string_view const needle_str,
+               int64_t const string_dict_handle,
+               T const null_val,
+               std::function<bool(std::string_view, std::string_view)> const cmp) {
+  ChunkIter* const chunk_iter = reinterpret_cast<ChunkIter*>(chunk_iter_i8);
+  ArrayDatum ad;
+  bool is_end;
+  ChunkIter_get_nth(chunk_iter, row_pos, &ad, &is_end);
+  size_t const elem_count = ad.length / sizeof(T);
+  for (size_t i = 0; i < elem_count; ++i) {
+    T const val = reinterpret_cast<T*>(ad.pointer)[i];
+    if (val != null_val) {
+      StringView const sv = string_decompress(val, string_dict_handle);
+      if (cmp(sv.stringView(), needle_str)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+template <typename T>
+bool array_all(int8_t* const chunk_iter_i8,
+               uint64_t const row_pos,
+               std::string_view const needle_str,
+               int64_t const string_dict_handle,
+               T const null_val,
+               std::function<bool(std::string_view, std::string_view)> const cmp) {
+  ChunkIter* const chunk_iter = reinterpret_cast<ChunkIter*>(chunk_iter_i8);
+  ArrayDatum ad;
+  bool is_end;
+  ChunkIter_get_nth(chunk_iter, row_pos, &ad, &is_end);
+  size_t const elem_count = ad.length / sizeof(T);
+  for (size_t i = 0; i < elem_count; ++i) {
+    T const val = reinterpret_cast<T*>(ad.pointer)[i];
+    if (val == null_val) {
+      return false;
+    }
+    StringView const sv = string_decompress(val, string_dict_handle);
+    if (!cmp(sv.stringView(), needle_str)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+#define ARRAY_STR_ANY(type, oper_name, oper)                         \
+  extern "C" RUNTIME_EXPORT bool array_any_##oper_name##_str_##type( \
+      int8_t* const chunk_iter_i8,                                   \
+      uint64_t const row_pos,                                        \
+      char const* const needle_ptr,                                  \
+      uint32_t const needle_len,                                     \
+      int64_t const string_dict_handle,                              \
+      type const null_val) {                                         \
+    return array_any(chunk_iter_i8,                                  \
+                     row_pos,                                        \
+                     std::string_view{needle_ptr, needle_len},       \
+                     string_dict_handle,                             \
+                     null_val,                                       \
+                     std::oper<std::string_view>{});                 \
   }
 
-#define ARRAY_STR_ALL(type, oper_name, oper)                                           \
-  extern "C" bool array_all_##oper_name##_str_##type(int8_t* chunk_iter_,              \
-                                                     const uint64_t row_pos,           \
-                                                     const char* needle_ptr,           \
-                                                     const uint32_t needle_len,        \
-                                                     const int64_t string_dict_handle, \
-                                                     const type null_val) {            \
-    ChunkIter* chunk_iter = reinterpret_cast<ChunkIter*>(chunk_iter_);                 \
-    ArrayDatum ad;                                                                     \
-    bool is_end;                                                                       \
-    ChunkIter_get_nth(chunk_iter, row_pos, &ad, &is_end);                              \
-    const size_t elem_count = ad.length / sizeof(type);                                \
-    std::string needle_str(needle_ptr, needle_len);                                    \
-    for (size_t i = 0; i < elem_count; ++i) {                                          \
-      const type val = reinterpret_cast<type*>(ad.pointer)[i];                         \
-      if (val == null_val) {                                                           \
-        return false;                                                                  \
-      }                                                                                \
-      uint64_t str_and_len = string_decompress(val, string_dict_handle);               \
-      const char* str = reinterpret_cast<const char*>(str_and_len & 0xffffffffffff);   \
-      const uint16_t len = str_and_len >> 48;                                          \
-      std::string val_str(str, len);                                                   \
-      if (!(val_str oper needle_str)) {                                                \
-        return false;                                                                  \
-      }                                                                                \
-    }                                                                                  \
-    return true;                                                                       \
+#define ARRAY_STR_ALL(type, oper_name, oper)                         \
+  extern "C" RUNTIME_EXPORT bool array_all_##oper_name##_str_##type( \
+      int8_t* const chunk_iter_i8,                                   \
+      uint64_t const row_pos,                                        \
+      char const* const needle_ptr,                                  \
+      uint32_t const needle_len,                                     \
+      int64_t const string_dict_handle,                              \
+      type const null_val) {                                         \
+    return array_all(chunk_iter_i8,                                  \
+                     row_pos,                                        \
+                     std::string_view{needle_ptr, needle_len},       \
+                     string_dict_handle,                             \
+                     null_val,                                       \
+                     std::oper<std::string_view>{});                 \
   }
 
 #define ARRAY_STR_ALL_ANY_ALL_TYPES(oper_name, oper) \
@@ -363,12 +459,12 @@ extern "C" uint64_t string_decompress(const int32_t string_id,
   ARRAY_STR_ANY(int64_t, oper_name, oper)            \
   ARRAY_STR_ALL(int64_t, oper_name, oper)
 
-ARRAY_STR_ALL_ANY_ALL_TYPES(eq, ==)
-ARRAY_STR_ALL_ANY_ALL_TYPES(ne, !=)
-ARRAY_STR_ALL_ANY_ALL_TYPES(lt, <)
-ARRAY_STR_ALL_ANY_ALL_TYPES(le, <=)
-ARRAY_STR_ALL_ANY_ALL_TYPES(gt, >)
-ARRAY_STR_ALL_ANY_ALL_TYPES(ge, >=)
+ARRAY_STR_ALL_ANY_ALL_TYPES(eq, equal_to)
+ARRAY_STR_ALL_ANY_ALL_TYPES(ne, not_equal_to)
+ARRAY_STR_ALL_ANY_ALL_TYPES(lt, less)
+ARRAY_STR_ALL_ANY_ALL_TYPES(le, less_equal)
+ARRAY_STR_ALL_ANY_ALL_TYPES(gt, greater)
+ARRAY_STR_ALL_ANY_ALL_TYPES(ge, greater_equal)
 
 #undef ARRAY_ALL_ANY_ALL_TYPES
 #undef ARRAY_STR_ALL

@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,24 +21,23 @@
 
 #include "Archive.h"
 
+// archive read buffer size, configurable for unit test.
+extern size_t g_archive_read_buf_size;
+
 // this is the archive class for files hosted locally or remotely with
 // POSIX compliant file name. !! 7z files work only with this class !!
 class PosixFileArchive : public Archive {
-  const size_t buf_size = (1 << 20);
-
  public:
   PosixFileArchive(const std::string url, const bool plain_text)
       : Archive(url, plain_text) {
     // some well-known file.exts imply plain text
     if (!this->plain_text) {
-      this->plain_text = boost::filesystem::extension(url_part(5)) == ".csv" ||
-                         boost::filesystem::extension(url_part(5)) == ".tsv" ||
-                         boost::filesystem::extension(url_part(5)) == ".txt" ||
-                         boost::filesystem::extension(url_part(5)) == "";
+      auto const ext = boost::filesystem::path(url_part(5)).extension();
+      this->plain_text = ext == ".csv" || ext == ".tsv" || ext == ".txt" || ext == "";
     }
 
     if (this->plain_text) {
-      buf = new char[buf_size];
+      buf = new char[g_archive_read_buf_size];
     }
 
     init_for_read();
@@ -79,7 +78,7 @@ class PosixFileArchive : public Archive {
   bool read_data_block(const void** buff, size_t* size, int64_t* offset) override {
     if (plain_text) {
       size_t nread;
-      if (0 >= (nread = fread(buf, 1, buf_size, fp))) {
+      if (0 >= (nread = fread(buf, 1, g_archive_read_buf_size, fp))) {
         return false;
       }
       *buff = buf;

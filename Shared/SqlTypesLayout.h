@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,19 +16,16 @@
 
 /**
  * @file    SqlTypesLayout.h
- * @author  Alex Suhan <alex@mapd.com>
+ * @brief
+ *
  */
 
 #ifndef QUERYENGINE_SQLTYPESLAYOUT_H
 #define QUERYENGINE_SQLTYPESLAYOUT_H
 
-#include "../Shared/TargetInfo.h"
+#include "Shared/TargetInfo.h"
 
-#ifndef __CUDACC__
-#include <glog/logging.h>
-#else
-#include "../Shared/always_assert.h"
-#endif  // __CUDACC__
+#include "Logger/Logger.h"
 
 #include <limits>
 
@@ -44,7 +41,12 @@ inline const SQLTypeInfo get_compact_type(const TargetInfo& target) {
   const auto agg_type = target.agg_kind;
   const auto& agg_arg = target.agg_arg_type;
   if (agg_arg.get_type() == kNULLT) {
-    CHECK_EQ(kCOUNT, agg_type);
+#ifdef __CUDACC__
+    CHECK((shared::is_any<kCOUNT, kCOUNT_IF, kAPPROX_QUANTILE, kMODE>(agg_type)));
+#else
+    CHECK((shared::is_any<kCOUNT, kCOUNT_IF, kAPPROX_QUANTILE, kMODE>(agg_type)))
+        << agg_type;
+#endif
     CHECK(!target.is_distinct);
     return target.sql_type;
   }
@@ -64,7 +66,7 @@ inline void set_compact_type(TargetInfo& target, const SQLTypeInfo& new_type) {
   if (target.is_agg) {
     const auto agg_type = target.agg_kind;
     auto& agg_arg = target.agg_arg_type;
-    if (agg_type != kCOUNT || agg_arg.get_type() != kNULLT) {
+    if (!shared::is_any<kCOUNT, kCOUNT_IF>(agg_type) || agg_arg.get_type() != kNULLT) {
       agg_arg = new_type;
       return;
     }
@@ -72,6 +74,8 @@ inline void set_compact_type(TargetInfo& target, const SQLTypeInfo& new_type) {
   target.sql_type = new_type;
 }
 
+// TODO: this function appears to be out of sync with
+// inline_int_null_val in InlineNullValues.h, or vice-versa??
 inline int64_t inline_int_null_val(const SQLTypeInfo& ti) {
   auto type = ti.get_type();
   if (ti.is_string()) {
@@ -144,7 +148,7 @@ inline int64_t inline_fixed_encoding_null_val(const SQLTypeInfo& ti) {
   CHECK_EQ(kENCODING_FIXED, ti.get_compression());
   CHECK(ti.is_integer() || ti.is_time() || ti.is_decimal());
   CHECK_EQ(0, ti.get_comp_param() % 8);
-  return -(1L << (ti.get_comp_param() - 1));
+  return -(1LL << (ti.get_comp_param() - 1));
 }
 
 inline double inline_fp_null_val(const SQLTypeInfo& ti) {
@@ -171,6 +175,10 @@ inline uint64_t exp_to_scale(const unsigned exp) {
 inline size_t get_bit_width(const SQLTypeInfo& ti) {
   const auto int_type = ti.is_decimal() ? kBIGINT : ti.get_type();
   switch (int_type) {
+    case kNULLT:
+      throw std::runtime_error(
+          "Untyped NULL values are not supported. Please CAST any NULL "
+          "constants to a type.");
     case kBOOLEAN:
       return 8;
     case kTINYINT:
@@ -201,13 +209,24 @@ inline size_t get_bit_width(const SQLTypeInfo& ti) {
       }
       return ti.get_size() * 8;
     case kPOINT:
+    case kMULTIPOINT:
     case kLINESTRING:
+    case kMULTILINESTRING:
     case kPOLYGON:
     case kMULTIPOLYGON:
       return 32;
+    case kCOLUMN:
+    case kCOLUMN_LIST:
+      return ti.get_elem_type().get_size() * 8;
     default:
-      abort();
+      break;
   }
+#ifdef __CUDACC__
+  UNREACHABLE();
+#else
+  UNREACHABLE() << "Unhandled int_type: " << int_type;
+#endif
+  return {};
 }
 
 inline bool is_unsigned_type(const SQLTypeInfo& ti) {

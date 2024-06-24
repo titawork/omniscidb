@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 OmniSci, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,9 +16,7 @@
 
 /**
  * @file    ColSlotContext.cpp
- * @author  Alex Baden <alex.baden@omnisci.com>
- * @brief   Provides column info and slot info for the output buffer and some metadata
- * helpers
+ * @brief   Provides column and slot info for the output buffer and some metadata helpers
  *
  */
 
@@ -30,11 +28,12 @@
 #include <Shared/SqlTypesLayout.h>
 
 #include <numeric>
+#include <stdexcept>
 
 extern bool g_bigint_count;
 
 ColSlotContext::ColSlotContext(const std::vector<Analyzer::Expr*>& col_expr_list,
-                               const std::vector<ssize_t>& col_exprs_to_not_project) {
+                               const std::vector<int64_t>& col_exprs_to_not_project) {
   // Note that non-projected col exprs could be projected cols that we can lazy fetch or
   // grouped cols with keyless hash
   if (!col_exprs_to_not_project.empty()) {
@@ -55,6 +54,7 @@ ColSlotContext::ColSlotContext(const std::vector<Analyzer::Expr*>& col_expr_list
     } else {
       const auto agg_info = get_target_info(col_expr, g_bigint_count);
       const auto chosen_type = get_compact_type(agg_info);
+
       if ((chosen_type.is_string() && chosen_type.get_compression() == kENCODING_NONE) ||
           chosen_type.is_array()) {
         addSlotForColumn(sizeof(int64_t), col_expr_idx);
@@ -63,14 +63,27 @@ ColSlotContext::ColSlotContext(const std::vector<Analyzer::Expr*>& col_expr_list
         continue;
       }
       if (chosen_type.is_geometry()) {
-        for (auto i = 0; i < chosen_type.get_physical_coord_cols(); ++i) {
+        if (dynamic_cast<const Analyzer::GeoExpr*>(col_expr)) {
+          CHECK_EQ(chosen_type.get_type(), kPOINT);
+          // Pointer/offset into varlen buffer
           addSlotForColumn(sizeof(int64_t), col_expr_idx);
-          addSlotForColumn(sizeof(int64_t), col_expr_idx);
+          const int64_t arr_size =
+              chosen_type.get_compression() == kENCODING_GEOINT ? 8 : 16;
+          CHECK(varlen_output_slot_map_
+                    .insert(std::make_pair(slot_sizes_.size() - 1, arr_size))
+                    .second);
+        } else {
+          for (auto i = 0; i < chosen_type.get_physical_coord_cols(); ++i) {
+            addSlotForColumn(sizeof(int64_t), col_expr_idx);
+            addSlotForColumn(sizeof(int64_t), col_expr_idx);
+          }
         }
         ++col_expr_idx;
         continue;
       }
+
       const auto col_expr_bitwidth = get_bit_width(chosen_type);
+
       CHECK_EQ(size_t(0), col_expr_bitwidth % 8);
       addSlotForColumn(static_cast<int8_t>(col_expr_bitwidth >> 3), col_expr_idx);
       // for average, we'll need to keep the count as well
@@ -195,7 +208,7 @@ size_t ColSlotContext::getCompactByteWidth() const {
     if (slot_size.padded_size == 0) {
       continue;
     }
-    CHECK_EQ(slot_size.padded_size, compact_width);
+    CHECK_EQ(static_cast<size_t>(slot_size.padded_size), compact_width);
   }
   return compact_width;
 }
@@ -252,6 +265,34 @@ void ColSlotContext::addColumn(
   }
 }
 
+void ColSlotContext::addColumnFlatBuffer(const int64_t flatbuffer_size) {
+  const auto col_idx = col_to_slot_map_.size();
+  col_to_slot_map_.emplace_back();
+  addSlotForColumn(0, 0, col_idx);
+  // reusing varlenOutput infrastructure for storing the size of a flatbuffer:
+  varlen_output_slot_map_.insert(std::make_pair(col_idx, flatbuffer_size));
+}
+
+int64_t ColSlotContext::getFlatBufferSize(const size_t slot_idx) const {
+  const auto varlen_map_it = varlen_output_slot_map_.find(slot_idx);
+  if (varlen_map_it == varlen_output_slot_map_.end()) {
+    throw std::runtime_error("Failed to find FlatBuffer map entry for slot " +
+                             std::to_string(slot_idx));
+  }
+  return varlen_map_it->second;
+}
+
+bool ColSlotContext::checkSlotUsesFlatBufferFormat(const size_t slot_idx) const {
+  const auto varlen_map_it = varlen_output_slot_map_.find(slot_idx);
+  if (varlen_map_it != varlen_output_slot_map_.end() &&
+      slot_idx < col_to_slot_map_.size() && col_to_slot_map_[slot_idx].size() == 1) {
+    const auto& slot_size = slot_sizes_[col_to_slot_map_[slot_idx][0]];
+    return slot_size.padded_size == 0 &&
+           slot_size.logical_size == 0;  // as per addColumnFlatBuffer
+  }
+  return false;
+}
+
 void ColSlotContext::addSlotForColumn(const int8_t logical_size,
                                       const size_t column_idx) {
   addSlotForColumn(-1, logical_size, column_idx);
@@ -263,4 +304,13 @@ void ColSlotContext::addSlotForColumn(const int8_t padded_size,
   CHECK_LT(column_idx, col_to_slot_map_.size());
   col_to_slot_map_[column_idx].push_back(slot_sizes_.size());
   slot_sizes_.emplace_back(SlotSize{padded_size, logical_size});
+}
+
+int64_t ColSlotContext::varlenOutputElementSize(const size_t slot_idx) const {
+  const auto varlen_map_it = varlen_output_slot_map_.find(slot_idx);
+  if (varlen_map_it == varlen_output_slot_map_.end()) {
+    throw std::runtime_error("Failed to find varlen map entry for slot " +
+                             std::to_string(slot_idx));
+  }
+  return varlen_map_it->second;
 }

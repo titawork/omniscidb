@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,15 +16,14 @@
 
 /**
  * @file    AbstractBufferMgr.h
- * @author  Steven Stewart <steve@map-d.com>
- * @author  Todd Mostak <todd@map-d.com>
+ * @brief
  */
-#ifndef ABSTRACTDATAMGR_H
-#define ABSTRACTDATAMGR_H
+
+#pragma once
 
 #include <boost/preprocessor.hpp>
-#include "../Shared/types.h"
 #include "AbstractBuffer.h"
+#include "Shared/types.h"
 
 #define X_DEFINE_ENUM_WITH_STRING_CONVERSIONS_TOSTRING_CASE(r, data, elem) \
   case elem:                                                               \
@@ -42,8 +41,9 @@
     }                                                                             \
   }
 
-DEFINE_ENUM_WITH_STRING_CONVERSIONS(MgrType,
-                                    (FILE_MGR)(CPU_MGR)(GPU_MGR)(GLOBAL_FILE_MGR))
+DEFINE_ENUM_WITH_STRING_CONVERSIONS(
+    MgrType,
+    (CACHING_FILE_MGR)(FILE_MGR)(CPU_MGR)(GPU_MGR)(GLOBAL_FILE_MGR)(PERSISTENT_STORAGE_MGR)(FOREIGN_STORAGE_MGR)(TIERED_CPU_MGR))
 
 namespace Data_Namespace {
 
@@ -62,7 +62,7 @@ namespace Data_Namespace {
 class AbstractBufferMgr {
  public:
   virtual ~AbstractBufferMgr() {}
-  AbstractBufferMgr(const int deviceId) : deviceId_(deviceId) {}
+  AbstractBufferMgr(const int deviceId) : device_id_(deviceId) {}
 
   // Chunk API
   virtual AbstractBuffer* createBuffer(const ChunkKey& key,
@@ -77,20 +77,14 @@ class AbstractBufferMgr {
   virtual void fetchBuffer(const ChunkKey& key,
                            AbstractBuffer* destBuffer,
                            const size_t numBytes = 0) = 0;
-  // virtual AbstractBuffer* putBuffer(const ChunkKey &key, AbstractBuffer *srcBuffer,
-  // const size_t numBytes = 0) = 0;
   virtual AbstractBuffer* putBuffer(const ChunkKey& key,
                                     AbstractBuffer* srcBuffer,
                                     const size_t numBytes = 0) = 0;
-  virtual void getChunkMetadataVec(
-      std::vector<std::pair<ChunkKey, ChunkMetadata>>& chunkMetadata) = 0;
-  virtual void getChunkMetadataVecForKeyPrefix(
-      std::vector<std::pair<ChunkKey, ChunkMetadata>>& chunkMetadataVec,
-      const ChunkKey& keyPrefix) = 0;
+  virtual void getChunkMetadataVecForKeyPrefix(ChunkMetadataVector& chunkMetadataVec,
+                                               const ChunkKey& keyPrefix) = 0;
 
   virtual bool isBufferOnDevice(const ChunkKey& key) = 0;
   virtual std::string printSlabs() = 0;
-  virtual void clearSlabs() = 0;
   virtual size_t getMaxSize() = 0;
   virtual size_t getInUseSize() = 0;
   virtual size_t getAllocated() = 0;
@@ -98,21 +92,19 @@ class AbstractBufferMgr {
 
   virtual void checkpoint() = 0;
   virtual void checkpoint(const int db_id, const int tb_id) = 0;
+  virtual void removeTableRelatedDS(const int db_id, const int table_id) = 0;
 
   // Buffer API
   virtual AbstractBuffer* alloc(const size_t numBytes = 0) = 0;
   virtual void free(AbstractBuffer* buffer) = 0;
-  // virtual AbstractBuffer* putBuffer(AbstractBuffer *d) = 0;
   virtual MgrType getMgrType() = 0;
   virtual std::string getStringMgrType() = 0;
   virtual size_t getNumChunks() = 0;
-  inline int getDeviceId() { return deviceId_; }
+  inline int getDeviceId() { return device_id_; }
 
  protected:
   AbstractBufferMgr* parentMgr_;
-  int deviceId_;
+  int device_id_;
 };
 
 }  // namespace Data_Namespace
-
-#endif  // ABSTRACTDATAMGR_H

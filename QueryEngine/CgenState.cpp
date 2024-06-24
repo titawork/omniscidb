@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 OmniSci, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,11 +15,52 @@
  */
 
 #include "CgenState.h"
+#include "CodeGenerator.h"
+#include "CodegenHelper.h"
 #include "OutputBufferInitialization.h"
 
+#include <llvm/IR/InstIterator.h>
+#include <llvm/Transforms/Utils/BasicBlockUtils.h>
 #include <llvm/Transforms/Utils/Cloning.h>
 
-extern std::unique_ptr<llvm::Module> g_rt_module;
+CgenState::CgenState(const size_t num_query_infos,
+                     const bool contains_left_deep_outer_join,
+                     Executor* executor)
+    : executor_id_(executor->getExecutorId())
+    , module_(nullptr)
+    , row_func_(nullptr)
+    , filter_func_(nullptr)
+    , current_func_(nullptr)
+    , row_func_bb_(nullptr)
+    , filter_func_bb_(nullptr)
+    , row_func_call_(nullptr)
+    , filter_func_call_(nullptr)
+    , context_(executor->getContext())
+    , ir_builder_(context_)
+    , contains_left_deep_outer_join_(contains_left_deep_outer_join)
+    , outer_join_match_found_per_level_(std::max(num_query_infos, size_t(1)) - 1)
+    , needs_error_check_(false)
+    , needs_geos_(false)
+    , query_func_(nullptr)
+    , query_func_entry_ir_builder_(context_){};
+
+CgenState::CgenState(const size_t num_query_infos,
+                     const bool contains_left_deep_outer_join)
+    : CgenState(num_query_infos,
+                contains_left_deep_outer_join,
+                Executor::getExecutor(Executor::UNITARY_EXECUTOR_ID).get()) {}
+
+CgenState::CgenState(llvm::LLVMContext& context)
+    : executor_id_(Executor::INVALID_EXECUTOR_ID)
+    , module_(nullptr)
+    , row_func_(nullptr)
+    , context_(context)
+    , ir_builder_(context_)
+    , contains_left_deep_outer_join_(false)
+    , needs_error_check_(false)
+    , needs_geos_(false)
+    , query_func_(nullptr)
+    , query_func_entry_ir_builder_(context_){};
 
 llvm::ConstantInt* CgenState::inlineIntNull(const SQLTypeInfo& type_info) {
   auto type = type_info.get_type();
@@ -43,6 +84,7 @@ llvm::ConstantInt* CgenState::inlineIntNull(const SQLTypeInfo& type_info) {
     case kINT:
       return llInt(static_cast<int32_t>(inline_int_null_val(type_info)));
     case kBIGINT:
+      return llInt(static_cast<int64_t>(inline_int_null_val(type_info)));
     case kTIME:
     case kTIMESTAMP:
     case kDATE:
@@ -69,6 +111,11 @@ llvm::ConstantFP* CgenState::inlineFpNull(const SQLTypeInfo& type_info) {
     default:
       abort();
   }
+}
+
+llvm::Constant* CgenState::inlineNull(const SQLTypeInfo& ti) {
+  return ti.is_fp() ? static_cast<llvm::Constant*>(inlineFpNull(ti))
+                    : static_cast<llvm::Constant*>(inlineIntNull(ti));
 }
 
 std::pair<llvm::ConstantInt*, llvm::ConstantInt*> CgenState::inlineIntMaxMin(
@@ -131,26 +178,274 @@ llvm::Value* CgenState::castToTypeIn(llvm::Value* val, const size_t dst_bits) {
   return ir_builder_.CreateFPCast(val, dst_type);
 }
 
+void CgenState::maybeCloneFunctionRecursive(llvm::Function* fn) {
+  CHECK(fn);
+  if (!fn->isDeclaration()) {
+    return;
+  }
+
+  // Get the implementation from the runtime module.
+  auto func_impl = getExecutor()->get_rt_module()->getFunction(fn->getName());
+  CHECK(func_impl) << fn->getName().str();
+
+  if (func_impl->isDeclaration()) {
+    return;
+  }
+
+  auto DestI = fn->arg_begin();
+  for (auto arg_it = func_impl->arg_begin(); arg_it != func_impl->arg_end(); ++arg_it) {
+    DestI->setName(arg_it->getName());
+    vmap_[&*arg_it] = &*DestI++;
+  }
+
+  llvm::SmallVector<llvm::ReturnInst*, 8> Returns;  // Ignore returns cloned.
+#if LLVM_VERSION_MAJOR > 12
+  llvm::CloneFunctionInto(
+      fn, func_impl, vmap_, llvm::CloneFunctionChangeType::DifferentModule, Returns);
+#else
+  llvm::CloneFunctionInto(fn, func_impl, vmap_, /*ModuleLevelChanges=*/true, Returns);
+#endif
+
+  for (auto it = llvm::inst_begin(fn), e = llvm::inst_end(fn); it != e; ++it) {
+    if (llvm::isa<llvm::CallInst>(*it)) {
+      auto& call = llvm::cast<llvm::CallInst>(*it);
+      maybeCloneFunctionRecursive(call.getCalledFunction());
+    }
+  }
+}
+
 llvm::Value* CgenState::emitCall(const std::string& fname,
                                  const std::vector<llvm::Value*>& args) {
-  // Get the implementation from the runtime module.
-  auto func_impl = g_rt_module->getFunction(fname);
-  CHECK(func_impl);
+  // Get the function reference from the query module.
+  auto func = module_->getFunction(fname);
+  CHECK(func) << fname;
+  // If the function called isn't external, clone the implementation from the runtime
+  // module.
+  maybeCloneFunctionRecursive(func);
+
+  return ir_builder_.CreateCall(func, args);
+}
+
+llvm::Value* CgenState::emitEntryCall(const std::string& fname,
+                                      const std::vector<llvm::Value*>& args) {
   // Get the function reference from the query module.
   auto func = module_->getFunction(fname);
   CHECK(func);
   // If the function called isn't external, clone the implementation from the runtime
   // module.
-  if (func->isDeclaration() && !func_impl->isDeclaration()) {
-    auto DestI = func->arg_begin();
-    for (auto arg_it = func_impl->arg_begin(); arg_it != func_impl->arg_end(); ++arg_it) {
-      DestI->setName(arg_it->getName());
-      vmap_[&*arg_it] = &*DestI++;
-    }
+  maybeCloneFunctionRecursive(func);
 
-    llvm::SmallVector<llvm::ReturnInst*, 8> Returns;  // Ignore returns cloned.
-    llvm::CloneFunctionInto(func, func_impl, vmap_, /*ModuleLevelChanges=*/true, Returns);
+  return query_func_entry_ir_builder_.CreateCall(func, args);
+}
+
+void CgenState::emitErrorCheck(llvm::Value* condition,
+                               llvm::Value* errorCode,
+                               std::string label) {
+  needs_error_check_ = true;
+  auto check_ok = llvm::BasicBlock::Create(context_, label + "_ok", current_func_);
+  auto check_fail = llvm::BasicBlock::Create(context_, label + "_fail", current_func_);
+  ir_builder_.CreateCondBr(condition, check_ok, check_fail);
+  ir_builder_.SetInsertPoint(check_fail);
+  ir_builder_.CreateRet(errorCode);
+  ir_builder_.SetInsertPoint(check_ok);
+}
+
+namespace {
+
+// clang-format off
+template <typename T>
+llvm::Type* getTy(llvm::LLVMContext& ctx) { return getTy<std::remove_pointer_t<T>>(ctx)->getPointerTo(); }
+// Commented out to avoid -Wunused-function warnings, but enable as needed.
+// template<> llvm::Type* getTy<bool>(llvm::LLVMContext& ctx) { return llvm::Type::getInt1Ty(ctx); }
+//template<> llvm::Type* getTy<int8_t>(llvm::LLVMContext& ctx) { return llvm::Type::getInt8Ty(ctx); }
+// template<> llvm::Type* getTy<int16_t>(llvm::LLVMContext& ctx) { return llvm::Type::getInt16Ty(ctx); }
+//template<> llvm::Type* getTy<int32_t>(llvm::LLVMContext& ctx) { return llvm::Type::getInt32Ty(ctx); }
+// template<> llvm::Type* getTy<int64_t>(llvm::LLVMContext& ctx) { return llvm::Type::getInt64Ty(ctx); }
+// template<> llvm::Type* getTy<float>(llvm::LLVMContext& ctx) { return llvm::Type::getFloatTy(ctx); }
+template<> llvm::Type* getTy<double>(llvm::LLVMContext& ctx) { return llvm::Type::getDoubleTy(ctx); }
+//template<> llvm::Type* getTy<void>(llvm::LLVMContext& ctx) { return llvm::Type::getVoidTy(ctx); }
+//  clang-format on
+
+struct GpuFunctionDefinition {
+  GpuFunctionDefinition(char const* name) : name_(name) {}
+  char const* const name_;
+
+  virtual ~GpuFunctionDefinition() = default;
+
+  virtual llvm::FunctionCallee getFunction(llvm::Module* llvm_module,
+                                           llvm::LLVMContext& context) const = 0;
+};
+
+// TYPES = return_type, arg0_type, arg1_type, arg2_type, ...
+template <typename... TYPES>
+struct GpuFunction final : public GpuFunctionDefinition {
+  GpuFunction(char const* name) : GpuFunctionDefinition(name) {}
+
+  llvm::FunctionCallee getFunction(llvm::Module* llvm_module,
+                                   llvm::LLVMContext& context) const override {
+    return llvm_module->getOrInsertFunction(name_, getTy<TYPES>(context)...);
+  }
+};
+
+static const std::unordered_map<std::string, std::shared_ptr<GpuFunctionDefinition>>
+    gpu_replacement_functions{
+        {"asin", std::make_shared<GpuFunction<double, double>>("Asin")},
+        {"atanh", std::make_shared<GpuFunction<double, double>>("Atanh")},
+        {"atan", std::make_shared<GpuFunction<double, double>>("Atan")},
+        {"cosh", std::make_shared<GpuFunction<double, double>>("Cosh")},
+        {"cos", std::make_shared<GpuFunction<double, double>>("Cos")},
+        {"exp", std::make_shared<GpuFunction<double, double>>("Exp")},
+        {"log", std::make_shared<GpuFunction<double, double>>("ln")},
+        {"pow", std::make_shared<GpuFunction<double, double, double>>("power")},
+        {"sinh", std::make_shared<GpuFunction<double, double>>("Sinh")},
+        {"sin", std::make_shared<GpuFunction<double, double>>("Sin")},
+        {"sqrt", std::make_shared<GpuFunction<double, double>>("Sqrt")},
+        {"tan", std::make_shared<GpuFunction<double, double>>("Tan")}};
+}  // namespace
+
+std::vector<std::string> CgenState::gpuFunctionsToReplace(llvm::Function* fn) {
+  std::vector<std::string> ret;
+
+  CHECK(fn);
+  CHECK(!fn->isDeclaration());
+
+  for (auto& basic_block : *fn) {
+    auto& inst_list = basic_block.getInstList();
+    for (auto inst_itr = inst_list.begin(); inst_itr != inst_list.end(); ++inst_itr) {
+      if (auto call_inst = llvm::dyn_cast<llvm::CallInst>(inst_itr)) {
+        auto const called_func_name = CodegenUtil::getCalledFunctionName(*call_inst);
+        CHECK(called_func_name);
+
+        if (gpu_replacement_functions.find(std::string(*called_func_name)) !=
+            gpu_replacement_functions.end()) {
+          ret.emplace_back(*called_func_name);
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+void CgenState::replaceFunctionForGpu(const std::string& fcn_to_replace,
+                                      llvm::Function* fn) {
+  CHECK(fn);
+  CHECK(!fn->isDeclaration());
+
+  auto map_it = gpu_replacement_functions.find(fcn_to_replace);
+  if (map_it == gpu_replacement_functions.end()) {
+    throw QueryMustRunOnCpu("Codegen failed: Could not find replacement functon for " +
+                            fcn_to_replace +
+                            " to run on gpu. Query step must run in cpu mode.");
+  }
+  const auto& gpu_fcn_obj = map_it->second;
+  CHECK(gpu_fcn_obj);
+  VLOG(1) << "Replacing " << fcn_to_replace << " with " << gpu_fcn_obj->name_
+          << " for parent function " << fn->getName().str();
+
+  for (auto& basic_block : *fn) {
+    auto& inst_list = basic_block.getInstList();
+    for (auto inst_itr = inst_list.begin(); inst_itr != inst_list.end(); ++inst_itr) {
+      if (auto call_inst = llvm::dyn_cast<llvm::CallInst>(inst_itr)) {
+        auto called_func = CodegenUtil::findCalledFunction(*call_inst);
+        if (called_func && called_func->getName().str() == fcn_to_replace) {
+          std::vector<llvm::Value*> args;
+          std::vector<llvm::Type*> arg_types;
+          for (auto& arg : call_inst->args()) {
+            arg_types.push_back(arg.get()->getType());
+            args.push_back(arg.get());
+          }
+          auto gpu_func = gpu_fcn_obj->getFunction(module_, context_);
+          CHECK(gpu_func);
+          auto gpu_func_type = gpu_func.getFunctionType();
+          CHECK(gpu_func_type);
+          CHECK_EQ(gpu_func_type->getReturnType(), called_func->getReturnType());
+          llvm::ReplaceInstWithInst(call_inst,
+                                    llvm::CallInst::Create(gpu_func, args, ""));
+          return;
+        }
+      }
+    }
+  }
+}
+
+std::shared_ptr<Executor> CgenState::getExecutor() const {
+  CHECK(executor_id_ != Executor::INVALID_EXECUTOR_ID);
+  return Executor::getExecutor(executor_id_);
+}
+
+llvm::LLVMContext& CgenState::getExecutorContext() const {
+  return getExecutor()->getContext();
+}
+
+void CgenState::set_module_shallow_copy(const std::unique_ptr<llvm::Module>& llvm_module,
+                                        bool always_clone) {
+  module_ =
+      llvm::CloneModule(*llvm_module, vmap_, [always_clone](const llvm::GlobalValue* gv) {
+        auto func = llvm::dyn_cast<llvm::Function>(gv);
+        if (!func) {
+          return true;
+        }
+        return (func->getLinkage() == llvm::GlobalValue::LinkageTypes::PrivateLinkage ||
+                func->getLinkage() == llvm::GlobalValue::LinkageTypes::InternalLinkage ||
+                (always_clone && CodeGenerator::alwaysCloneRuntimeFunction(func)));
+      }).release();
+}
+
+
+llvm::Value* CgenState::emitExternalCall(
+    const std::string& fname,
+    llvm::Type* ret_type,
+    const std::vector<llvm::Value*> args,
+    const std::vector<llvm::Attribute::AttrKind>& fnattrs,
+    const bool has_struct_return) {
+  std::vector<llvm::Type*> arg_types;
+  for (const auto arg : args) {
+    CHECK(arg);
+    arg_types.push_back(arg->getType());
+  }
+  auto func_ty = llvm::FunctionType::get(ret_type, arg_types, false);
+  llvm::AttributeList attrs;
+  if (!fnattrs.empty()) {
+    std::vector<std::pair<unsigned, llvm::Attribute>> indexedAttrs;
+    indexedAttrs.reserve(fnattrs.size());
+    for (auto attr : fnattrs) {
+      indexedAttrs.emplace_back(llvm::AttributeList::FunctionIndex,
+                                llvm::Attribute::get(context_, attr));
+    }
+    attrs = llvm::AttributeList::get(context_,
+                                      {&indexedAttrs.front(), indexedAttrs.size()});
   }
 
-  return ir_builder_.CreateCall(func, args);
+  auto func_p = module_->getOrInsertFunction(fname, func_ty, attrs);
+  CHECK(func_p);
+  auto callee = func_p.getCallee();
+  llvm::Function* func{nullptr};
+  if (auto callee_cast = llvm::dyn_cast<llvm::ConstantExpr>(callee)) {
+    // Get or insert function automatically adds a ConstantExpr cast if the return type
+    // of the existing function does not match the supplied return type.
+    CHECK(callee_cast->isCast());
+    CHECK_EQ(callee_cast->getNumOperands(), size_t(1));
+    func = llvm::dyn_cast<llvm::Function>(callee_cast->getOperand(0));
+  } else {
+    func = llvm::dyn_cast<llvm::Function>(callee);
+  }
+  CHECK(func);
+  llvm::FunctionType* func_type = func_p.getFunctionType();
+  CHECK(func_type);
+  if (has_struct_return) {
+    const auto arg_ti = func_type->getParamType(0);
+    CHECK(arg_ti->isPointerTy() && arg_ti->getPointerElementType()->isStructTy());
+    auto attr_list = func->getAttributes();
+#if 14 <= LLVM_VERSION_MAJOR
+    llvm::AttrBuilder arr_arg_builder(context_, attr_list.getParamAttrs(0));
+#else
+    llvm::AttrBuilder arr_arg_builder(attr_list.getParamAttributes(0));
+#endif
+    arr_arg_builder.addAttribute(llvm::Attribute::StructRet);
+    func->addParamAttrs(0, arr_arg_builder);
+  }
+  llvm::Value* result = ir_builder_.CreateCall(func_p, args);
+  // check the assumed type
+  CHECK_EQ(result->getType(), ret_type);
+  return result;
 }

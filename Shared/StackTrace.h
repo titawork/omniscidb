@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 OmniSci, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,13 +14,11 @@
  * limitations under the License.
  */
 
-#ifndef SHARED_STACKTRACE_H
-#define SHARED_STACKTRACE_H
+#pragma once
 
+#include <cstdint>
 #include <string>
 
 std::string getCurrentStackTrace(uint32_t num_frames_to_skip = 1,
                                  const char* stop_at_this_frame = nullptr,
                                  bool skip_void_and_stl_frames = true);
-
-#endif  // SHARED_STACKTRACE_H

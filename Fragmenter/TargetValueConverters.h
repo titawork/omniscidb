@@ -1,5 +1,5 @@
 /*
- * Copyright 2018, OmniSci, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,7 +18,6 @@
 #define TARGET_VALUE_CONVERTERS_H_
 
 #include "../Catalog/Catalog.h"
-#include "../Import/Importer.h"
 #include "../QueryEngine/TargetMetaInfo.h"
 #include "../QueryEngine/TargetValue.h"
 #include "../Shared/sqldefs.h"

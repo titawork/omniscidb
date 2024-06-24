@@ -1,10 +1,26 @@
+/*
+ * Copyright 2022 HEAVY.AI, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #ifndef COMMANDFUNCTORS_H
 #define COMMANDFUNCTORS_H
 
 #include "CommandResolutionChain.h"
 #include "ThriftOps.h"
 
-#include "gen-cpp/MapD.h"
+#include "gen-cpp/Heavy.h"
 
 #include "ClientContext.h"  // Provides us with default class
 #include "RegexSupport.h"
@@ -15,7 +31,6 @@
 #include <type_traits>
 
 #include "Fragmenter/InsertOrderFragmenter.h"
-#include "MapDServer.h"
 
 #include <boost/algorithm/string.hpp>
 #include <boost/algorithm/string/join.hpp>
@@ -23,18 +38,8 @@
 #include <boost/algorithm/string/trim.hpp>
 #include <boost/preprocessor/facilities/overload.hpp>
 
+#include "Shared/ThriftTypesConvert.h"
 #include "Shared/base64.h"
-
-// NOTE:  These alternative checks are required because of changes to glog
-template <typename T1>
-inline auto NESTED_CHECK(T1&& t1) {
-  CHECK(std::forward<T1>(t1));
-}
-
-template <typename T1, typename T2>
-inline auto NESTED_CHECK_EQ(T1&& t1, T2&& t2) {
-  CHECK_EQ(std::forward<T1>(t1), std::forward<T2>(t2));
-}
 
 template <typename CONTEXT_OP_POLICY>
 class ContextOperations {
@@ -185,7 +190,13 @@ class CmdStringUtilities {
 
 #define StandardCommand_2(CommandName, CommandOperations) \
   StandardCommand_3(CommandName, CommandOperations, CmdDeterminant)
+#if !BOOST_PP_VARIADICS_MSVC
 #define StandardCommand(...) BOOST_PP_OVERLOAD(StandardCommand_, __VA_ARGS__)(__VA_ARGS__)
+#else
+#define StandardCommand(...)                                                  \
+  BOOST_PP_CAT(BOOST_PP_OVERLOAD(StandardCommand_, __VA_ARGS__)(__VA_ARGS__), \
+               BOOST_PP_EMPTY())
+#endif
 
 //
 // Standard Command Definitions
@@ -195,7 +206,7 @@ StandardCommand(Status, { ContextOps::get_status(cmdContext(), output_stream); }
 
 StandardCommand(CopyGeo, {
   std::cout << "Error: The \\copygeo command is deprecated. Use: COPY <table> FROM "
-               "'<file>' WITH (geo='true');"
+               "'<file>' WITH (source_type='geo_file');"
             << std::endl;
 });
 
@@ -220,45 +231,61 @@ StandardCommand(
     { returned_list_regex<kGET_VIEWS>(p, cmdContext(), output_stream); },
     RegexCmdDeterminant);
 
+// clang-format off
 StandardCommand(Help, {
-  std::cout << "\\u [regex] List all users, optionally matching regex.\n";
-  std::cout << "\\l List all databases.\n";
-  std::cout << "\\t [regex] List all tables, optionally matching regex.\n";
-  std::cout << "\\v [regex] List all views, optionally matching regex.\n";
-  std::cout << "\\d <table> List all columns of a table or a view.\n";
-  std::cout << "\\c <database> <user> <password>.\n";
-  std::cout
-      << "\\db [database|...] Switch database. Use ... to switch to your default.\n";
-  std::cout << "\\dash List all dashboards accessible by user.\n";
-  std::cout << "\\o <table> Return a memory optimized schema based on current data "
-               "distribution in table.\n";
-  std::cout << "\\gpu Execute in GPU mode's.\n";
-  std::cout << "\\cpu Execute in CPU mode's.\n";
-  std::cout << "\\multiline Set multi-line command line mode.\n";
-  std::cout << "\\singleline Set single-line command line mode.\n";
-  std::cout << "\\historylen <number> Set history buffer size (default 100).\n";
-  std::cout << "\\timing Print timing information.\n";
-  std::cout << "\\notiming Do not print timing information.\n";
-  std::cout << "\\memory_summary Print memory usage summary.\n";
-  std::cout << "\\version Print OmniSci Server version.\n";
-  std::cout << "\\copy <file path> <table> Copy data from file to table.\n";
-  std::cout << "\\status Get status of the server and the leaf nodes.\n";
-  std::cout << "\\export_dashboard <dashboard name> <filename> <optional: dashboard "
-               "owner name> Exports a dashboard to a "
-               "file.\n";
-  std::cout << "\\import_dashboard <dashboard name> <filename> Imports a dashboard from "
-               "a file\n";
-  std::cout << "\\roles Reports all roles.\n";
-  std::cout << "\\role_list <userName> Reports all roles granted to user.\n";
-  std::cout << "\\privileges {<roleName>|<userName>} Reports all database objects "
-               "privileges granted to role or "
-               "user.\n";
-  std::cout << "\\object_privileges {database|table} <object_name> Reports all "
-               "privileges granted to an object for all "
-               "roles and users.\n";
-  std::cout << "\\q Quit.\n";
+  std::cout << "\\c <database> <user> <password>\n";
+  std::cout <<  "                   - Connect to database as different user\n";
+  std::cout << "\\clear_cpu         - Releases CPU memory held by HeavyDB server Data Manager\n";
+  std::cout << "\\clear_gpu         - Releases GPU memory held by HeavyDB server Data Manager\n";
+  std::cout << "\\copy <file path> <table>\n";
+  std::cout <<  "                   - Copy data from file to table\n";
+  std::cout << "\\cpu               - Execute in CPU mode's\n";
+  std::cout << "\\d <table>         - List all columns of a table or a view.\n";
+  std::cout << "\\dash              - List all dashboards accessible by user\n";
+  std::cout << "\\db [database|...] - Switch database. Use ... to switch to your default\n";
+  std::cout << "\\detect {parquet} <file_name|s3_details>\n";
+  std::cout <<  "                   - Reads a sample of the specified file and returns a CREATE TABLE statement\n";
+  std::cout << "\\export_dashboard <dashboard name> <filename> <optional: dashboard owner name>\n";
+  std::cout <<  "                   - Exports a dashboard to a file\n";
+  std::cout << "\\gpu               - Execute in GPU mode's\n";
+  std::cout << "\\gte <table>       - Get table epoch\n";
+  std::cout << "\\get_license       - Print license information\n";
+  std::cout << "\\hardware_info     - Report hardware information\n";
+  std::cout << "\\historylen <number> - Set history buffer size (default 100)\n";
+  std::cout << "\\import_dashboard <dashboard name> <filename>\n";
+  std::cout <<  "                   - Imports a dashboard from a file\n";
+  std::cout << "\\interrupt         - Send interrupt to HeavyDB\n";
+  std::cout << "\\l                 - List all databases\n";
+  std::cout << "\\memory_cpu        - Report CPU memory usage\n";
+  std::cout << "\\memory_gpu        - Report GPU memory usage\n";
+  std::cout << "\\memory_summary    - Report CPU and GPU memory usage\n";
+  std::cout << "\\notiming          - Do not print timing information\n";
+  std::cout << "\\o <table>         - Return a memory optimized schema based on current data distribution in table\n";
+  std::cout << "\\object_privileges {database|table|server} <object_name>\n";
+  std::cout <<  "                   - Reports all privileges granted to an object for all roles and users\n";
+  std::cout << "\\privileges {<roleName>|<userName>}\n";
+  std::cout <<  "                   - Reports all database objects privileges granted to role or user\n";
+  std::cout << "\\q                 - Quit.\n";
+  std::cout << "\\roles             - Reports all roles\n";
+  std::cout << "\\role_list <userName>\n";
+  std::cout <<  "                   - Reports all roles granted to user\n";
+  std::cout << "\\status            - Get status of the server and the leaf nodes\n";
+  std::cout << "\\ste <db_id:table_id:epoch>\n";
+  std::cout <<  "                   - Set table epoch\n";
+  std::cout << "\\t [regex]         - List all tables, optionally matching regex\n";
+  std::cout << "\\timing            - Print timing information\n";
+  std::cout << "\\u [regex]         - List all users, optionally matching regex\n";
+  std::cout << "\\v [regex]         - List all views, optionally matching regex\n";
+  std::cout << "\\version           - Print HeavyDB Server version\n";
+
+  // These are linenoise commands for debugging - for devs - not heavysql admins/users 
+  // std::cout << "\\key_codes - Set key-codes for command line\n";  
+  // std::cout << "\\multiline - Set multi-line command line mode\n";
+  // std::cout << "\\singleline - Set single-line command line mode\n";
+
   std::cout.flush();
 });
+// clang-format on
 
 StandardCommand(ListDatabases, {
   thrift_op<kGET_DATABASES>(cmdContext(), [&](ContextType& lambda_context) {
@@ -309,139 +336,25 @@ StandardCommand(SwitchDatabase, {
 StandardCommand(ListColumns, {
   decltype(p[1])& table_name(p[1]);
 
-  auto unserialize_key_metainfo =
-      [](const std::string key_metainfo) -> std::vector<std::string> {
-    std::vector<std::string> keys_with_spec;
-    rapidjson::Document document;
-    document.Parse(key_metainfo.c_str());
-    NESTED_CHECK(!document.HasParseError());
-    NESTED_CHECK(document.IsArray());
-    for (auto it = document.Begin(); it != document.End(); ++it) {
-      const auto& key_with_spec_json = *it;
-      NESTED_CHECK(key_with_spec_json.IsObject());
-      const std::string type = key_with_spec_json["type"].GetString();
-      const std::string name = key_with_spec_json["name"].GetString();
-      auto key_with_spec = type + " (" + name + ")";
-      if (type == "SHARED DICTIONARY") {
-        key_with_spec += " REFERENCES ";
-        const std::string foreign_table = key_with_spec_json["foreign_table"].GetString();
-        const std::string foreign_column =
-            key_with_spec_json["foreign_column"].GetString();
-        key_with_spec += foreign_table + "(" + foreign_column + ")";
-      } else {
-        NESTED_CHECK(type == "SHARD KEY");
-      }
-      keys_with_spec.push_back(key_with_spec);
+  const auto stmt = "show create table " + table_name;
+
+  auto valid_row_count = [](const TQueryResult& query_result) -> bool {
+    CHECK(!query_result.row_set.row_desc.empty());
+    if (query_result.row_set.columns.empty()) {
+      return false;
     }
-    return keys_with_spec;
+    CHECK_EQ(query_result.row_set.columns.size(), query_result.row_set.row_desc.size());
+    return (query_result.row_set.columns.front().nulls.size() == 1);
   };
 
   auto on_success_lambda = [&](ContextType& context) {
-    const auto table_details = context.table_details;
-    if (table_details.view_sql.empty()) {
-      std::string temp_holder(" ");
-      if (table_details.is_temporary) {
-        temp_holder = " TEMPORARY ";
-      }
-      output_stream << "CREATE" + temp_holder + "TABLE " + table_name + " (\n";
-    } else {
-      output_stream << "CREATE VIEW " + table_name + " AS " + table_details.view_sql
-                    << "\n";
-      output_stream << "\n"
-                    << "View columns:"
-                    << "\n\n";
-    }
-    std::string comma_or_blank("");
-    for (TColumnType p : table_details.row_desc) {
-      if (p.is_system) {
-        continue;
-      }
-      std::string encoding = "";
-      if (p.col_type.type == TDatumType::STR) {
-        encoding = (p.col_type.encoding == 0
-                        ? " ENCODING NONE"
-                        : " ENCODING " + thrift_to_encoding_name(p.col_type) + "(" +
-                              std::to_string(p.col_type.comp_param) + ")");
-      } else if (p.col_type.type == TDatumType::POINT ||
-                 p.col_type.type == TDatumType::LINESTRING ||
-                 p.col_type.type == TDatumType::POLYGON ||
-                 p.col_type.type == TDatumType::MULTIPOLYGON) {
-        if (p.col_type.scale == 4326) {
-          encoding = (p.col_type.encoding == 0
-                          ? " ENCODING NONE"
-                          : " ENCODING " + thrift_to_encoding_name(p.col_type) + "(" +
-                                std::to_string(p.col_type.comp_param) + ")");
-        }
-      } else {
-        encoding = (p.col_type.encoding == 0
-                        ? ""
-                        : " ENCODING " + thrift_to_encoding_name(p.col_type) + "(" +
-                              std::to_string(p.col_type.comp_param) + ")");
-      }
-      output_stream << comma_or_blank << p.col_name << " " << thrift_to_name(p.col_type)
-                    << (p.col_type.nullable ? "" : " NOT NULL") << encoding;
-      comma_or_blank = ",\n";
-    }
-    if (table_details.view_sql.empty()) {
-      const auto keys_with_spec = unserialize_key_metainfo(table_details.key_metainfo);
-      for (const auto& key_with_spec : keys_with_spec) {
-        output_stream << ",\n" << key_with_spec;
-      }
-      // push final ")\n";
-      output_stream << ")\n";
-      comma_or_blank = "";
-      std::string frag = "";
-      std::string page = "";
-      std::string row = "";
-      std::string partition_detail = "";
-      if (DEFAULT_FRAGMENT_ROWS != table_details.fragment_size) {
-        frag = "FRAGMENT_SIZE = " + std::to_string(table_details.fragment_size);
-        comma_or_blank = ", ";
-      }
-      if (table_details.shard_count) {
-        auto shard_count = table_details.shard_count;
-        if (context.cluster_status.size() > 1) {
-          size_t leaf_count = 0;
-          for (const auto& node : context.cluster_status) {
-            leaf_count += node.role == TRole::type::LEAF ? 1 : 0;
-          }
-          shard_count *= leaf_count;
-        }
-        frag += comma_or_blank + "SHARD_COUNT = " + std::to_string(shard_count);
-        comma_or_blank = ", ";
-      }
-      if (DEFAULT_PAGE_SIZE != table_details.page_size) {
-        page = comma_or_blank + "PAGE_SIZE = " + std::to_string(table_details.page_size);
-        comma_or_blank = ", ";
-      }
-      if (DEFAULT_MAX_ROWS != table_details.max_rows) {
-        row = comma_or_blank + "MAX_ROWS = " + std::to_string(table_details.max_rows);
-        comma_or_blank = ", ";
-      }
-      if (table_details.partition_detail != TPartitionDetail::DEFAULT) {
-        partition_detail = comma_or_blank + "PARTITIONS = ";
-        switch (table_details.partition_detail) {
-          case TPartitionDetail::REPLICATED:
-            partition_detail += "'REPLICATED'";
-            break;
-          case TPartitionDetail::SHARDED:
-            partition_detail += "'SHARDED'";
-            break;
-          default:
-            partition_detail += "'OTHER'";
-            break;
-        }
-      }
-      std::string with = frag + page + row + partition_detail;
-      if (with.length() > 0) {
-        output_stream << "WITH (" << with << ")\n";
-      }
-    } else {
-      output_stream << "\n";
-    }
+    CHECK(valid_row_count(context.query_return));
+    const auto create_table_str = context.query_return.row_set.columns[0].data.str_col[0];
+    output_stream << create_table_str;
+    output_stream << "\n";
   };
 
-  thrift_op<kGET_TABLE_DETAILS>(cmdContext(), table_name.c_str(), on_success_lambda);
+  thrift_op<kSQL>(cmdContext(), stmt.c_str(), on_success_lambda);
 });
 
 StandardCommand(ExportDashboard, {
@@ -504,7 +417,7 @@ StandardCommand(ExportDashboard, {
           if (dashfile.is_open()) {
             dashfile << lambda_context.dash_return.dashboard_name << std::endl;
             dashfile << lambda_context.dash_return.dashboard_metadata << std::endl;
-            dashfile << mapd::decode_base64(lambda_context.dash_return.dashboard_state);
+            dashfile << shared::decode_base64(lambda_context.dash_return.dashboard_state);
             dashfile.close();
           } else {
             output_stream << "Could not open file `" << filename << "`" << std::endl;
@@ -539,13 +452,13 @@ StandardCommand(ImportDashboard, {
   }
 
   if (!replace(state,
-               std::string("\"title\":\"" + old_name + "\","),
-               std::string("\"title\":\"" + cmdContext().view_name + "\","))) {
+               std::string("\"title\":\"" + old_name + "\""),
+               std::string("\"title\":\"" + cmdContext().view_name + "\""))) {
     output_stream << "Failed to update title." << std::endl;
     return;
   }
 
-  cmdContext().view_state = mapd::encode_base64(state);
+  cmdContext().view_state = shared::encode_base64(state);
 
   output_stream << "Importing dashboard " << cmdContext().view_name << " from file "
                 << filename << std::endl;
@@ -558,19 +471,18 @@ StandardCommand(GetOptimizedSchema, {
   decltype(p[1])& table_name(p[1]);
 
   auto get_row_count = [](const TQueryResult& query_result) -> size_t {
-    NESTED_CHECK(!query_result.row_set.row_desc.empty());
+    CHECK(!query_result.row_set.row_desc.empty());
     if (query_result.row_set.columns.empty()) {
       return 0;
     }
-    NESTED_CHECK_EQ(query_result.row_set.columns.size(),
-                    query_result.row_set.row_desc.size());
+    CHECK_EQ(query_result.row_set.columns.size(), query_result.row_set.row_desc.size());
     return query_result.row_set.columns.front().nulls.size();
   };
 
   // runs a simple single integer value query and returns that single int value returned
   auto run_query = [get_row_count](ContextType& context, std::string query) -> int {
     thrift_op<kSQL>(context, query.c_str());
-    NESTED_CHECK(get_row_count(context.query_return));
+    CHECK(get_row_count(context.query_return));
     // std::cerr << "return value is " <<
     // context.query_return.row_set.columns[0].data.int_col[0];
     return context.query_return.row_set.columns[0].data.int_col[0];
@@ -648,7 +560,9 @@ StandardCommand(GetOptimizedSchema, {
                                   context, table_name, p.col_name, p.col_type.type)) +
                               ")");
       } else if (p.col_type.type == TDatumType::POINT ||
+                 p.col_type.type == TDatumType::MULTIPOINT ||
                  p.col_type.type == TDatumType::LINESTRING ||
+                 p.col_type.type == TDatumType::MULTILINESTRING ||
                  p.col_type.type == TDatumType::POLYGON ||
                  p.col_type.type == TDatumType::MULTIPOLYGON) {
         if (p.col_type.scale == 4326) {

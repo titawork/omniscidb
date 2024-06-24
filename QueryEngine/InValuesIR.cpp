@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,9 +18,11 @@
 #include "Execute.h"
 
 #include <future>
+#include <memory>
 
 llvm::Value* CodeGenerator::codegen(const Analyzer::InValues* expr,
                                     const CompilationOptions& co) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   const auto in_arg = expr->get_arg();
   if (is_unnest(in_arg)) {
     throw std::runtime_error("IN not supported for unnested expressions");
@@ -36,7 +38,7 @@ llvm::Value* CodeGenerator::codegen(const Analyzer::InValues* expr,
     result = cgen_state_->llInt(int8_t(0));
   }
   CHECK(result);
-  if (co.hoist_literals_) {  // TODO(alex): remove this constraint
+  if (co.hoist_literals) {  // TODO(alex): remove this constraint
     auto in_vals_bitmap = createInValuesBitmap(expr, co);
     if (in_vals_bitmap) {
       if (in_vals_bitmap->isEmpty()) {
@@ -69,26 +71,27 @@ llvm::Value* CodeGenerator::codegen(const Analyzer::InValues* expr,
 
 llvm::Value* CodeGenerator::codegen(const Analyzer::InIntegerSet* in_integer_set,
                                     const CompilationOptions& co) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   const auto in_arg = in_integer_set->get_arg();
   if (is_unnest(in_arg)) {
     throw std::runtime_error("IN not supported for unnested expressions");
   }
   const auto& ti = in_integer_set->get_arg()->get_type_info();
   const auto needle_null_val = inline_int_null_val(ti);
-  if (!co.hoist_literals_) {
+  if (!co.hoist_literals) {
     // We never run without literal hoisting in real world scenarios, this avoids a crash
     // when testing.
     throw std::runtime_error(
         "IN subquery with many right-hand side values not supported when literal "
         "hoisting is disabled");
   }
-  auto in_vals_bitmap = boost::make_unique<InValuesBitmap>(
+  auto in_vals_bitmap = std::make_unique<InValuesBitmap>(
       in_integer_set->get_value_list(),
       needle_null_val,
-      co.device_type_ == ExecutorDeviceType::GPU ? Data_Namespace::GPU_LEVEL
-                                                 : Data_Namespace::CPU_LEVEL,
-      executor()->deviceCount(co.device_type_),
-      &executor()->getCatalog()->getDataMgr());
+      co.device_type == ExecutorDeviceType::GPU ? Data_Namespace::GPU_LEVEL
+                                                : Data_Namespace::CPU_LEVEL,
+      executor()->deviceCount(co.device_type),
+      executor()->data_mgr_);
   const auto& in_integer_set_ti = in_integer_set->get_type_info();
   CHECK(in_integer_set_ti.is_boolean());
   const auto lhs_lvs = codegen(in_arg, true, co);
@@ -100,11 +103,6 @@ llvm::Value* CodeGenerator::codegen(const Analyzer::InIntegerSet* in_integer_set
     result = cgen_state_->llInt(int8_t(0));
   }
   CHECK(result);
-  if (in_vals_bitmap->isEmpty()) {
-    return in_vals_bitmap->hasNull()
-               ? cgen_state_->inlineIntNull(SQLTypeInfo(kBOOLEAN, false))
-               : result;
-  }
   CHECK_EQ(size_t(1), lhs_lvs.size());
   return cgen_state_->addInValuesBitmap(in_vals_bitmap)
       ->codegen(lhs_lvs.front(), executor());
@@ -113,6 +111,7 @@ llvm::Value* CodeGenerator::codegen(const Analyzer::InIntegerSet* in_integer_set
 std::unique_ptr<InValuesBitmap> CodeGenerator::createInValuesBitmap(
     const Analyzer::InValues* in_values,
     const CompilationOptions& co) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   const auto& value_list = in_values->get_value_list();
   const auto val_count = value_list.size();
   const auto& ti = in_values->get_arg()->get_type_info();
@@ -120,9 +119,10 @@ std::unique_ptr<InValuesBitmap> CodeGenerator::createInValuesBitmap(
     return nullptr;
   }
   const auto sdp =
-      ti.is_string() ? executor()->getStringDictionaryProxy(
-                           ti.get_comp_param(), executor()->getRowSetMemoryOwner(), true)
-                     : nullptr;
+      ti.is_string()
+          ? executor()->getStringDictionaryProxy(
+                ti.getStringDictKey(), executor()->getRowSetMemoryOwner(), true)
+          : nullptr;
   if (val_count > 3) {
     using ListIterator = decltype(value_list.begin());
     std::vector<int64_t> values;
@@ -149,7 +149,7 @@ std::unique_ptr<InValuesBitmap> CodeGenerator::createInValuesBitmap(
             return false;
           }
           const auto& in_val_ti = in_val->get_type_info();
-          CHECK(in_val_ti == ti);
+          CHECK(in_val_ti == ti || get_nullable_type_info(in_val_ti) == ti);
           if (ti.is_string()) {
             CHECK(sdp);
             const auto string_id =
@@ -160,7 +160,8 @@ std::unique_ptr<InValuesBitmap> CodeGenerator::createInValuesBitmap(
               out_vals.push_back(string_id);
             }
           } else {
-            out_vals.push_back(codegenIntConst(in_val_const)->getSExtValue());
+            out_vals.push_back(CodeGenerator::codegenIntConst(in_val_const, cgen_state_)
+                                   ->getSExtValue());
           }
         }
         return true;
@@ -190,13 +191,13 @@ std::unique_ptr<InValuesBitmap> CodeGenerator::createInValuesBitmap(
       }
     }
     try {
-      return boost::make_unique<InValuesBitmap>(values,
-                                                needle_null_val,
-                                                co.device_type_ == ExecutorDeviceType::GPU
-                                                    ? Data_Namespace::GPU_LEVEL
-                                                    : Data_Namespace::CPU_LEVEL,
-                                                executor()->deviceCount(co.device_type_),
-                                                &executor()->getCatalog()->getDataMgr());
+      return std::make_unique<InValuesBitmap>(values,
+                                              needle_null_val,
+                                              co.device_type == ExecutorDeviceType::GPU
+                                                  ? Data_Namespace::GPU_LEVEL
+                                                  : Data_Namespace::CPU_LEVEL,
+                                              executor()->deviceCount(co.device_type),
+                                              executor()->data_mgr_);
     } catch (...) {
       return nullptr;
     }

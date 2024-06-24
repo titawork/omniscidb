@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 OmniSci, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -72,12 +72,13 @@ std::shared_ptr<Analyzer::WindowFunction> rewrite_sum_window(const Analyzer::Exp
     return nullptr;
   }
   const auto count_window_expr =
-      dynamic_cast<const Analyzer::WindowFunction*>(window_gt_zero->get_left_operand());
+      std::dynamic_pointer_cast<const Analyzer::WindowFunction>(
+          remove_cast(window_gt_zero->get_own_left_operand()));
   if (!count_window_expr ||
       count_window_expr->getKind() != SqlWindowFunctionKind::COUNT) {
     return nullptr;
   }
-  if (!window_sum_and_count_match(sum_window_expr.get(), count_window_expr)) {
+  if (!window_sum_and_count_match(sum_window_expr.get(), count_window_expr.get())) {
     return nullptr;
   }
   CHECK(sum_window_expr);
@@ -85,12 +86,16 @@ std::shared_ptr<Analyzer::WindowFunction> rewrite_sum_window(const Analyzer::Exp
   if (sum_ti.is_integer()) {
     sum_ti = SQLTypeInfo(kBIGINT, sum_ti.get_notnull());
   }
-  return makeExpr<Analyzer::WindowFunction>(sum_ti,
-                                            SqlWindowFunctionKind::SUM,
-                                            sum_window_expr->getArgs(),
-                                            sum_window_expr->getPartitionKeys(),
-                                            sum_window_expr->getOrderKeys(),
-                                            sum_window_expr->getCollation());
+  return makeExpr<Analyzer::WindowFunction>(
+      sum_ti,
+      SqlWindowFunctionKind::SUM,
+      sum_window_expr->getArgs(),
+      sum_window_expr->getPartitionKeys(),
+      sum_window_expr->getOrderKeys(),
+      sum_window_expr->getFrameBoundType(),
+      sum_window_expr->getFrameStartBound()->deep_copy(),
+      sum_window_expr->getFrameEndBound()->deep_copy(),
+      sum_window_expr->getCollation());
 }
 
 std::shared_ptr<Analyzer::WindowFunction> rewrite_avg_window(const Analyzer::Expr* expr) {
@@ -123,10 +128,14 @@ std::shared_ptr<Analyzer::WindowFunction> rewrite_avg_window(const Analyzer::Exp
   if (!expr_list_match(sum_window_expr.get()->getArgs(), count_window->getArgs())) {
     return nullptr;
   }
-  return makeExpr<Analyzer::WindowFunction>(SQLTypeInfo(kDOUBLE),
-                                            SqlWindowFunctionKind::AVG,
-                                            sum_window_expr->getArgs(),
-                                            sum_window_expr->getPartitionKeys(),
-                                            sum_window_expr->getOrderKeys(),
-                                            sum_window_expr->getCollation());
+  return makeExpr<Analyzer::WindowFunction>(
+      SQLTypeInfo(kDOUBLE),
+      SqlWindowFunctionKind::AVG,
+      sum_window_expr->getArgs(),
+      sum_window_expr->getPartitionKeys(),
+      sum_window_expr->getOrderKeys(),
+      sum_window_expr->getFrameBoundType(),
+      sum_window_expr->getFrameStartBound()->deep_copy(),
+      sum_window_expr->getFrameEndBound()->deep_copy(),
+      sum_window_expr->getCollation());
 }

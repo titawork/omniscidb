@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -68,7 +68,7 @@ bool should_defer_eval(const std::shared_ptr<Analyzer::Expr> expr) {
   if (contains_unsafe_division(bin_expr.get())) {
     return true;
   }
-  if (bin_expr->is_overlaps_oper()) {
+  if (bin_expr->is_bbox_intersect_oper()) {
     return false;
   }
   const auto rhs = bin_expr->get_right_operand();
@@ -156,8 +156,12 @@ Weight get_weight(const Analyzer::Expr* expr, int depth = 0) {
 
 bool CodeGenerator::prioritizeQuals(const RelAlgExecutionUnit& ra_exe_unit,
                                     std::vector<Analyzer::Expr*>& primary_quals,
-                                    std::vector<Analyzer::Expr*>& deferred_quals) {
+                                    std::vector<Analyzer::Expr*>& deferred_quals,
+                                    const PlanState::HoistedFiltersSet& hoisted_quals) {
   for (auto expr : ra_exe_unit.simple_quals) {
+    if (hoisted_quals.find(expr) != hoisted_quals.end()) {
+      continue;
+    }
     if (should_defer_eval(expr)) {
       deferred_quals.push_back(expr.get());
       continue;
@@ -168,6 +172,10 @@ bool CodeGenerator::prioritizeQuals(const RelAlgExecutionUnit& ra_exe_unit,
   bool short_circuit = false;
 
   for (auto expr : ra_exe_unit.quals) {
+    if (hoisted_quals.find(expr) != hoisted_quals.end()) {
+      continue;
+    }
+
     if (get_likelihood(expr.get()) < 0.10 && !contains_unsafe_division(expr.get())) {
       if (!short_circuit) {
         primary_quals.push_back(expr.get());
@@ -187,6 +195,7 @@ bool CodeGenerator::prioritizeQuals(const RelAlgExecutionUnit& ra_exe_unit,
 
 llvm::Value* CodeGenerator::codegenLogicalShortCircuit(const Analyzer::BinOper* bin_oper,
                                                        const CompilationOptions& co) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   const auto optype = bin_oper->get_optype();
   auto lhs = bin_oper->get_left_operand();
   auto rhs = bin_oper->get_right_operand();
@@ -221,19 +230,19 @@ llvm::Value* CodeGenerator::codegenLogicalShortCircuit(const Analyzer::BinOper* 
   // the control flow converges.
   Executor::FetchCacheAnchor anchor(cgen_state_);
 
-  auto rhs_bb =
-      llvm::BasicBlock::Create(cgen_state_->context_, "rhs_bb", cgen_state_->row_func_);
-  auto ret_bb =
-      llvm::BasicBlock::Create(cgen_state_->context_, "ret_bb", cgen_state_->row_func_);
+  auto rhs_bb = llvm::BasicBlock::Create(
+      cgen_state_->context_, "rhs_bb", cgen_state_->current_func_);
+  auto ret_bb = llvm::BasicBlock::Create(
+      cgen_state_->context_, "ret_bb", cgen_state_->current_func_);
   llvm::BasicBlock* nullcheck_ok_bb{nullptr};
   llvm::BasicBlock* nullcheck_fail_bb{nullptr};
 
   if (!ti.get_notnull()) {
     // need lhs nullcheck before short circuiting
     nullcheck_ok_bb = llvm::BasicBlock::Create(
-        cgen_state_->context_, "nullcheck_ok_bb", cgen_state_->row_func_);
+        cgen_state_->context_, "nullcheck_ok_bb", cgen_state_->current_func_);
     nullcheck_fail_bb = llvm::BasicBlock::Create(
-        cgen_state_->context_, "nullcheck_fail_bb", cgen_state_->row_func_);
+        cgen_state_->context_, "nullcheck_fail_bb", cgen_state_->current_func_);
     if (lhs_lv->getType()->isIntegerTy(1)) {
       lhs_lv = cgen_state_->castToTypeIn(lhs_lv, 8);
     }
@@ -288,6 +297,7 @@ llvm::Value* CodeGenerator::codegenLogicalShortCircuit(const Analyzer::BinOper* 
 
 llvm::Value* CodeGenerator::codegenLogical(const Analyzer::BinOper* bin_oper,
                                            const CompilationOptions& co) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   const auto optype = bin_oper->get_optype();
   CHECK(IS_LOGIC(optype));
 
@@ -331,6 +341,7 @@ llvm::Value* CodeGenerator::codegenLogical(const Analyzer::BinOper* bin_oper,
 }
 
 llvm::Value* CodeGenerator::toBool(llvm::Value* lv) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   CHECK(lv->getType()->isIntegerTy());
   if (static_cast<llvm::IntegerType*>(lv->getType())->getBitWidth() > 1) {
     return cgen_state_->ir_builder_.CreateICmp(
@@ -350,6 +361,7 @@ bool is_qualified_bin_oper(const Analyzer::Expr* expr) {
 
 llvm::Value* CodeGenerator::codegenLogical(const Analyzer::UOper* uoper,
                                            const CompilationOptions& co) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   const auto optype = uoper->get_optype();
   CHECK_EQ(kNOT, optype);
   const auto operand = uoper->get_operand();
@@ -367,6 +379,7 @@ llvm::Value* CodeGenerator::codegenLogical(const Analyzer::UOper* uoper,
 
 llvm::Value* CodeGenerator::codegenIsNull(const Analyzer::UOper* uoper,
                                           const CompilationOptions& co) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   const auto operand = uoper->get_operand();
   if (dynamic_cast<const Analyzer::Constant*>(operand) &&
       dynamic_cast<const Analyzer::Constant*>(operand)->get_is_null()) {
@@ -375,22 +388,30 @@ llvm::Value* CodeGenerator::codegenIsNull(const Analyzer::UOper* uoper,
   }
   const auto& ti = operand->get_type_info();
   CHECK(ti.is_integer() || ti.is_boolean() || ti.is_decimal() || ti.is_time() ||
-        ti.is_string() || ti.is_fp() || ti.is_array());
+        ti.is_string() || ti.is_fp() || ti.is_array() || ti.is_geometry());
   // if the type is inferred as non null, short-circuit to false
-  if (ti.get_notnull() && !ti.is_array()) {
+  if (ti.get_notnull()) {
     return llvm::ConstantInt::get(get_int_type(1, cgen_state_->context_), 0);
   }
-  const auto operand_lv = codegen(operand, true, co).front();
-  if (ti.is_array()) {
-    return cgen_state_->emitExternalCall("array_is_null",
-                                         get_int_type(1, cgen_state_->context_),
-                                         {operand_lv, posArg(operand)});
+  llvm::Value* operand_lv = codegen(operand, true, co).front();
+  // NULL-check array or geo's coords array
+  if (ti.is_array() || ti.is_geometry()) {
+    // POINT [un]compressed coord check requires custom checker and chunk iterator
+    // Non-POINT NULL geographies will have a normally encoded null coord array
+    auto fname =
+        (ti.get_type() == kPOINT) ? "point_coord_array_is_null" : "array_is_null";
+    return cgen_state_->emitExternalCall(
+        fname, get_int_type(1, cgen_state_->context_), {operand_lv, posArg(operand)});
+  } else if (ti.is_none_encoded_string()) {
+    operand_lv = cgen_state_->ir_builder_.CreateExtractValue(operand_lv, 0);
+    operand_lv = cgen_state_->castToTypeIn(operand_lv, sizeof(int64_t) * 8);
   }
   return codegenIsNullNumber(operand_lv, ti);
 }
 
 llvm::Value* CodeGenerator::codegenIsNullNumber(llvm::Value* operand_lv,
                                                 const SQLTypeInfo& ti) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   if (ti.is_fp()) {
     return cgen_state_->ir_builder_.CreateFCmp(llvm::FCmpInst::FCMP_OEQ,
                                                operand_lv,

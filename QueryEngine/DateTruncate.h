@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,57 +17,61 @@
 #ifndef QUERYENGINE_DATETRUNCATE_H
 #define QUERYENGINE_DATETRUNCATE_H
 
+#include <array>
 #include <cstdint>
 
 #include "../Shared/funcannotations.h"
 #include "ExtractFromTime.h"
 
-/*
- * year
- * month
- * day
- * hour
- * minute
- * second
- *
- * millennium
- * century
- * decade
- * milliseconds
- * microseconds
- * nanoseconds
- * week
- * quarterday
- */
+// DatetruncField must be synced with datetrunc_fname
 enum DatetruncField {
-  dtYEAR,
+  dtYEAR = 0,
   dtQUARTER,
   dtMONTH,
   dtDAY,
   dtHOUR,
   dtMINUTE,
   dtSECOND,
-  dtMILLENNIUM,
-  dtCENTURY,
-  dtDECADE,
   dtMILLISECOND,
   dtMICROSECOND,
   dtNANOSECOND,
+  dtMILLENNIUM,
+  dtCENTURY,
+  dtDECADE,
   dtWEEK,
+  dtWEEK_SUNDAY,
+  dtWEEK_SATURDAY,
   dtQUARTERDAY,
   dtINVALID
 };
 
-extern "C" NEVER_INLINE DEVICE int64_t DateTruncate(DatetruncField field,
-                                                    const int64_t timeval);
+constexpr std::array<char const*, dtINVALID> datetrunc_fname_lookup{
+    {"datetrunc_year",
+     "datetrunc_quarter",
+     "datetrunc_month",
+     "datetrunc_day",
+     "datetrunc_hour",
+     "datetrunc_minute",
+     "datetrunc_second",       // not used
+     "datetrunc_millisecond",  // not used
+     "datetrunc_microsecond",  // not used
+     "datetrunc_nanosecond",   // not used
+     "datetrunc_millennium",
+     "datetrunc_century",
+     "datetrunc_decade",
+     "datetrunc_week_monday",
+     "datetrunc_week_sunday",
+     "datetrunc_week_saturday",
+     "datetrunc_quarterday"}};
 
-extern "C" DEVICE int64_t DateTruncateHighPrecisionToDate(const int64_t timeval,
-                                                          const int64_t scale);
+// Arithmetic which relies on these enums being consecutive is used elsewhere.
+static_assert(dtSECOND + 1 == dtMILLISECOND, "Please keep these consecutive.");
+static_assert(dtMILLISECOND + 1 == dtMICROSECOND, "Please keep these consecutive.");
+static_assert(dtMICROSECOND + 1 == dtNANOSECOND, "Please keep these consecutive.");
 
-extern "C" DEVICE int64_t DateTruncateAlterPrecisionScaleUp(const int64_t timeval,
-                                                            const int64_t scale);
+DEVICE int64_t DateTruncate(DatetruncField field, const int64_t timeval);
 
-extern "C" DEVICE int64_t DateTruncateAlterPrecisionScaleDown(const int64_t timeval,
-                                                              const int64_t scale);
+extern "C" RUNTIME_EXPORT DEVICE int64_t
+DateTruncateHighPrecisionToDate(const int64_t timeval, const int64_t scale);
 
 #endif  // QUERYENGINE_DATETRUNCATE_H

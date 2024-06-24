@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,23 +14,26 @@
  * limitations under the License.
  */
 
-#ifndef QUERYENGINE_STRINGDICTIONARYGENERATION_H
-#define QUERYENGINE_STRINGDICTIONARYGENERATION_H
+#pragma once
 
 #include <unordered_map>
 
+#include "Shared/DbObjectKeys.h"
+
 class StringDictionaryGenerations {
  public:
-  void setGeneration(const uint32_t id, const size_t generation);
+  StringDictionaryGenerations(){};
 
-  ssize_t getGeneration(const uint32_t id) const;
+  void setGeneration(const shared::StringDictKey& dict_key, const uint64_t generation);
 
-  const std::unordered_map<uint32_t, size_t>& asMap() const;
+  void updateGeneration(const shared::StringDictKey& dict_key, const uint64_t generation);
+
+  int64_t getGeneration(const shared::StringDictKey& dict_key) const;
+
+  const std::unordered_map<shared::StringDictKey, uint64_t>& asMap() const;
 
   void clear();
 
  private:
-  std::unordered_map<uint32_t, size_t> id_to_generation_;
+  std::unordered_map<shared::StringDictKey, uint64_t> dict_key_to_generation_;
 };
-
-#endif  // QUERYENGINE_STRINGDICTIONARYGENERATION_H

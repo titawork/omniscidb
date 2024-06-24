@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,11 +14,10 @@
  * limitations under the License.
  */
 
-/*
+/**
  * @file    GpuInitGroups.h
- * @author  Alex Suhan <alex@mapd.com>
+ * @brief
  *
- * Copyright (c) 2015 MapD Technologies, Inc.  All rights reserved.
  */
 
 #ifndef GPUINITGROUPS_H
@@ -48,8 +47,4 @@ void init_columnar_group_by_buffer_on_device(int64_t* groups_buffer,
                                              const size_t block_size_x,
                                              const size_t grid_size_x);
 
-void init_render_buffer_on_device(int64_t* render_buffer,
-                                  const uint32_t qw_count,
-                                  const size_t block_size_x,
-                                  const size_t grid_size_x);
 #endif  // GPUINITGROUPS_H

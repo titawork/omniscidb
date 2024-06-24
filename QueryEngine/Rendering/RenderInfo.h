@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,43 +14,42 @@
  * limitations under the License.
  */
 
-#ifndef QUERYENGINE_RENDERINFO_H
-#define QUERYENGINE_RENDERINFO_H
+#pragma once
 
-#include <Analyzer/Analyzer.h>
-#include <Catalog/Catalog.h>
-#include "../Descriptors/RowSetMemoryOwner.h"
-#include "RenderAllocator.h"
+#include "Analyzer/Analyzer.h"
+#include "Catalog/Catalog.h"
+#include "QueryEngine/Descriptors/RowSetMemoryOwner.h"
+#include "QueryEngine/Rendering/RenderAllocator.h"
+#include "Shared/FullyQualifiedTableName.h"
+#include "Shared/Rendering/InSituFlags.h"
+#include "Shared/Rendering/RenderQueryOptions.h"
 
 namespace QueryRenderer {
-struct RenderSession;
-}  // namespace QueryRenderer
+struct RenderSessionKey;
+}
 
-class RenderInfo {
+class RenderInfo : public heavyai::InSituFlagsOwnerInterface {
  public:
   std::unique_ptr<RenderAllocatorMap> render_allocator_map_ptr;
-  const std::shared_ptr<const ::QueryRenderer::RenderSession> render_session;
-  std::shared_ptr<RowSetMemoryOwner> row_set_mem_owner;
+  const ::QueryRenderer::RenderSessionKey& render_session_key;
 
   // Info for all the column targets retrieved in in a query. Used to extract column/table
   // info when rendering.
   std::vector<std::shared_ptr<Analyzer::TargetEntry>> targets;
 
   // All the "selected from" tables in a query. Includes resolved and un-resolved views.
-  std::unordered_set<std::string> table_names;
-  bool disallow_in_situ_only_if_final_ED_is_aggregate;
+  std::unordered_set<shared::FullyQualifiedTableName> table_names;
 
-  RenderInfo(
-      const std::shared_ptr<const ::QueryRenderer::RenderSession> in_render_session,
-      const bool force_non_in_situ_data = false);
+  RenderInfo(const ::QueryRenderer::RenderSessionKey& in_render_session_key,
+             const RenderQueryOptions& in_render_query_opts,
+             const heavyai::InSituFlags in_insitu_flags = heavyai::InSituFlags::kInSitu);
 
   const Catalog_Namespace::SessionInfo& getSessionInfo() const;
-  void setForceNonInSituData();
-  bool queryRanWithInSituData() const;
-  bool hasInSituData() const;
-  bool isInSituDataFlagUnset() const;
-  bool couldRunInSitu() const;
-  bool isPotentialInSituRender() const;
+  std::shared_ptr<Catalog_Namespace::SessionInfo const> getSessionInfoPtr() const;
+
+  void forceNonInSitu();
+  void setNonInSitu();
+
   bool useCudaBuffers() const;
   void disableCudaBuffers();
 
@@ -61,28 +60,17 @@ class RenderInfo {
   void setQuerySsboLayout(
       const std::shared_ptr<QueryRenderer::QueryDataLayout>& ssbo_layout);
 
-  bool setInSituDataIfUnset(const bool is_in_situ_data);
+  const RenderQueryOptions& getRenderQueryOptions() const;
 
-  void reset(const bool disallow_in_situ_only_if_final_ED_is_aggregate_in);
+  void reset(std::unique_ptr<RenderQueryOptions> in_query_opts,
+             const heavyai::InSituFlags in_insitu_flags);
 
  private:
   enum class InSituState { UNSET, IS_IN_SITU, IS_NOT_IN_SITU };
-  InSituState
-      in_situ_data;  // Should be set to true if query results can be written directly
-                     // to CUDA-mapped opengl buffers for rendering. Should be set
-                     // to false otherwise, meaning results are written to CPU first,
-                     // and buffered back to GPU for rendering.
-                     // An alternative meaning is that when false, you've encountered
-                     // a non-projection query.
-                     // Can only be set once for the lifetime of the object.
   bool force_non_in_situ_data;
-
-  enum class RendererBufferMode { CUDA, GL };
-  RendererBufferMode buffer_mode_;  // The Renderer buffer mode determines how query
-                                    // results are bused to the Rendering engine.
+  bool cuda_using_buffers_;
 
   std::shared_ptr<QueryRenderer::QueryDataLayout> query_vbo_layout;
   std::shared_ptr<QueryRenderer::QueryDataLayout> query_ssbo_layout;
+  RenderQueryOptions render_query_opts_;
 };
-
-#endif  // QUERYENGINE_RENDERINFO_H

@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,7 +16,8 @@
 
 /**
  * @file    OutputBufferInitialization.h
- * @author  Alex Suhan <alex@mapd.com>
+ * @brief
+ *
  */
 
 #ifndef QUERYENGINE_OUTPUTBUFFERINITIALIZATION_H
@@ -48,6 +49,9 @@ std::vector<int64_t> init_agg_val_vec(
     const std::vector<Analyzer::Expr*>& targets,
     const std::list<std::shared_ptr<Analyzer::Expr>>& quals,
     const QueryMemoryDescriptor& query_mem_desc);
+
+std::vector<int64_t> init_agg_val_vec(const std::vector<TargetInfo>& targets,
+                                      const QueryMemoryDescriptor& query_mem_desc);
 
 const Analyzer::Expr* agg_arg(const Analyzer::Expr* expr);
 

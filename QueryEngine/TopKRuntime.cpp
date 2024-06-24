@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,13 +14,12 @@
  * limitations under the License.
  */
 
-/*
+/**
  * @file    TopKRuntime.cpp
- * @author  Minggang Yu <miyu@mapd.com>
  * @brief   Structures and runtime functions of streaming top-k heap
  *
- * Copyright (c) 2017 MapD Technologies, Inc.  All rights reserved.
  */
+
 #include "../Shared/funcannotations.h"
 
 enum class HeapOrdering { MIN, MAX };
@@ -235,26 +234,26 @@ ALWAYS_INLINE DEVICE int64_t* get_bin_from_k_heap_impl(int64_t* heaps,
   }
 }
 
-#define DEF_GET_BIN_FROM_K_HEAP(key_type)                                 \
-  extern "C" NEVER_INLINE DEVICE int64_t* get_bin_from_k_heap_##key_type( \
-      int64_t* heaps,                                                     \
-      const uint32_t k,                                                   \
-      const uint32_t row_size_quad,                                       \
-      const uint32_t key_offset,                                          \
-      const bool min_heap,                                                \
-      const bool has_null,                                                \
-      const bool nulls_first,                                             \
-      const key_type null_key,                                            \
-      const key_type curr_key) {                                          \
-    return get_bin_from_k_heap_impl(heaps,                                \
-                                    k,                                    \
-                                    row_size_quad,                        \
-                                    key_offset,                           \
-                                    min_heap,                             \
-                                    has_null,                             \
-                                    nulls_first,                          \
-                                    null_key,                             \
-                                    curr_key);                            \
+#define DEF_GET_BIN_FROM_K_HEAP(key_type)                                                \
+  extern "C" RUNTIME_EXPORT NEVER_INLINE DEVICE int64_t* get_bin_from_k_heap_##key_type( \
+      int64_t* heaps,                                                                    \
+      const uint32_t k,                                                                  \
+      const uint32_t row_size_quad,                                                      \
+      const uint32_t key_offset,                                                         \
+      const bool min_heap,                                                               \
+      const bool has_null,                                                               \
+      const bool nulls_first,                                                            \
+      const key_type null_key,                                                           \
+      const key_type curr_key) {                                                         \
+    return get_bin_from_k_heap_impl(heaps,                                               \
+                                    k,                                                   \
+                                    row_size_quad,                                       \
+                                    key_offset,                                          \
+                                    min_heap,                                            \
+                                    has_null,                                            \
+                                    nulls_first,                                         \
+                                    null_key,                                            \
+                                    curr_key);                                           \
   }
 
 DEF_GET_BIN_FROM_K_HEAP(int32_t)

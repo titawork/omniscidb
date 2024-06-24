@@ -1,5 +1,5 @@
 /*
- * Copyright 2018, OmniSci, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,33 +14,35 @@
  * limitations under the License.
  */
 
-#include <glog/logging.h>
 #include <gtest/gtest.h>
+#include <boost/filesystem.hpp>
 #include <boost/program_options.hpp>
 
 #include <thrift/Thrift.h>
 #include <thrift/protocol/TBinaryProtocol.h>
-#include <thrift/protocol/TJSONProtocol.h>
-#include <thrift/transport/TBufferTransports.h>
-#include <thrift/transport/TSocket.h>
 
 using namespace ::apache::thrift;
 using namespace ::apache::thrift::protocol;
 using namespace ::apache::thrift::transport;
 
 #include "QueryEngine/TargetValue.h"
+#include "Shared/SysDefinitions.h"
 #include "Shared/ThriftClient.h"
 #include "Shared/sqltypes.h"
-#include "gen-cpp/MapD.h"
+#include "TestHelpers.h"
+#include "gen-cpp/Heavy.h"
 
+#include <algorithm>
 #include <ctime>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 
 // uncomment to run full test suite
 // #define RUN_ALL_TEST
 
 TSessionId g_session_id;
-std::shared_ptr<MapDClient> g_client;
+std::shared_ptr<HeavyClient> g_client;
 
 template <typename RETURN_TYPE, typename SOURCE_TYPE>
 bool checked_get(size_t row,
@@ -327,11 +329,17 @@ class DateTimeColumnDescriptor : public TestColumnDescriptor {
   }
 
   std::string getValueAsString(int row) {
-    std::tm tm_struct;
-    time_t t = offset + (scale * row);
-    gmtime_r(&t, &tm_struct);
     char buf[128];
+    time_t t = offset + (scale * row);
+#ifdef _WIN32
+    // On Windows gmtime is thread safe.
+    auto* tm_struct = gmtime(&t);
+    strftime(buf, 128, format.c_str(), tm_struct);
+#else
+    std::tm tm_struct;
+    gmtime_r(&t, &tm_struct);
     strftime(buf, 128, format.c_str(), &tm_struct);
+#endif
     return std::string(buf);
   }
 };
@@ -631,7 +639,8 @@ TEST(Ctas, SyntaxCheck) {
   run_ddl_statement(ddl);
 }
 
-TEST_P(Ctas, CreateTableAsSelect) {
+void ctasTestBody(std::vector<std::shared_ptr<TestColumnDescriptor>>& columnDescriptors,
+                  std::string sourcePartitionScheme = ")") {
   run_ddl_statement("DROP TABLE IF EXISTS CTAS_SOURCE;");
   run_ddl_statement("DROP TABLE IF EXISTS CTAS_TARGET;");
 
@@ -645,7 +654,7 @@ TEST_P(Ctas, CreateTableAsSelect) {
 
     create_sql += ", col_" + std::to_string(col) + " " + tcd->get_column_definition();
   }
-  create_sql += ");";
+  create_sql += sourcePartitionScheme + ";";
 
   LOG(INFO) << create_sql;
 
@@ -713,7 +722,98 @@ TEST_P(Ctas, CreateTableAsSelect) {
   }
 }
 
+TEST_P(Ctas, CreateTableFromSelect) {
+  ctasTestBody(columnDescriptors, ")");
+}
+
+TEST_P(Ctas, CreateTableFromSelectFragments) {
+  ctasTestBody(columnDescriptors, ") WITH (FRAGMENT_SIZE=3)");
+}
+
+TEST_P(Ctas, CreateTableFromSelectReplicated) {
+  ctasTestBody(columnDescriptors, ") WITH (FRAGMENT_SIZE=3, partitions='REPLICATED')");
+}
+
+TEST_P(Ctas, CreateTableFromSelectSharded) {
+  ctasTestBody(
+      columnDescriptors,
+      ", SHARD KEY (id)) WITH (FRAGMENT_SIZE=3, shard_count = 4, partitions='SHARDED')");
+}
+
+void exportTestBody(std::string sourcePartitionScheme = ")") {
+  run_ddl_statement("DROP TABLE IF EXISTS EXPORT_SOURCE;");
+
+  std::string create_sql =
+      "CREATE TABLE EXPORT_SOURCE ( id int, val int " + sourcePartitionScheme + ";";
+  LOG(INFO) << create_sql;
+
+  run_ddl_statement(create_sql);
+
+  size_t num_rows = 25;
+  std::vector<std::string> expected_rows;
+
+  // fill source table
+  for (unsigned int row = 0; row < num_rows; row++) {
+    std::string insert_sql = "INSERT INTO EXPORT_SOURCE VALUES (" + std::to_string(row) +
+                             "," + std::to_string(row) + ");";
+    expected_rows.push_back(std::to_string(row) + "," + std::to_string(row));
+
+    run_multiple_agg(insert_sql);
+  }
+
+  boost::filesystem::path temp =
+      boost::filesystem::temp_directory_path() / boost::filesystem::unique_path();
+
+  std::string export_file_name = temp.make_preferred().string() + ".csv";
+
+  // execute CTAS
+  std::string export_sql = "COPY (SELECT * FROM EXPORT_SOURCE) TO '" + export_file_name +
+                           "' with (header='false', quoted='false');";
+  LOG(INFO) << export_sql;
+
+  run_ddl_statement(export_sql);
+
+  std::ifstream export_file(export_file_name);
+
+  std::vector<std::string> exported_rows;
+
+  std::copy(std::istream_iterator<std::string>(export_file),
+            std::istream_iterator<std::string>(),
+            std::back_inserter(exported_rows));
+
+  export_file.close();
+  remove(export_file_name.c_str());
+
+  std::sort(exported_rows.begin(), exported_rows.end());
+  std::sort(expected_rows.begin(), expected_rows.end());
+
+  ASSERT_EQ(expected_rows.size(), num_rows);
+  ASSERT_EQ(exported_rows.size(), num_rows);
+
+  for (unsigned int row = 0; row < num_rows; row++) {
+    ASSERT_EQ(exported_rows[row], expected_rows[row]);
+  }
+}
+
+TEST(Export, ExportFromSelect) {
+  exportTestBody(")");
+}
+
+TEST(Export, ExportFromSelectFragments) {
+  exportTestBody(") WITH (FRAGMENT_SIZE=3)");
+}
+
+TEST(Export, ExportFromSelectReplicated) {
+  exportTestBody(") WITH (FRAGMENT_SIZE=3, partitions='REPLICATED')");
+}
+
+TEST(Export, ExportFromSelectSharded) {
+  exportTestBody(
+      ", SHARD KEY (id)) WITH (FRAGMENT_SIZE=3, shard_count = 4, partitions='SHARDED')");
+}
+
 void itasTestBody(std::vector<std::shared_ptr<TestColumnDescriptor>>& columnDescriptors,
+                  std::string sourcePartitionScheme = ")",
                   std::string targetPartitionScheme = ")") {
   run_ddl_statement("DROP TABLE IF EXISTS ITAS_SOURCE;");
   run_ddl_statement("DROP TABLE IF EXISTS ITAS_TARGET;");
@@ -732,7 +832,7 @@ void itasTestBody(std::vector<std::shared_ptr<TestColumnDescriptor>>& columnDesc
     create_target_sql +=
         ", col_" + std::to_string(col) + " " + tcd->get_column_definition();
   }
-  create_source_sql += ");";
+  create_source_sql += sourcePartitionScheme + ";";
   create_target_sql += targetPartitionScheme + ";";
 
   LOG(INFO) << create_source_sql;
@@ -796,16 +896,65 @@ void itasTestBody(std::vector<std::shared_ptr<TestColumnDescriptor>>& columnDesc
 }
 
 TEST_P(Itas, InsertIntoTableFromSelect) {
-  itasTestBody(columnDescriptors, ")");
+  itasTestBody(columnDescriptors, ")", ")");
+}
+
+TEST_P(Itas, InsertIntoTableFromSelectFragments) {
+  itasTestBody(columnDescriptors, ") WITH (FRAGMENT_SIZE=3)", ")");
+}
+
+TEST_P(Itas, InsertIntoFragmentsTableFromSelect) {
+  itasTestBody(columnDescriptors, ")", ") WITH (FRAGMENT_SIZE=3)");
+}
+
+TEST_P(Itas, InsertIntoFragmentsTableFromSelectFragments) {
+  itasTestBody(columnDescriptors, ") WITH (FRAGMENT_SIZE=3)", ") WITH (FRAGMENT_SIZE=3)");
 }
 
 TEST_P(Itas, InsertIntoTableFromSelectReplicated) {
-  itasTestBody(columnDescriptors, ") WITH (partitions='REPLICATED')");
+  itasTestBody(
+      columnDescriptors, ") WITH (FRAGMENT_SIZE=3, partitions='REPLICATED')", ")");
 }
 
 TEST_P(Itas, InsertIntoTableFromSelectSharded) {
+  itasTestBody(
+      columnDescriptors,
+      ", SHARD KEY (id)) WITH (FRAGMENT_SIZE=3, shard_count = 4, partitions='SHARDED')",
+      ")");
+}
+
+TEST_P(Itas, InsertIntoReplicatedTableFromSelect) {
+  itasTestBody(columnDescriptors, ")", ") WITH (partitions='REPLICATED')");
+}
+
+TEST_P(Itas, InsertIntoShardedTableFromSelect) {
   itasTestBody(columnDescriptors,
+               ")",
                ", SHARD KEY (id)) WITH (shard_count = 4, partitions='SHARDED')");
+}
+
+TEST_P(Itas, InsertIntoReplicatedTableFromSelectReplicated) {
+  itasTestBody(columnDescriptors,
+               ") WITH (partitions='REPLICATED')",
+               ") WITH (partitions='REPLICATED')");
+}
+
+TEST_P(Itas, InsertIntoReplicatedTableFromSelectSharded) {
+  itasTestBody(columnDescriptors,
+               ") WITH (partitions='REPLICATED')",
+               ", SHARD KEY (id)) WITH (shard_count = 4, partitions='SHARDED')");
+}
+
+TEST_P(Itas, InsertIntoShardedTableFromSelectSharded) {
+  itasTestBody(columnDescriptors,
+               ", SHARD KEY (id)) WITH (shard_count = 4, partitions='SHARDED')",
+               ", SHARD KEY (id)) WITH (shard_count = 4, partitions='SHARDED')");
+}
+
+TEST_P(Itas, InsertIntoShardedTableFromSelectReplicated) {
+  itasTestBody(columnDescriptors,
+               ", SHARD KEY (id)) WITH (shard_count = 4, partitions='SHARDED')",
+               ") WITH (partitions='REPLICATED')");
 }
 
 const std::shared_ptr<TestColumnDescriptor> STRING_NONE_BASE =
@@ -816,24 +965,24 @@ const std::shared_ptr<TestColumnDescriptor> STRING_NONE_BASE =
 #ifdef RUN_ALL_TEST
 
 #define INSTANTIATE_DATA_INGESTION_TEST(CDT)                                           \
-  INSTANTIATE_TEST_CASE_P(                                                             \
+  INSTANTIATE_TEST_SUITE_P(                                                            \
       CDT,                                                                             \
       Ctas,                                                                            \
       testing::Values(std::vector<std::shared_ptr<TestColumnDescriptor>>{CDT}));       \
-  INSTANTIATE_TEST_CASE_P(                                                             \
+  INSTANTIATE_TEST_SUITE_P(                                                            \
       CDT,                                                                             \
       Itas,                                                                            \
       testing::Values(std::vector<std::shared_ptr<TestColumnDescriptor>>{CDT}));       \
-  INSTANTIATE_TEST_CASE_P(                                                             \
+  INSTANTIATE_TEST_SUITE_P(                                                            \
       CDT,                                                                             \
       Update,                                                                          \
       testing::Values(std::vector<std::shared_ptr<TestColumnDescriptor>>{CDT}));       \
-  INSTANTIATE_TEST_CASE_P(                                                             \
+  INSTANTIATE_TEST_SUITE_P(                                                            \
       VARLEN_TEXT_AND_##CDT,                                                           \
       Update,                                                                          \
       testing::Values(                                                                 \
           std::vector<std::shared_ptr<TestColumnDescriptor>>{STRING_NONE_BASE, CDT})); \
-  INSTANTIATE_TEST_CASE_P(                                                             \
+  INSTANTIATE_TEST_SUITE_P(                                                            \
       CDT##_AND_VARLEN_TEXT,                                                           \
       Update,                                                                          \
       testing::Values(                                                                 \
@@ -986,7 +1135,7 @@ const std::shared_ptr<TestColumnDescriptor> GEO_MULTI_POLYGON =
         new GeoMultiPolygonColumnDescriptor(kMULTIPOLYGON));
 INSTANTIATE_DATA_INGESTION_TEST(GEO_MULTI_POLYGON);
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     MIXED_NO_GEO,
     Ctas,
     testing::Values(std::vector<std::shared_ptr<TestColumnDescriptor>>{BOOLEAN,
@@ -1005,7 +1154,7 @@ INSTANTIATE_TEST_CASE_P(
                                                                        DATE,
                                                                        TIMESTAMP}));
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     MIXED_NO_GEO,
     Itas,
     testing::Values(std::vector<std::shared_ptr<TestColumnDescriptor>>{BOOLEAN,
@@ -1024,7 +1173,7 @@ INSTANTIATE_TEST_CASE_P(
                                                                        DATE,
                                                                        TIMESTAMP}));
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     MIXED_WITH_GEO,
     Update,
     testing::Values(std::vector<std::shared_ptr<TestColumnDescriptor>>{TEXT,
@@ -1039,10 +1188,10 @@ INSTANTIATE_TEST_CASE_P(
 
 int main(int argc, char* argv[]) {
   int err = 0;
+  TestHelpers::init_logger_stderr_only(argc, argv);
 
   try {
     testing::InitGoogleTest(&argc, argv);
-    google::InitGoogleLogging(argv[0]);
 
     namespace po = boost::program_options;
 
@@ -1056,9 +1205,9 @@ int main(int argc, char* argv[]) {
     int port = 6274;
     std::string cert = "";
 
-    std::string user = "admin";
-    std::string pwd = "HyperInteractive";
-    std::string db = "omnisci";
+    auto user = shared::kRootUsername;
+    auto pwd = shared::kDefaultRootPasswd;
+    auto db = shared::kDefaultDbName;
 
     desc.add_options()(
         "host",
@@ -1082,15 +1231,26 @@ int main(int argc, char* argv[]) {
     desc.add_options()("db",
                        po::value<std::string>(&db)->default_value(db)->implicit_value(db),
                        "db to connect to");
+    desc.add_options()("test-help",
+                       "Print all CtasIntegrationTest specific options (for gtest "
+                       "options use `--help`).");
 
     po::variables_map vm;
     po::store(po::command_line_parser(argc, argv).options(desc).run(), vm);
     po::notify(vm);
 
-    auto transport = openBufferedClientTransport(host, port, cert);
+    if (vm.count("test-help")) {
+      std::cout << "Usage: CtasIntegrationTest" << std::endl << std::endl;
+      std::cout << desc << std::endl;
+      return 0;
+    }
+
+    std::shared_ptr<ThriftClientConnection> connMgr;
+    connMgr = std::make_shared<ThriftClientConnection>();
+    auto transport = connMgr->open_buffered_client_transport(host, port, cert);
     transport->open();
     auto protocol = std::make_shared<TBinaryProtocol>(transport);
-    g_client = std::make_shared<MapDClient>(protocol);
+    g_client = std::make_shared<HeavyClient>(protocol);
 
     g_client->connect(g_session_id, user, pwd, db);
 

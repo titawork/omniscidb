@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -40,6 +40,8 @@
 
 #ifdef __CUDACC__
 #define FORCE_INLINE __forceinline__
+#elif defined(_WIN32)
+#define FORCE_INLINE __forceinline
 #else
 #define FORCE_INLINE inline __attribute__((always_inline))
 #endif
@@ -47,12 +49,18 @@
 #if defined(__CUDACC__) || (defined(__GNUC__) && defined(__SANITIZE_THREAD__)) || \
     defined(WITH_JIT_DEBUG)
 #define ALWAYS_INLINE
+#elif defined(ENABLE_EMBEDDED_DATABASE) && !defined(_WIN32)
+#define ALWAYS_INLINE __attribute__((inline)) __attribute__((__visibility__("protected")))
+#elif defined(_WIN32)
+#define ALWAYS_INLINE __inline
 #else
 #define ALWAYS_INLINE __attribute__((always_inline))
 #endif
 
 #ifdef __CUDACC__
 #define NEVER_INLINE
+#elif defined(_WIN32)
+#define NEVER_INLINE __declspec(noinline)
 #else
 #define NEVER_INLINE __attribute__((noinline))
 #endif
@@ -61,4 +69,10 @@
 #define SUFFIX(name) name##_gpu
 #else
 #define SUFFIX(name) name
+#endif
+
+#ifdef _WIN32
+#define RUNTIME_EXPORT __declspec(dllexport)
+#else
+#define RUNTIME_EXPORT
 #endif

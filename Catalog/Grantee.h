@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,18 +19,18 @@
 
 #include "DBObject.h"
 
-#include <glog/logging.h>
 #include <boost/algorithm/string.hpp>
 #include <boost/make_unique.hpp>
 #include <map>
 #include <string>
 #include <unordered_set>
+#include "Logger/Logger.h"
 
 class User;
 class Role;
 
 class Grantee {
-  typedef std::map<DBObjectKey, std::unique_ptr<DBObject>> DBObjectMap;
+  using DBObjectMap = std::map<DBObjectKey, std::unique_ptr<DBObject>>;
 
  public:
   Grantee(const std::string& name);
@@ -51,12 +51,17 @@ class Grantee {
   bool hasAnyPrivilegesOnDb(int32_t dbId, bool only_direct) const;
   const std::string& getName() const { return name_; }
   void setName(const std::string& name) { name_ = name; }
-  std::vector<std::string> getRoles() const;
+  std::vector<std::string> getRoles(bool only_direct = true) const;
   bool hasRole(Role* role, bool only_direct) const;
   const DBObjectMap* getDbObjects(bool only_direct) const {
     return only_direct ? &directPrivileges_ : &effectivePrivileges_;
   }
   void checkCycles(Role* newRole);
+
+  void reassignObjectOwners(const std::set<int32_t>& old_owner_ids,
+                            int32_t new_owner_id,
+                            int32_t db_id);
+  void reassignObjectOwner(DBObjectKey& object_key, int32_t new_owner_id);
 
  protected:
   std::string name_;

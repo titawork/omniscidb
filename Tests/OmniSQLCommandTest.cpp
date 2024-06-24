@@ -1,8 +1,25 @@
+/*
+ * Copyright 2022 HEAVY.AI, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #include "../SQLFrontend/CommandFunctors.h"
 #include "../SQLFrontend/CommandResolutionChain.h"
 #include "../SQLFrontend/MetaClientContext.h"
 #include "../SQLFrontend/ThriftOps.h"
-#include "../gen-cpp/mapd_types.h"
+#include "../Shared/StringTransform.h"
+#include "../gen-cpp/heavy_types.h"
 #include "gtest/gtest.h"
 
 #include <boost/interprocess/sync/file_lock.hpp>
@@ -25,6 +42,7 @@ struct CoreMockTransport {
 // clang-format off
 class CoreMockClient {
  public:
+  MockMethod(krb5_connect)
   MockMethod(connect)
   MockMethod(disconnect)
   MockMethod(switch_database)
@@ -709,7 +727,7 @@ TEST(OmniSQLTest, ImportDashboardCommandTest_SimpleDashSimpleFilename) {
   ImportDashboardCommandMockupContext unit_test_context;
   auto resolution =
       CommandResolutionChain<>(
-          "\\import_dashboard simpledash unlikely_file_to_over_be_opened_1234.txt",
+          "\\import_dashboard simpledash unlikely_file_to_ever_be_opened_1234.txt",
           "\\import_dashboard",
           3,
           3,
@@ -727,7 +745,7 @@ TEST(OmniSQLTest, ImportDashboardCommandTest_SimpleDashSimpleFilename) {
   auto extracted_tokens = TokenExtractor().extract_tokens(output_back_to_input);
   using TokenCount = decltype(extracted_tokens)::size_type;
   EXPECT_EQ(extracted_tokens.size(), 5u);
-  EXPECT_EQ(extracted_tokens[4], "`unlikely_file_to_over_be_opened_1234.txt`");
+  EXPECT_EQ(extracted_tokens[4], "`unlikely_file_to_ever_be_opened_1234.txt`");
 }
 
 TEST(OmniSQLTest, ImportDashboardCommandTest_SimpleDashComplexFilename) {
@@ -860,10 +878,14 @@ TEST(OmniSQLTest, ExportDashboardCommandTest_SimpleDashSimpleFilename) {
   using TokenExtractor = UnitTestOutputTokenizer<std::vector<std::string>>;
 
   // Create a directory to force file open to fail
-  static const char* test_filename = "export_unlikely_file_to_over_be_opened_1234.txt";
+  static const char* test_filename = "export_unlikely_file_to_ever_be_opened_1234.txt";
   std::string fake_input = std::string("\\export_dashboard simpledash ") + test_filename;
 
+#ifdef _WIN32
+  auto result = mkdir(test_filename);
+#else
   auto result = mkdir(test_filename, 0700);
+#endif
   EXPECT_EQ(result, 0);
 
   std::ostringstream test_capture_stream;
@@ -877,7 +899,7 @@ TEST(OmniSQLTest, ExportDashboardCommandTest_SimpleDashSimpleFilename) {
                                test_capture_stream)
           .is_resolved();
 
-  result = rmdir(test_filename);
+  result = ::rmdir(test_filename);
   EXPECT_EQ(result, 0);
 
   EXPECT_TRUE(resolution);

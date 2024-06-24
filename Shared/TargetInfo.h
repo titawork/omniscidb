@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,16 +16,17 @@
 
 /**
  * @file    TargetInfo.h
- * @author  Alex Suhan <alex@mapd.com>
+ * @brief
+ *
  */
 
 #ifndef QUERYENGINE_TARGETINFO_H
 #define QUERYENGINE_TARGETINFO_H
 
+#include "Analyzer/Analyzer.h"
+#include "misc.h"
 #include "sqldefs.h"
 #include "sqltypes.h"
-
-#include "../Analyzer/Analyzer.h"
 
 inline const Analyzer::AggExpr* cast_to_agg_expr(const Analyzer::Expr* target_expr) {
   return dynamic_cast<const Analyzer::AggExpr*>(target_expr);
@@ -36,6 +37,15 @@ inline const Analyzer::AggExpr* cast_to_agg_expr(
   return dynamic_cast<const Analyzer::AggExpr*>(target_expr.get());
 }
 
+inline bool target_expr_has_varlen_projection(const Analyzer::Expr* target_expr) {
+  return !(dynamic_cast<const Analyzer::GeoExpr*>(target_expr) == nullptr);
+}
+
+inline bool target_expr_has_varlen_projection(
+    const std::shared_ptr<Analyzer::Expr> target_expr) {
+  return !(dynamic_cast<const Analyzer::GeoExpr*>(target_expr.get()) == nullptr);
+}
+
 struct TargetInfo {
   bool is_agg;
   SQLAgg agg_kind;
@@ -43,74 +53,50 @@ struct TargetInfo {
   SQLTypeInfo agg_arg_type;
   bool skip_null_val;
   bool is_distinct;
+  bool is_varlen_projection;
+#ifndef __CUDACC__
+ public:
+  inline std::string toString() const {
+    auto result = std::string("TargetInfo(");
+    result += "is_agg=" + std::string(is_agg ? "true" : "false") + ", ";
+    if (is_agg) {
+      result += "agg_kind=" + ::toString(agg_kind) + ", ";
+    }
+    result += "sql_type=" + sql_type.to_string() + ", ";
+    if (is_agg) {
+      result += "agg_arg_type=" + agg_arg_type.to_string() + ", ";
+    }
+    result += "skip_null_val=" + std::string(skip_null_val ? "true" : "false") + ", ";
+    result += "is_distinct=" + std::string(is_distinct ? "true" : "false") + ", ";
+    result +=
+        "is_varlen_projection=" + std::string(is_varlen_projection ? "true" : "false") +
+        ")";
+    return result;
+  }
+#endif
 };
 
 /**
  * Returns true if the aggregate function always returns a value in the domain of the
  * argument. Returns false otherwise.
  */
-inline bool is_agg_domain_range_equivalent(const SQLAgg& agg_kind) {
-  switch (agg_kind) {
-    case kMIN:
-    case kMAX:
-    case kSAMPLE:
-      return true;
-    default:
-      break;
-  }
-  return false;
+inline bool is_agg_domain_range_equivalent(const SQLAgg agg_kind) {
+  return shared::is_any<kMIN, kMAX, kSINGLE_VALUE, kSAMPLE, kMODE, kCOUNT_IF>(agg_kind);
 }
 
-template <class PointerType>
-inline TargetInfo get_target_info(const PointerType target_expr,
+namespace target_info {
+TargetInfo get_target_info_impl(const Analyzer::Expr* target_expr,
+                                const bool bigint_count);
+}
+
+inline TargetInfo get_target_info(const Analyzer::Expr* target_expr,
                                   const bool bigint_count) {
-  const auto agg_expr = cast_to_agg_expr(target_expr);
-  bool notnull = target_expr->get_type_info().get_notnull();
-  if (!agg_expr) {
-    auto target_ti = target_expr ? get_logical_type_info(target_expr->get_type_info())
-                                 : SQLTypeInfo(kBIGINT, notnull);
-    return {false, kMIN, target_ti, SQLTypeInfo(kNULLT, false), false, false};
-  }
-  const auto agg_type = agg_expr->get_aggtype();
-  const auto agg_arg = agg_expr->get_arg();
-  if (!agg_arg) {
-    CHECK_EQ(kCOUNT, agg_type);
-    CHECK(!agg_expr->get_is_distinct());
-    return {true,
-            kCOUNT,
-            SQLTypeInfo(bigint_count ? kBIGINT : kINT, notnull),
-            SQLTypeInfo(kNULLT, false),
-            false,
-            false};
-  }
+  return target_info::get_target_info_impl(target_expr, bigint_count);
+}
 
-  const auto& agg_arg_ti = agg_arg->get_type_info();
-  bool is_distinct{false};
-  if (agg_expr->get_aggtype() == kCOUNT) {
-    is_distinct = agg_expr->get_is_distinct();
-  }
-
-  if (agg_type == kAVG) {
-    // Upcast the target type for AVG, so that the integer argument does not overflow the
-    // sum
-    return {true,
-            agg_expr->get_aggtype(),
-            agg_arg_ti.is_integer() ? SQLTypeInfo(kBIGINT, agg_arg_ti.get_notnull())
-                                    : agg_arg_ti,
-            agg_arg_ti,
-            !agg_arg_ti.get_notnull(),
-            is_distinct};
-  }
-
-  return {
-      true,
-      agg_expr->get_aggtype(),
-      agg_type == kCOUNT
-          ? SQLTypeInfo((is_distinct || bigint_count) ? kBIGINT : kINT, notnull)
-          : agg_expr->get_type_info(),
-      agg_arg_ti,
-      agg_type == kCOUNT && agg_arg_ti.is_varlen() ? false : !agg_arg_ti.get_notnull(),
-      is_distinct};
+inline TargetInfo get_target_info(const std::shared_ptr<Analyzer::Expr> target_expr,
+                                  const bool bigint_count) {
+  return target_info::get_target_info_impl(target_expr.get(), bigint_count);
 }
 
 inline bool is_distinct_target(const TargetInfo& target_info) {
@@ -118,10 +104,9 @@ inline bool is_distinct_target(const TargetInfo& target_info) {
 }
 
 inline bool takes_float_argument(const TargetInfo& target_info) {
-  return target_info.is_agg &&
-         (target_info.agg_kind == kAVG || target_info.agg_kind == kSUM ||
-          target_info.agg_kind == kMIN || target_info.agg_kind == kMAX) &&
-         target_info.agg_arg_type.get_type() == kFLOAT;
+  return target_info.is_agg && target_info.agg_arg_type.get_type() == kFLOAT &&
+         shared::is_any<kAVG, kSUM, kSUM_IF, kMIN, kMAX, kSINGLE_VALUE, kMODE>(
+             target_info.agg_kind);
 }
 
 #endif  // QUERYENGINE_TARGETINFO_H

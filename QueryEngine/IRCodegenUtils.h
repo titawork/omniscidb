@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,10 +16,21 @@
 
 #pragma once
 
-#include <glog/logging.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/LLVMContext.h>
+#include <llvm/IR/Module.h>
 #include <llvm/IR/Type.h>
+#include <llvm/Support/raw_os_ostream.h>
+
+#include "Logger/Logger.h"
+
+#if LLVM_VERSION_MAJOR >= 10
+#define LLVM_ALIGN(alignment) llvm::Align(alignment)
+#define LLVM_MAYBE_ALIGN(alignment) llvm::MaybeAlign(alignment)
+#else
+#define LLVM_ALIGN(alignment) alignment
+#define LLVM_MAYBE_ALIGN(alignment) alignment
+#endif
 
 inline llvm::ArrayType* get_int_array_type(int const width,
                                            int count,
@@ -50,18 +61,18 @@ inline llvm::VectorType* get_int_vector_type(int const width,
                                              llvm::LLVMContext& context) {
   switch (width) {
     case 64:
-      return llvm::VectorType::get(llvm::Type::getInt64Ty(context), count);
+      return llvm::VectorType::get(llvm::Type::getInt64Ty(context), count, false);
     case 32:
-      return llvm::VectorType::get(llvm::Type::getInt32Ty(context), count);
+      return llvm::VectorType::get(llvm::Type::getInt32Ty(context), count, false);
       break;
     case 16:
-      return llvm::VectorType::get(llvm::Type::getInt16Ty(context), count);
+      return llvm::VectorType::get(llvm::Type::getInt16Ty(context), count, false);
       break;
     case 8:
-      return llvm::VectorType::get(llvm::Type::getInt8Ty(context), count);
+      return llvm::VectorType::get(llvm::Type::getInt8Ty(context), count, false);
       break;
     case 1:
-      return llvm::VectorType::get(llvm::Type::getInt1Ty(context), count);
+      return llvm::VectorType::get(llvm::Type::getInt1Ty(context), count, false);
       break;
     default:
       LOG(FATAL) << "Unsupported integer width: " << width;
@@ -88,7 +99,48 @@ inline llvm::Type* get_int_type(const int width, llvm::LLVMContext& context) {
     default:
       LOG(FATAL) << "Unsupported integer width: " << width;
   }
-  CHECK(false);
+  UNREACHABLE();
+  return nullptr;
+}
+
+inline llvm::Type* get_fp_type(const int width, llvm::LLVMContext& context) {
+  switch (width) {
+    case 64:
+      return llvm::Type::getDoubleTy(context);
+    case 32:
+      return llvm::Type::getFloatTy(context);
+    default:
+      LOG(FATAL) << "Unsupported floating point width: " << width;
+  }
+  UNREACHABLE();
+  return nullptr;
+}
+
+inline llvm::Type* get_fp_ptr_type(const int width, llvm::LLVMContext& context) {
+  switch (width) {
+    case 64:
+      return llvm::Type::getDoublePtrTy(context);
+    case 32:
+      return llvm::Type::getFloatPtrTy(context);
+  }
+  UNREACHABLE();
+  return nullptr;
+}
+
+inline llvm::Type* get_int_ptr_type(const int width, llvm::LLVMContext& context) {
+  switch (width) {
+    case 64:
+      return llvm::Type::getInt64PtrTy(context);
+    case 32:
+      return llvm::Type::getInt32PtrTy(context);
+    case 16:
+      return llvm::Type::getInt16PtrTy(context);
+    case 8:
+      return llvm::Type::getInt8PtrTy(context);
+    case 1:
+      return llvm::Type::getInt1PtrTy(context);
+  }
+  UNREACHABLE();
   return nullptr;
 }
 
@@ -102,3 +154,14 @@ inline llvm::ConstantInt* ll_bool(const bool v, llvm::LLVMContext& context) {
   return static_cast<llvm::ConstantInt*>(
       llvm::ConstantInt::get(get_int_type(1, context), v));
 }
+
+template <class T>
+std::string serialize_llvm_object(const T* llvm_obj) {
+  std::string str;
+  llvm::raw_string_ostream os(str);
+  os << *llvm_obj;
+  os.flush();
+  return str;
+}
+
+void verify_function_ir(const llvm::Function* func);

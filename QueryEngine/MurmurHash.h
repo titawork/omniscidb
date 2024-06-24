@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,12 +20,13 @@
 #include <cstdint>
 #include "../Shared/funcannotations.h"
 
-extern "C" NEVER_INLINE DEVICE uint32_t MurmurHash1(const void* key,
-                                                    int len,
-                                                    const uint32_t seed);
+extern "C" RUNTIME_EXPORT NEVER_INLINE DEVICE RUNTIME_EXPORT uint32_t
+MurmurHash1(const void* key, int len, const uint32_t seed);
 
-extern "C" NEVER_INLINE DEVICE uint64_t MurmurHash64A(const void* key,
-                                                      int len,
-                                                      uint64_t seed);
+extern "C" RUNTIME_EXPORT NEVER_INLINE DEVICE RUNTIME_EXPORT uint64_t
+MurmurHash64A(const void* key, int len, uint64_t seed);
+
+extern "C" RUNTIME_EXPORT NEVER_INLINE DEVICE RUNTIME_EXPORT uint32_t
+MurmurHash3(const void* key, int len, const uint32_t seed);
 
 #endif  // QUERYENGINE_MURMURHASH_H

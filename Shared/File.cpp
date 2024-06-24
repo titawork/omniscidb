@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,41 +16,58 @@
 
 /**
  * @file    File.cpp
- * @author  Steven Stewart <steve@map-d.com>
  * @brief   Implementation of helper methods for File I/O.
  *
  */
-#include "File.h"
-#include <glog/logging.h>
-#include <unistd.h>
-#include <boost/filesystem.hpp>
+
+#include "Shared/File.h"
+
+#include <algorithm>
+#include <atomic>
+#include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 
+#include "Logger/Logger.h"
+#include "OSDependent/heavyai_fs.h"
+
+#include <boost/filesystem.hpp>
+
 namespace File_Namespace {
 
-FILE* create(const std::string& basePath,
-             const int fileId,
-             const size_t pageSize,
-             const size_t numPages) {
-  std::string path(basePath + "/" + std::to_string(fileId) + "." +
-                   std::to_string(pageSize) +
-                   std::string(MAPD_FILE_EXT));  // MAPD_FILE_EXT has preceding "."
+std::string get_data_file_path(const std::string& base_path,
+                               int file_id,
+                               size_t page_size) {
+  return base_path + "/" + std::to_string(file_id) + "." + std::to_string(page_size) +
+         std::string(DATA_FILE_EXT);  // DATA_FILE_EXT has preceding "."
+}
+
+std::string get_legacy_data_file_path(const std::string& new_data_file_path) {
+  auto legacy_path = boost::filesystem::canonical(new_data_file_path);
+  legacy_path.replace_extension(kLegacyDataFileExtension);
+  return legacy_path.string();
+}
+
+std::pair<FILE*, std::string> create(const std::string& basePath,
+                                     const int fileId,
+                                     const size_t pageSize,
+                                     const size_t numPages) {
+  auto path = get_data_file_path(basePath, fileId, pageSize);
   if (numPages < 1 || pageSize < 1) {
     LOG(FATAL) << "Error trying to create file '" << path
                << "', Number of pages and page size must be positive integers. numPages "
                << numPages << " pageSize " << pageSize;
   }
-  FILE* f = fopen(path.c_str(), "w+b");
+  FILE* f = heavyai::fopen(path.c_str(), "w+b");
   if (f == nullptr) {
     LOG(FATAL) << "Error trying to create file '" << path
                << "', the error was: " << std::strerror(errno);
-    ;
   }
-  fseek(f, (pageSize * numPages) - 1, SEEK_SET);
+  fseek(f, static_cast<long>((pageSize * numPages) - 1), SEEK_SET);
   fputc(EOF, f);
   fseek(f, 0, SEEK_SET);  // rewind
   if (fileSize(f) != pageSize * numPages) {
@@ -58,40 +75,35 @@ FILE* create(const std::string& basePath,
                << fileSize(f) << " does not equal pageSize * numPages "
                << pageSize * numPages;
   }
-
-  return f;
+  boost::filesystem::create_symlink(boost::filesystem::canonical(path).filename(),
+                                    get_legacy_data_file_path(path));
+  return {f, path};
 }
 
-FILE* create(const std::string& fullPath, const size_t requestedFileSize) {
-  FILE* f = fopen(fullPath.c_str(), "w+b");
+FILE* create(const std::string& full_path, const size_t requested_file_size) {
+  FILE* f = heavyai::fopen(full_path.c_str(), "w+b");
   if (f == nullptr) {
-    LOG(FATAL) << "Error trying to create file '" << fullPath
+    LOG(FATAL) << "Error trying to create file '" << full_path
                << "', the error was:  " << std::strerror(errno);
-    ;
   }
-  fseek(f, requestedFileSize - 1, SEEK_SET);
+  fseek(f, static_cast<long>(requested_file_size - 1), SEEK_SET);
   fputc(EOF, f);
   fseek(f, 0, SEEK_SET);  // rewind
-  if (fileSize(f) != requestedFileSize) {
-    LOG(FATAL) << "Error trying to create file '" << fullPath << "', file size "
-               << fileSize(f) << " does not equal requestedFileSize "
-               << requestedFileSize;
+  if (fileSize(f) != requested_file_size) {
+    LOG(FATAL) << "Error trying to create file '" << full_path << "', file size "
+               << fileSize(f) << " does not equal requested_file_size "
+               << requested_file_size;
   }
   return f;
 }
 
-FILE* open(int fileId) {
-  std::string s(std::to_string(fileId) + std::string(MAPD_FILE_EXT));
-  FILE* f = fopen(s.c_str(), "r+b");  // opens existing file for updates
-  if (f == nullptr) {
-    LOG(FATAL) << "Error trying to open file '" << s
-               << "', the error was: " << std::strerror(errno);
-  }
-  return f;
+FILE* open(int file_id) {
+  std::string s(std::to_string(file_id) + std::string(DATA_FILE_EXT));
+  return open(s);
 }
 
 FILE* open(const std::string& path) {
-  FILE* f = fopen(path.c_str(), "r+b");  // opens existing file for updates
+  FILE* f = heavyai::fopen(path.c_str(), "r+b");
   if (f == nullptr) {
     LOG(FATAL) << "Error trying to open file '" << path
                << "', the errno was: " << std::strerror(errno);
@@ -105,22 +117,32 @@ void close(FILE* f) {
   CHECK_EQ(fclose(f), 0);
 }
 
-bool removeFile(const std::string basePath, const std::string filename) {
-  const std::string filePath = basePath + filename;
-  return remove(filePath.c_str()) == 0;
+bool removeFile(const std::string& base_path, const std::string& filename) {
+  const std::string file_path = base_path + filename;
+  return remove(file_path.c_str()) == 0;
 }
 
-size_t read(FILE* f, const size_t offset, const size_t size, int8_t* buf) {
+size_t read(FILE* f,
+            const size_t offset,
+            const size_t size,
+            int8_t* buf,
+            const std::string& file_path) {
   // read "size" bytes from the offset location in the file into the buffer
-  CHECK_EQ(fseek(f, offset, SEEK_SET), 0);
+  CHECK_EQ(fseek(f, static_cast<long>(offset), SEEK_SET), 0);
   size_t bytesRead = fread(buf, sizeof(int8_t), size, f);
-  CHECK_EQ(bytesRead, sizeof(int8_t) * size);
+  auto expected_bytes_read = sizeof(int8_t) * size;
+  CHECK_EQ(bytesRead, expected_bytes_read)
+      << "Unexpected number of bytes read from file: " << file_path
+      << ". Expected bytes read: " << expected_bytes_read
+      << ", actual bytes read: " << bytesRead << ", offset: " << offset
+      << ", file stream error set: " << (std::ferror(f) ? "true" : "false")
+      << ", EOF reached: " << (std::feof(f) ? "true" : "false");
   return bytesRead;
 }
 
-size_t write(FILE* f, const size_t offset, const size_t size, int8_t* buf) {
+size_t write(FILE* f, const size_t offset, const size_t size, const int8_t* buf) {
   // write size bytes from the buffer to the offset location in the file
-  if (fseek(f, offset, SEEK_SET) != 0) {
+  if (fseek(f, static_cast<long>(offset), SEEK_SET) != 0) {
     LOG(FATAL)
         << "Error trying to write to file (during positioning seek) the error was: "
         << std::strerror(errno);
@@ -133,12 +155,16 @@ size_t write(FILE* f, const size_t offset, const size_t size, int8_t* buf) {
   return bytesWritten;
 }
 
-size_t append(FILE* f, const size_t size, int8_t* buf) {
+size_t append(FILE* f, const size_t size, const int8_t* buf) {
   return write(f, fileSize(f), size, buf);
 }
 
-size_t readPage(FILE* f, const size_t pageSize, const size_t pageNum, int8_t* buf) {
-  return read(f, pageNum * pageSize, pageSize, buf);
+size_t readPage(FILE* f,
+                const size_t pageSize,
+                const size_t pageNum,
+                int8_t* buf,
+                const std::string& file_path) {
+  return read(f, pageNum * pageSize, pageSize, buf, file_path);
 }
 
 size_t readPartialPage(FILE* f,
@@ -146,8 +172,9 @@ size_t readPartialPage(FILE* f,
                        const size_t offset,
                        const size_t readSize,
                        const size_t pageNum,
-                       int8_t* buf) {
-  return read(f, pageNum * pageSize + offset, readSize, buf);
+                       int8_t* buf,
+                       const std::string& file_path) {
+  return read(f, pageNum * pageSize + offset, readSize, buf, file_path);
 }
 
 size_t writePage(FILE* f, const size_t pageSize, const size_t pageNum, int8_t* buf) {
@@ -192,17 +219,34 @@ void renameForDelete(const std::string directoryName) {
                                              std::to_string(ms.count()) + "_DELETE_ME");
     boost::filesystem::rename(directoryPath, newDirectoryPath, ec);
 
+#ifdef _WIN32
+    // On Windows we sometimes fail to rename a directory with System: 5 error
+    // code (access denied). An attempt to stop in debugger and look for opened
+    // handles for some of directory content shows no opened handles and actually
+    // allows renaming to execute successfully. It's not clear why, but a short
+    // pause allows to rename directory successfully. Until reasons are known,
+    // use this retry loop as a workaround.
+    int tries = 10;
+    while (ec.value() != boost::system::errc::success && tries) {
+      LOG(ERROR) << "Failed to rename directory " << directoryPath << " error was " << ec
+                 << " (" << tries << " attempts left)";
+      std::this_thread::sleep_for(std::chrono::milliseconds(100 / tries));
+      tries--;
+      boost::filesystem::rename(directoryPath, newDirectoryPath, ec);
+    }
+#endif
+
     if (ec.value() == boost::system::errc::success) {
       std::thread th([newDirectoryPath]() {
         boost::system::error_code ec;
         boost::filesystem::remove_all(newDirectoryPath, ec);
-        if (ec.value() != boost::system::errc::success) {
-          LOG(ERROR) << "Failed to remove directory " << newDirectoryPath << " error was "
-                     << ec;
-        }
+        // We dont check error on remove here as we cant log the
+        // issue fromdetached thrad, its not safe to LOG from here
+        // This is under investigation as clang detects TSAN issue data race
+        // the main system wide file_delete_thread will clean up any missed files
       });
       // let it run free so we can return
-      // if it fails the file_delete_thread in MapDHandler will clean up
+      // if it fails the file_delete_thread in DBHandler will clean up
       th.detach();
 
       return;

@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,22 +13,36 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 #include "S3Archive.h"
-#include <glog/logging.h>
-#include <atomic>
-#include <boost/filesystem.hpp>
 
 #include <aws/core/Aws.h>
 #include <aws/core/auth/AWSCredentialsProvider.h>
+#include <aws/core/auth/AWSCredentialsProviderChain.h>
 #include <aws/s3/model/GetObjectRequest.h>
 #include <aws/s3/model/ListObjectsV2Request.h>
 #include <aws/s3/model/Object.h>
+#include <atomic>
+#include <boost/filesystem.hpp>
 #include <fstream>
 #include <memory>
 
-int S3Archive::awsapi_count;
-std::mutex S3Archive::awsapi_mtx;
-Aws::SDKOptions S3Archive::awsapi_options;
+#include "DataMgr/ForeignStorage/S3FilePathUtil.h"
+#include "DataMgr/HeavyDbAwsSdk.h"
+#include "Logger/Logger.h"
+
+bool g_allow_s3_server_privileges{false};
+
+namespace {
+void get_s3_parameter_from_env_if_unset_or_empty(std::string& param,
+                                                 const std::string& env_variable_name) {
+  char* env;
+  if (param.empty() && (0 != (env = getenv(env_variable_name.c_str())))) {
+    param = env;
+  }
+}
+
+};  // namespace
 
 void S3Archive::init_for_read() {
   boost::filesystem::create_directories(s3_temp_dir);
@@ -52,49 +66,35 @@ void S3Archive::init_for_read() {
     objects_request.WithPrefix(prefix_name);
     objects_request.SetMaxKeys(1 << 20);
 
-    // for a daemon like omnisci_server it seems improper to set s3 credentials
+    if (g_allow_s3_server_privileges) {
+      get_s3_parameter_from_env_if_unset_or_empty(s3_region, "AWS_REGION");
+    }
+
+    if (s3_region.empty()) {
+      throw std::runtime_error(
+          "Required parameter \"s3_region\" not set. Please specify the \"s3_region\" "
+          "configuration parameter.");
+    }
+
+    // for a daemon like heavydb it seems improper to set s3 credentials
     // via AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY env's because that way
     // credentials are configured *globally* while different users with private
     // s3 resources may need separate credentials to access.in that case, use
     // WITH s3_access_key/s3_secret_key parameters.
     Aws::Client::ClientConfiguration s3_config;
-    s3_config.region = s3_region.size() ? s3_region : Aws::Region::US_EAST_1;
+    s3_config.region = s3_region;
     s3_config.endpointOverride = s3_endpoint;
-
-    /*
-       Fix a wrong ca path established at building libcurl on Centos being carried to
-       Ubuntu. To fix the issue, this is this sequence of locating ca file: 1) if
-       `SSL_CERT_DIR` or `SSL_CERT_FILE` is set, set it to S3 ClientConfiguration. 2) if
-       none ^ is set, omnisci_server searches a list of known ca file paths. 3) if 2)
-       finds nothing, it is users' call to set correct SSL_CERT_DIR or SSL_CERT_FILE. S3
-       c++ sdk: "we only want to override the default path if someone has explicitly told
-       us to."
-     */
-    std::list<std::string> v_known_ca_paths({
-        "/etc/ssl/certs/ca-certificates.crt",
-        "/etc/pki/tls/certs/ca-bundle.crt",
-        "/usr/share/ssl/certs/ca-bundle.crt",
-        "/usr/local/share/certs/ca-root.crt",
-        "/etc/ssl/cert.pem",
-        "/etc/ssl/ca-bundle.pem",
-    });
-    char* env;
-    if (nullptr != (env = getenv("SSL_CERT_DIR"))) {
-      s3_config.caPath = env;
-    }
-    if (nullptr != (env = getenv("SSL_CERT_FILE"))) {
-      v_known_ca_paths.push_front(env);
-    }
-    for (const auto& known_ca_path : v_known_ca_paths) {
-      if (boost::filesystem::exists(known_ca_path)) {
-        s3_config.caFile = known_ca_path;
-        break;
-      }
-    }
+    auto ssl_config = heavydb_aws_sdk::get_ssl_config();
+    s3_config.caPath = ssl_config.ca_path;
+    s3_config.caFile = ssl_config.ca_file;
 
     if (!s3_access_key.empty() && !s3_secret_key.empty()) {
       s3_client.reset(new Aws::S3::S3Client(
-          Aws::Auth::AWSCredentials(s3_access_key, s3_secret_key), s3_config));
+          Aws::Auth::AWSCredentials(s3_access_key, s3_secret_key, s3_session_token),
+          s3_config));
+    } else if (g_allow_s3_server_privileges) {
+      s3_client.reset(new Aws::S3::S3Client(
+          std::make_shared<Aws::Auth::DefaultAWSCredentialsProviderChain>(), s3_config));
     } else {
       s3_client.reset(new Aws::S3::S3Client(
           std::make_shared<Aws::Auth::AnonymousAWSCredentialsProvider>(), s3_config));
@@ -105,6 +105,9 @@ void S3Archive::init_for_read() {
         // pass only object keys to next stage, which may be Importer::import_parquet,
         // Importer::import_compressed or else, depending on copy_params (eg. .is_parquet)
         auto object_list = list_objects_outcome.GetResult().GetContents();
+        object_list = foreign_storage::s3_objects_filter_sort_files(
+            object_list, {regex_path_filter, file_sort_order_by, file_sort_regex});
+
         if (0 == object_list.size()) {
           if (objkeys.empty()) {
             throw std::runtime_error("no object was found with s3 url '" + url + "'");
@@ -135,8 +138,15 @@ void S3Archive::init_for_read() {
         // could be the object is there but we do not have listObject Privilege
         // We can treat it as a specific object, so should try to parse it and pass to
         // getObject as a singleton
+        // Null prefix in urls such like 's3://bucket/' should be ignored.
         if (objkeys.empty()) {
-          objkeys.push_back(prefix_name);
+          if (!prefix_name.empty()) {
+            objkeys.push_back(prefix_name);
+          } else {
+            throw std::runtime_error("failed to list objects of s3 url '" + url + "': " +
+                                     list_objects_outcome.GetError().GetExceptionName() +
+                                     ": " + list_objects_outcome.GetError().GetMessage());
+          }
         }
       }
       // continue to read next 1000 files
@@ -162,7 +172,9 @@ void S3Archive::init_for_read() {
 // land entirely to be imported... (avro?)
 const std::string S3Archive::land(const std::string& objkey,
                                   std::exception_ptr& teptr,
-                                  const bool for_detection) {
+                                  const bool for_detection,
+                                  const bool allow_named_pipe_use,
+                                  const bool track_file_paths) {
   // 7z file needs entire landing; other file types use a named pipe
   static std::atomic<int64_t> seqno(((int64_t)getpid() << 32) | time(0));
   // need a dummy ext b/c no-ext now indicate plain_text
@@ -170,10 +182,13 @@ const std::string S3Archive::land(const std::string& objkey,
   boost::filesystem::remove(file_path);
 
   auto ext = strrchr(objkey.c_str(), '.');
-  auto use_pipe = (0 == ext || 0 != strcmp(ext, ".7z"));
+  auto use_pipe = (nullptr == ext || 0 != strcmp(ext, ".7z"));
 #ifdef ENABLE_IMPORT_PARQUET
-  use_pipe = use_pipe && (0 != strcmp(ext, ".parquet"));
+  use_pipe = use_pipe && (nullptr == ext || 0 != strcmp(ext, ".parquet"));
 #endif
+  if (!allow_named_pipe_use) {  // override using a named pipe no matter the configuration
+    use_pipe = false;
+  }
   if (use_pipe) {
     if (mkfifo(file_path.c_str(), 0660) < 0) {
       throw std::runtime_error("failed to create named pipe '" + file_path +
@@ -229,14 +244,14 @@ const std::string S3Archive::land(const std::string& objkey,
           // this static mutex protect the static google::last_tm_time_for_raw_log from
           // concurrent LOG(INFO)s that call RawLog__SetLastTime to write the variable!
           static std::mutex mutex_glog;
-#define MAPD_S3_LOG(x)                             \
-  {                                                \
-    std::unique_lock<std::mutex> lock(mutex_glog); \
-    x;                                             \
+#define S3_LOG_WITH_LOCK(x)                       \
+  {                                               \
+    std::lock_guard<std::mutex> lock(mutex_glog); \
+    x;                                            \
   }
-          MAPD_S3_LOG(LOG(INFO)
-                      << "downloading s3://" << bucket_name << "/" << objkey << " to "
-                      << (use_pipe ? "pipe " : "file ") << file_path << "...")
+          S3_LOG_WITH_LOCK(LOG(INFO) << "downloading s3://" << bucket_name << "/"
+                                     << objkey << " to " << (use_pipe ? "pipe " : "file ")
+                                     << file_path << "...")
           auto get_object_outcome_moved =
               decltype(get_object_outcome)(std::move(get_object_outcome));
           is_get_object_outcome_moved = true;
@@ -244,9 +259,9 @@ const std::string S3Archive::land(const std::string& objkey,
           local_file.open(file_path.c_str(),
                           std::ios::out | std::ios::binary | std::ios::trunc);
           local_file << get_object_outcome_moved.GetResult().GetBody().rdbuf();
-          MAPD_S3_LOG(LOG(INFO)
-                      << "downloaded s3://" << bucket_name << "/" << objkey << " to "
-                      << (use_pipe ? "pipe " : "file ") << file_path << ".")
+          S3_LOG_WITH_LOCK(LOG(INFO)
+                           << "downloaded s3://" << bucket_name << "/" << objkey << " to "
+                           << (use_pipe ? "pipe " : "file ") << file_path << ".")
         } catch (...) {
           // need this way to capture any exception occurring when
           // this thread runs as a disjoint asynchronous thread
@@ -280,7 +295,10 @@ const std::string S3Archive::land(const std::string& objkey,
     }
   }
 
-  file_paths.insert(std::pair<const std::string, const std::string>(objkey, file_path));
+  if (track_file_paths) {  // `file_paths` may be shared between threads, so is not
+                           // thread-safe
+    file_paths.insert(std::pair<const std::string, const std::string>(objkey, file_path));
+  }
   return file_path;
 }
 

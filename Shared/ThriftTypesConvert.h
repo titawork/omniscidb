@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,15 +17,15 @@
 #ifndef THRIFT_TYPE_CONVERT_H
 #define THRIFT_TYPE_CONVERT_H
 
-#include "gen-cpp/mapd_types.h"
+#include "gen-cpp/heavy_types.h"
 
-#include <glog/logging.h>
+#include "Logger/Logger.h"
 
 #include <string>
 
 inline TDatumType::type type_to_thrift(const SQLTypeInfo& type_info) {
   SQLTypes type = type_info.get_type();
-  if (type == kARRAY) {
+  if (type == kARRAY || type == kCOLUMN || type == kCOLUMN_LIST) {
     type = type_info.get_subtype();
   }
   switch (type) {
@@ -62,8 +62,12 @@ inline TDatumType::type type_to_thrift(const SQLTypeInfo& type_info) {
       return TDatumType::INTERVAL_YEAR_MONTH;
     case kPOINT:
       return TDatumType::POINT;
+    case kMULTIPOINT:
+      return TDatumType::MULTIPOINT;
     case kLINESTRING:
       return TDatumType::LINESTRING;
+    case kMULTILINESTRING:
+      return TDatumType::MULTILINESTRING;
     case kPOLYGON:
       return TDatumType::POLYGON;
     case kMULTIPOLYGON:
@@ -110,8 +114,12 @@ inline SQLTypes thrift_to_type(const TDatumType::type& type) {
       return kINTERVAL_YEAR_MONTH;
     case TDatumType::POINT:
       return kPOINT;
+    case TDatumType::MULTIPOINT:
+      return kMULTIPOINT;
     case TDatumType::LINESTRING:
       return kLINESTRING;
+    case TDatumType::MULTILINESTRING:
+      return kMULTILINESTRING;
     case TDatumType::POLYGON:
       return kPOLYGON;
     case TDatumType::MULTIPOLYGON:
@@ -208,10 +216,12 @@ inline std::string thrift_to_encoding_name(const TTypeInfo& ti) {
 
 inline SQLTypeInfo type_info_from_thrift(const TTypeInfo& thrift_ti,
                                          const bool strip_geo_encoding = false) {
+  SQLTypeInfo type_info;
   const auto ti = thrift_to_type(thrift_ti.type);
   if (IS_GEO(ti)) {
     const auto base_type = static_cast<SQLTypes>(thrift_ti.precision);
-    return SQLTypeInfo(
+    CHECK_LT(base_type, kSQLTYPE_LAST);
+    type_info = SQLTypeInfo(
         ti,
         thrift_ti.scale,
         thrift_ti.scale,
@@ -219,25 +229,29 @@ inline SQLTypeInfo type_info_from_thrift(const TTypeInfo& thrift_ti,
         strip_geo_encoding ? kENCODING_NONE : thrift_to_encoding(thrift_ti.encoding),
         thrift_ti.comp_param,
         base_type);
+  } else if (thrift_ti.is_array) {
+    type_info = SQLTypeInfo(kARRAY,
+                            thrift_ti.precision,
+                            thrift_ti.scale,
+                            !thrift_ti.nullable,
+                            thrift_to_encoding(thrift_ti.encoding),
+                            thrift_ti.comp_param,
+                            ti);
+    type_info.set_size(thrift_ti.size);
+  } else {
+    type_info = SQLTypeInfo(ti,
+                            thrift_ti.precision,
+                            thrift_ti.scale,
+                            !thrift_ti.nullable,
+                            thrift_to_encoding(thrift_ti.encoding),
+                            thrift_ti.comp_param,
+                            kNULLT);
   }
-  if (thrift_ti.is_array) {
-    auto ati = SQLTypeInfo(kARRAY,
-                           thrift_ti.precision,
-                           thrift_ti.scale,
-                           !thrift_ti.nullable,
-                           thrift_to_encoding(thrift_ti.encoding),
-                           thrift_ti.comp_param,
-                           ti);
-    ati.set_size(thrift_ti.size);
-    return ati;
+  if (type_info.is_dict_encoded_string() || type_info.is_subtype_dict_encoded_string()) {
+    const auto& dict_key = thrift_ti.dict_key;
+    type_info.setStringDictKey({dict_key.db_id, dict_key.dict_id});
   }
-  return SQLTypeInfo(ti,
-                     thrift_ti.precision,
-                     thrift_ti.scale,
-                     !thrift_ti.nullable,
-                     thrift_to_encoding(thrift_ti.encoding),
-                     thrift_ti.comp_param,
-                     kNULLT);
+  return type_info;
 }
 
 #endif  // THRIFT_TYPE_CONVERT_H

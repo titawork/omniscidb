@@ -1,4 +1,5 @@
-namespace java com.mapd.thrift.server
+namespace java ai.heavy.thrift.server
+namespace py heavydb.serialized_result_set
 
 include "../common.thrift"
 
@@ -22,7 +23,7 @@ struct TColSlotContext {
 enum TCountDistinctImplType {
   Invalid,
   Bitmap,
-  StdSet
+  UnorderedSet
 }
 
 struct TCountDistinctDescriptor {
@@ -53,7 +54,7 @@ struct TResultSetBufferDescriptor {
 }
 
 enum TAggKind {
-  AVG, MIN, MAX, SUM, COUNT, APPROX_COUNT_DISTINCT, SAMPLE
+  AVG, MIN, MAX, SUM, COUNT, APPROX_COUNT_DISTINCT, SAMPLE, SINGLE_VALUE, COUNT_IF, SUM_IF
 }
 
 struct TTargetInfo {

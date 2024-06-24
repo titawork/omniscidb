@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 OmniSci, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,8 +16,8 @@
 
 /**
  * @file    TargetExprBuilder.h
- * @author  Alex Baden <alex.baden@omnisci.com>
  * @brief   Helpers for codegen of target expressions
+ *
  */
 
 #pragma once
@@ -46,12 +46,29 @@ struct TargetExprCodegen {
                Executor* executor,
                const QueryMemoryDescriptor& query_mem_desc,
                const CompilationOptions& co,
+               const GpuSharedMemoryContext& gpu_smem_context,
                const std::tuple<llvm::Value*, llvm::Value*>& agg_out_ptr_w_idx,
                const std::vector<llvm::Value*>& agg_out_vec,
                llvm::Value* output_buffer_byte_stream,
                llvm::Value* out_row_idx,
-               GroupByAndAggregate::DiamondCodegen& diamond_codegen,
-               GroupByAndAggregate::DiamondCodegen* sample_cfg = nullptr) const;
+               llvm::Value* varlen_output_buffer,
+               DiamondCodegen& diamond_codegen,
+               DiamondCodegen* sample_cfg = nullptr) const;
+
+  void codegenAggregate(GroupByAndAggregate* group_by_and_agg,
+                        Executor* executor,
+                        const QueryMemoryDescriptor& query_mem_desc,
+                        const CompilationOptions& co,
+                        const std::vector<llvm::Value*>& target_lvs,
+                        const std::tuple<llvm::Value*, llvm::Value*>& agg_out_ptr_w_idx,
+                        const std::vector<llvm::Value*>& agg_out_vec,
+                        llvm::Value* output_buffer_byte_stream,
+                        llvm::Value* out_row_idx,
+                        llvm::Value* varlen_output_buffer,
+                        int32_t slot_index) const;
+
+  friend std::ostream& operator<<(std::ostream& os,
+                                  const TargetExprCodegen& target_expr_codegen);
 
   const Analyzer::Expr* target_expr;
   TargetInfo target_info;
@@ -62,31 +79,68 @@ struct TargetExprCodegen {
 };
 
 struct TargetExprCodegenBuilder {
-  TargetExprCodegenBuilder(const QueryMemoryDescriptor& query_mem_desc,
-                           const RelAlgExecutionUnit& ra_exe_unit,
-                           const bool is_group_by)
-      : query_mem_desc(query_mem_desc)
-      , ra_exe_unit(ra_exe_unit)
-      , is_group_by(is_group_by) {}
+  TargetExprCodegenBuilder(const RelAlgExecutionUnit& ra_exe_unit, const bool is_group_by)
+      : ra_exe_unit(ra_exe_unit), is_group_by(is_group_by) {}
 
   void operator()(const Analyzer::Expr* target_expr,
                   const Executor* executor,
+                  QueryMemoryDescriptor& query_mem_desc,
                   const CompilationOptions& co);
 
   void codegen(GroupByAndAggregate* group_by_and_agg,
                Executor* executor,
                const QueryMemoryDescriptor& query_mem_desc,
                const CompilationOptions& co,
+               const GpuSharedMemoryContext& gpu_smem_context,
                const std::tuple<llvm::Value*, llvm::Value*>& agg_out_ptr_w_idx,
                const std::vector<llvm::Value*>& agg_out_vec,
                llvm::Value* output_buffer_byte_stream,
                llvm::Value* out_row_idx,
-               GroupByAndAggregate::DiamondCodegen& diamond_codegen) const;
+               llvm::Value* varlen_output_buffer,
+               DiamondCodegen& diamond_codegen) const;
+
+  void codegenSampleExpressions(
+      GroupByAndAggregate* group_by_and_agg,
+      Executor* executor,
+      const QueryMemoryDescriptor& query_mem_desc,
+      const CompilationOptions& co,
+      const std::tuple<llvm::Value*, llvm::Value*>& agg_out_ptr_w_idx,
+      const std::vector<llvm::Value*>& agg_out_vec,
+      llvm::Value* output_buffer_byte_stream,
+      llvm::Value* out_row_idx,
+      DiamondCodegen& diamond_codegen) const;
+
+  void codegenSingleSlotSampleExpression(
+      GroupByAndAggregate* group_by_and_agg,
+      Executor* executor,
+      const QueryMemoryDescriptor& query_mem_desc,
+      const CompilationOptions& co,
+      const std::tuple<llvm::Value*, llvm::Value*>& agg_out_ptr_w_idx,
+      const std::vector<llvm::Value*>& agg_out_vec,
+      llvm::Value* output_buffer_byte_stream,
+      llvm::Value* out_row_idx,
+      DiamondCodegen& diamond_codegen) const;
+
+  void codegenMultiSlotSampleExpressions(
+      GroupByAndAggregate* group_by_and_agg,
+      Executor* executor,
+      const QueryMemoryDescriptor& query_mem_desc,
+      const CompilationOptions& co,
+      const std::tuple<llvm::Value*, llvm::Value*>& agg_out_ptr_w_idx,
+      const std::vector<llvm::Value*>& agg_out_vec,
+      llvm::Value* output_buffer_byte_stream,
+      llvm::Value* out_row_idx,
+      DiamondCodegen& diamond_codegen) const;
+
+  llvm::Value* codegenSlotEmptyKey(llvm::Value* agg_col_ptr,
+                                   std::vector<llvm::Value*>& target_lvs,
+                                   Executor* executor,
+                                   const QueryMemoryDescriptor& query_mem_desc,
+                                   const int64_t init_val) const;
 
   size_t target_index_counter{0};
   size_t slot_index_counter{0};
 
-  const QueryMemoryDescriptor& query_mem_desc;
   const RelAlgExecutionUnit& ra_exe_unit;
 
   std::vector<TargetExprCodegen> target_exprs_to_codegen;

@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,15 +16,14 @@
 
 /**
  * @file		StringNoneEncoder.h
- * @author	Wei Hong <wei@map-d.com>
  * @brief		For unencoded strings
  *
- * Copyright (c) 2014 MapD Technologies, Inc.  All rights reserved.
- **/
+ */
+
 #ifndef STRING_NONE_ENCODER_H
 #define STRING_NONE_ENCODER_H
+#include "Logger/Logger.h"
 
-#include <glog/logging.h>
 #include <cassert>
 #include <string>
 #include <vector>
@@ -45,39 +44,63 @@ class StringNoneEncoder : public Encoder {
                                        const size_t byteLimit,
                                        const bool replicating = false);
 
-  ChunkMetadata appendData(int8_t*& srcData,
-                           const size_t numAppendElems,
-                           const SQLTypeInfo&,
-                           const bool replicating = false) override {
-    CHECK(false);  // should never be called for strings
-    return ChunkMetadata{};
+  size_t getNumElemsForBytesEncodedDataAtIndices(const int8_t* index_data,
+                                                 const std::vector<size_t>& selected_idx,
+                                                 const size_t byte_limit) override;
+
+  std::shared_ptr<ChunkMetadata> appendData(int8_t*& src_data,
+                                            const size_t num_elems_to_append,
+                                            const SQLTypeInfo& ti,
+                                            const bool replicating = false,
+                                            const int64_t offset = -1) override {
+    UNREACHABLE();  // should never be called for strings
+    return nullptr;
   }
 
-  ChunkMetadata appendData(const std::vector<std::string>* srcData,
-                           const int start_idx,
-                           const size_t numAppendElems,
-                           const bool replicating = false);
+  std::shared_ptr<ChunkMetadata> appendEncodedDataAtIndices(
+      const int8_t* index_data,
+      int8_t* data,
+      const std::vector<size_t>& selected_idx) override;
 
-  void getMetadata(ChunkMetadata& chunkMetadata) override {
-    Encoder::getMetadata(chunkMetadata);  // call on parent class
-    chunkMetadata.chunkStats.min.stringval = nullptr;
-    chunkMetadata.chunkStats.max.stringval = nullptr;
-    chunkMetadata.chunkStats.has_nulls = has_nulls;
-  }
+  std::shared_ptr<ChunkMetadata> appendEncodedData(const int8_t* index_data,
+                                                   int8_t* data,
+                                                   const size_t start_idx,
+                                                   const size_t num_elements) override;
+
+  template <typename StringType>
+  std::shared_ptr<ChunkMetadata> appendData(const StringType* srcData,
+                                            const int start_idx,
+                                            const size_t numAppendElems,
+                                            const bool replicating = false);
+
+  template <typename StringType>
+  std::shared_ptr<ChunkMetadata> appendData(const std::vector<StringType>* srcData,
+                                            const int start_idx,
+                                            const size_t numAppendElems,
+                                            const bool replicating = false);
+
+  void getMetadata(const std::shared_ptr<ChunkMetadata>& chunkMetadata) override;
 
   // Only called from the executor for synthesized meta-information.
-  ChunkMetadata getMetadata(const SQLTypeInfo& ti) override {
-    auto chunk_stats = ChunkStats{};
-    chunk_stats.min.stringval = nullptr;
-    chunk_stats.max.stringval = nullptr;
-    chunk_stats.has_nulls = has_nulls;
-    ChunkMetadata chunk_metadata{ti, 0, 0, chunk_stats};
-    return chunk_metadata;
-  }
+  std::shared_ptr<ChunkMetadata> getMetadata(const SQLTypeInfo& ti) override;
 
   void updateStats(const int64_t, const bool) override { CHECK(false); }
 
   void updateStats(const double, const bool) override { CHECK(false); }
+
+  void updateStats(const int8_t* const src_data, const size_t num_elements) override {
+    UNREACHABLE();
+  }
+
+  void updateStats(const std::vector<std::string>* const src_data,
+                   const size_t start_idx,
+                   const size_t num_elements) override;
+
+  void updateStats(const std::vector<ArrayDatum>* const src_data,
+                   const size_t start_idx,
+                   const size_t num_elements) override {
+    UNREACHABLE();
+  }
 
   void reduceStats(const Encoder&) override { CHECK(false); }
 
@@ -98,13 +121,36 @@ class StringNoneEncoder : public Encoder {
     has_nulls = static_cast<const StringNoneEncoder*>(copyFromEncoder)->has_nulls;
   }
 
-  AbstractBuffer* get_index_buf() const { return index_buf; }
-  void set_index_buf(AbstractBuffer* buf) { index_buf = buf; }
+  AbstractBuffer* getIndexBuf() const { return index_buf; }
+  void setIndexBuffer(AbstractBuffer* buf) { index_buf = buf; }
+
+  bool resetChunkStats(const ChunkStats& stats) override {
+    if (has_nulls == stats.has_nulls) {
+      return false;
+    }
+    has_nulls = stats.has_nulls;
+    return true;
+  }
+
+  void resetChunkStats() override { has_nulls = false; }
+
+  static std::string_view getStringAtIndex(const int8_t* index_data,
+                                           const int8_t* data,
+                                           size_t index);
 
  private:
+  static std::pair<StringOffsetT, StringOffsetT> getStringOffsets(
+      const int8_t* index_data,
+      size_t index);
+
+  static size_t getStringSizeAtIndex(const int8_t* index_data, size_t index);
+
   AbstractBuffer* index_buf;
   StringOffsetT last_offset;
   bool has_nulls;
+
+  template <typename StringType>
+  void update_elem_stats(const StringType& elem);
 
 };  // class StringNoneEncoder
 

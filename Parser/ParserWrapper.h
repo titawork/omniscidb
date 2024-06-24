@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,44 +16,84 @@
 
 /**
  * @file    ParserWrapper.h
- * @author  michael
  * @brief   Classes used to wrap parser calls for calcite redirection
  *
- * Copyright (c) 2016 MapD Technologies, Inc.  All rights reserved.
- **/
+ */
+
+// TODO(sy): We already use Calcite, which is a powerful general-purpose parser tool, so
+// ParserWrapper has no good reason to exist. Any work happening in here should be moved
+// into our Java Calcite classes and ParserWrapper should be removed from HeavyDB.
 
 #pragma once
 
-#include <boost/regex.hpp>
 #include <string>
 #include <vector>
 
-#include "Shared/ConfigResolve.h"
+#include "Shared/clean_boost_regex.hpp"
 
-enum class CalciteDMLPathSelection : int {
-  Unsupported = 0,
-  OnlyUpdates = 1,
-  OnlyDeletes = 2,
-  UpdatesAndDeletes = 3,
+class ExplainInfo {
+ public:
+  enum class ExplainType {
+    None,
+    IR,
+    OptimizedIR,
+    Calcite,
+    CalciteDetail,
+    ExecutionPlan,
+    Other
+  };
+
+  ExplainInfo() : explain_type_(ExplainType::None), actual_query_("") {}
+  ExplainInfo(ExplainType type) : explain_type_(type), actual_query_("") {}
+  ExplainInfo(std::string query_string);
+
+  bool isExplain() const { return explain_type_ != ExplainType::None; }
+
+  bool isJustExplain() const {
+    return explain_type_ == ExplainType::IR ||
+           explain_type_ == ExplainType::OptimizedIR ||
+           explain_type_ == ExplainType::ExecutionPlan;
+  }
+
+  bool isSelectExplain() const {
+    return explain_type_ == ExplainType::IR ||
+           explain_type_ == ExplainType::OptimizedIR ||
+           explain_type_ == ExplainType::Calcite ||
+           explain_type_ == ExplainType::CalciteDetail ||
+           explain_type_ == ExplainType::ExecutionPlan;
+  }
+
+  bool isIRExplain() const {
+    return explain_type_ == ExplainType::IR || explain_type_ == ExplainType::OptimizedIR;
+  }
+
+  bool isOptimizedExplain() const { return explain_type_ == ExplainType::OptimizedIR; }
+  bool isCalciteExplain() const {
+    return explain_type_ == ExplainType::Calcite ||
+           explain_type_ == ExplainType::CalciteDetail;
+  }
+  bool isCalciteExplainDetail() const {
+    return explain_type_ == ExplainType::CalciteDetail;
+  }
+  bool isPlanExplain() const { return explain_type_ == ExplainType::ExecutionPlan; }
+  bool isOtherExplain() const { return explain_type_ == ExplainType::Other; }
+
+  std::string ActualQuery() { return actual_query_; }
+
+  bool isVerbose() const { return verbose_; }
+
+ private:
+  ExplainType explain_type_ = ExplainType::None;
+  std::string actual_query_ = "";
+  bool verbose_{false};
 };
-
-constexpr inline CalciteDMLPathSelection yield_dml_path_selector() {
-  int selector = 0;
-  if (std::is_same<CalciteDeletePathSelector, PreprocessorTrue>::value) {
-    selector |= 0x02;
-  }
-  if (std::is_same<CalciteUpdatePathSelector, PreprocessorTrue>::value) {
-    selector |= 0x01;
-  }
-  return static_cast<CalciteDMLPathSelection>(selector);
-}
 
 class ParserWrapper {
  public:
   // HACK:  This needs to go away as calcite takes over parsing
-  enum class DMLType : int { Insert = 0, Delete, Update, Upsert, NotDML };
+  enum class DMLType : int { Insert = 0, Delete, Update, NotDML };
 
-  enum class ExplainType { None, IR, OptimizedIR, Calcite, Other };
+  enum class QueryType { Unknown, Read, Write, SchemaRead, SchemaWrite };
 
   ParserWrapper(std::string query_string);
   std::string process(std::string user,
@@ -64,67 +104,27 @@ class ParserWrapper {
   virtual ~ParserWrapper();
 
   bool is_ddl = false;
-  bool is_update_dml = false;
+  bool is_update_dml = false;  // INSERT DELETE UPDATE
   bool is_ctas = false;
   bool is_itas = false;
   bool is_copy = false;
   bool is_copy_to = false;
-  bool is_optimize = false;
   bool is_validate = false;
-  std::string actual_query;
+  bool is_other_explain = false;
+  bool is_refresh = false;
 
   DMLType getDMLType() const { return dml_type_; }
 
-  ExplainType getExplainType() const { return explain_type_; }
+  QueryType getQueryType() const { return query_type_; }
 
-  bool isCalciteExplain() const { return explain_type_ == ExplainType::Calcite; }
-
-  bool isSelectExplain() const {
-    return explain_type_ == ExplainType::Calcite || explain_type_ == ExplainType::IR ||
-           explain_type_ == ExplainType::OptimizedIR;
-  }
-
-  bool isIRExplain() const {
-    return explain_type_ == ExplainType::IR || explain_type_ == ExplainType::OptimizedIR;
-  }
-
-  bool isCalcitePathPermissable(bool read_only_mode = false) {
-    return (!is_ddl && !is_optimize && !is_validate &&
-            isCalcitePermissableDml(read_only_mode) &&
-            !(explain_type_ == ExplainType::Other));
-  }
-
-  bool isOtherExplain() const { return explain_type_ == ExplainType::Other; }
-
-  bool isCalcitePermissableDml(bool read_only_mode) {
-    if (read_only_mode) {
-      return !is_update_dml;  // If we're read-only, no DML is permissable
-    }
-
-    // TODO: A good place for if-constexpr
-    switch (yield_dml_path_selector()) {
-      case CalciteDMLPathSelection::OnlyUpdates:
-        return !is_update_dml || (getDMLType() == ParserWrapper::DMLType::Update);
-      case CalciteDMLPathSelection::OnlyDeletes:
-        return !is_update_dml || (getDMLType() == ParserWrapper::DMLType::Delete);
-      case CalciteDMLPathSelection::UpdatesAndDeletes:
-        return !is_update_dml || (getDMLType() == ParserWrapper::DMLType::Delete) ||
-               (getDMLType() == ParserWrapper::DMLType::Update);
-      case CalciteDMLPathSelection::Unsupported:
-      default:
-        return false;
-    }
+  bool isUpdateDelete() const {
+    return dml_type_ == DMLType::Update || dml_type_ == DMLType::Delete;
   }
 
  private:
   DMLType dml_type_ = DMLType::NotDML;
-  ExplainType explain_type_ = ExplainType::None;
+  QueryType query_type_ = QueryType::Unknown;
 
   static const std::vector<std::string> ddl_cmd;
   static const std::vector<std::string> update_dml_cmd;
-  static const std::string explain_str;
-  static const std::string calcite_explain_str;
-  static const std::string optimized_explain_str;
-  static const std::string optimize_str;
-  static const std::string validate_str;
 };

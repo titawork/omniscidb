@@ -1,5 +1,5 @@
 /*
- * Copyright 2018 OmniSci, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,16 +17,19 @@
 /**
  * @file		Compressor.cpp
  * @brief		singleton class to handle concurrancy and state for blosc library.
- *A C++ wraper over a pure C library.
+ *          A C++ wrapper over a pure C library.
  *
- * Copyright (c) 2018 OmniSci, Inc.  All rights reserved.
- **/
+ */
 
-#include "Compressor.h"
-#include <blosc.h>
-#include <glog/logging.h>
-#include <string>
+#include "Shared/Compressor.h"
+
+#include <cstdint>
+#include <memory>
 #include <thread>
+
+#include <blosc.h>
+
+#include "Logger/Logger.h"
 
 // we only compress data if the payload size is greater than 512 MB
 size_t g_compression_limit_bytes{512 * 1024 * 1024};
@@ -56,6 +59,17 @@ int64_t BloscCompressor::compress(
     uint8_t* compressed_buffer,
     const size_t compressed_buffer_size,
     const size_t min_compressor_bytes = g_compression_limit_bytes) {
+  if (compressed_buffer_size < BLOSC_MIN_HEADER_LENGTH) {
+    // Blosc compressor checks this condition during the initialization
+    // and throw "Output buffer size should be larger than 16 bytes" error
+    // if compressed_buffer_size < 16 (BLOSC_MIN_HEADER_LENGTH)
+    // but after sending interrupt signal, blosc compress function hangs until
+    // thrift timed out error and could not check this code.
+    // here, we can early return by explicitly checking this condition
+    // so as to avoid hangs in query runtime
+    return 0;
+  }
+
   if (buffer_size < min_compressor_bytes && min_compressor_bytes != 0) {
     return 0;
   }
@@ -71,7 +85,6 @@ int64_t BloscCompressor::compress(
   if (compressed_len <= 0) {
     // something went wrong. blosc retrun codes simply don't provide enough information
     // for us to decide what.
-
     throw CompressionFailedError(std::string("failed to compress result set of length ") +
                                  std::to_string(buffer_size));
   }
@@ -98,9 +111,8 @@ std::string BloscCompressor::compress(const std::string& buffer) {
       compressed_buffer.resize(compressed_len);
       return {compressed_buffer.begin(), compressed_buffer.end()};
     }
-  } catch (const CompressionFailedError& e) {
+  } catch (const CompressionFailedError&) {
   }
-
   return buffer;
 }
 
@@ -140,7 +152,7 @@ std::string BloscCompressor::decompress(const std::string& buffer,
     decompress(
         (uint8_t*)&buffer[0], (uint8_t*)&decompressed_buffer[0], decompressed_size);
     return {decompressed_buffer.begin(), decompressed_buffer.end()};
-  } catch (const CompressionFailedError& e) {
+  } catch (const CompressionFailedError&) {
   }
   return buffer;
 }
@@ -158,7 +170,7 @@ size_t BloscCompressor::compressOrMemcpy(const uint8_t* input_buffer,
     if (compressed_size > 0) {
       return compressed_size;
     }
-  } catch (const CompressionFailedError& e) {
+  } catch (const CompressionFailedError&) {
     // catch exceptions from blosc
     // we copy regardless what happens in compressor
     if (uncompressed_size > min_compressor_bytes) {
@@ -176,7 +188,7 @@ bool BloscCompressor::decompressOrMemcpy(const uint8_t* compressed_buffer,
   try {
     decompress(compressed_buffer, decompressed_buffer, decompressed_size);
     return true;
-  } catch (const CompressionFailedError& e) {
+  } catch (const CompressionFailedError&) {
     // we will memcpy if we find that the buffer is not compressed
 
     if (compressed_size > decompressed_size) {
@@ -200,7 +212,6 @@ BloscCompressor* BloscCompressor::instance = NULL;
 BloscCompressor* BloscCompressor::getCompressor() {
   static std::mutex compressor_singleton_lock;
   std::lock_guard<std::mutex> singleton_lock(compressor_singleton_lock);
-
   if (instance == NULL) {
     instance = new BloscCompressor();
   }
@@ -210,7 +221,7 @@ BloscCompressor* BloscCompressor::getCompressor() {
 
 int BloscCompressor::setThreads(size_t num_threads) {
   std::lock_guard<std::mutex> compressor_lock_(compressor_lock);
-  return blosc_set_nthreads(num_threads);
+  return blosc_set_nthreads(static_cast<int>(num_threads));
 }
 
 int BloscCompressor::setCompressor(std::string& compressor_name) {

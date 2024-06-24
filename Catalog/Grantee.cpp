@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,7 +15,10 @@
  */
 
 #include "Grantee.h"
+
 #include <stack>
+
+#include "Shared/misc.h"
 
 using std::runtime_error;
 using std::string;
@@ -31,12 +34,22 @@ Grantee::~Grantee() {
   roles_.clear();
 }
 
-std::vector<std::string> Grantee::getRoles() const {
-  std::vector<std::string> roles;
-  for (const auto role : roles_) {
-    roles.push_back(role->getName());
+std::vector<std::string> Grantee::getRoles(bool only_direct) const {
+  std::set<std::string> roles;  // Sorted for human readers.
+  std::stack<const Grantee*> g;
+  g.push(this);
+  while (!g.empty()) {
+    auto r = g.top();
+    g.pop();
+    for (auto direct_role : r->roles_) {
+      g.push(direct_role);
+      roles.insert(direct_role->getName());
+    }
+    if (only_direct) {
+      break;
+    }
   }
-  return roles;
+  return std::vector(roles.begin(), roles.end());
 }
 
 bool Grantee::hasRole(Role* role, bool only_direct) const {
@@ -253,19 +266,23 @@ void Grantee::updatePrivileges(Role* role) {
 
 // Pull privileges from upper roles
 void Grantee::updatePrivileges() {
+  // Zero out the effective privileges. DBObjects may still exist, but will be empty.
   for (auto& dbObject : effectivePrivileges_) {
     dbObject.second->resetPrivileges();
   }
+  // Load this Grantee's direct privileges into its effective privileges.
   for (auto it = directPrivileges_.begin(); it != directPrivileges_.end(); ++it) {
     if (effectivePrivileges_.find(it->first) != effectivePrivileges_.end()) {
       effectivePrivileges_[it->first]->updatePrivileges(*it->second);
     }
   }
+  // Load any other roles that we've been granted into the effective privileges.
   for (auto role : roles_) {
     if (role->getDbObjects(false)->size() > 0) {
       updatePrivileges(role);
     }
   }
+  // Free any DBObjects that are still empty in the effective privileges.
   for (auto dbObjectIt = effectivePrivileges_.begin();
        dbObjectIt != effectivePrivileges_.end();) {
     if (!dbObjectIt->second->getPrivileges().hasAny()) {
@@ -306,6 +323,38 @@ void Grantee::checkCycles(Role* newRole) {
       for (auto g : r->getGrantees()) {
         grantees.push(g);
       }
+    }
+  }
+}
+
+void Grantee::reassignObjectOwners(const std::set<int32_t>& old_owner_ids,
+                                   int32_t new_owner_id,
+                                   int32_t db_id) {
+  for (const auto& [object_key, object] : effectivePrivileges_) {
+    if (object_key.objectId != -1 && object_key.dbId == db_id &&
+        shared::contains(old_owner_ids, object->getOwner())) {
+      object->setOwner(new_owner_id);
+    }
+  }
+
+  for (const auto& [object_key, object] : directPrivileges_) {
+    if (object_key.objectId != -1 && object_key.dbId == db_id &&
+        shared::contains(old_owner_ids, object->getOwner())) {
+      object->setOwner(new_owner_id);
+    }
+  }
+}
+
+void Grantee::reassignObjectOwner(DBObjectKey& object_key, int32_t new_owner_id) {
+  for (const auto& [grantee_object_key, object] : effectivePrivileges_) {
+    if (grantee_object_key == object_key) {
+      object->setOwner(new_owner_id);
+    }
+  }
+
+  for (const auto& [grantee_object_key, object] : directPrivileges_) {
+    if (grantee_object_key == object_key) {
+      object->setOwner(new_owner_id);
     }
   }
 }

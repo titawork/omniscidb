@@ -1,5 +1,5 @@
 /*
- * Copyright 2018 OmniSci, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
  */
 package com.mapd.tests;
 
+import org.apache.commons.cli.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -48,12 +49,20 @@ public class UpdateDeleteInsertConcurrencyTest {
           "p"};
 
   public static void main(String[] args) throws Exception {
+    Options options = new Options();
+    options.addOption(Option.builder("t")
+                              .longOpt("temptables")
+                              .desc("Use temporary tables for test")
+                              .build());
+    CommandLineParser clp = new DefaultParser();
+    final CommandLine commandLine = clp.parse(options, args);
+
+    Boolean useTemporaryTables = commandLine.hasOption("temptables");
     UpdateDeleteInsertConcurrencyTest test = new UpdateDeleteInsertConcurrencyTest();
-    test.testUpdateDeleteInsertConcurrency();
+    test.testUpdateDeleteInsertConcurrency(useTemporaryTables);
   }
 
-  private void run_test(
-          MapdTestClient dba, MapdTestClient user, String tableName, int max) {}
+  private Boolean useTemporaryTables_ = false;
 
   private void runTest(String db,
           String dbaUser,
@@ -71,9 +80,11 @@ public class UpdateDeleteInsertConcurrencyTest {
     final CyclicBarrier barrier = new CyclicBarrier(num_threads, new Runnable() {
       public void run() {
         try {
-          MapdTestClient dba =
-                  MapdTestClient.getClient("localhost", 6274, db, dbaUser, dbaPassword);
-          dba.runSql("CREATE TABLE " + tableName
+          HeavyDBTestClient dba = HeavyDBTestClient.getClient(
+                  "localhost", 6274, db, dbaUser, dbaPassword);
+          final String createPrefix =
+                  useTemporaryTables_ ? "CREATE TEMPORARY TABLE " : "CREATE TABLE ";
+          dba.runSql(createPrefix + tableName
                   + "(x BIGINT, y INTEGER, z SMALLINT, a TINYINT, f FLOAT, d DOUBLE, deci DECIMAL(18,6), str TEXT ENCODING NONE) WITH (FRAGMENT_SIZE = "
                   + fragment_size + ")");
           if (!concurrentInserts) {
@@ -113,14 +124,15 @@ public class UpdateDeleteInsertConcurrencyTest {
       Thread t = new Thread(new Runnable() {
         @Override
         public void run() {
+          long tid = Thread.currentThread().getId();
+          String logPrefix = "[" + tid + "]";
+          String sql = "";
+
           try {
             barrier.await();
 
-            MapdTestClient dba =
-                    MapdTestClient.getClient("localhost", 6274, db, dbaUser, dbaPassword);
-            MapdTestClient user =
-                    MapdTestClient.getClient("localhost", 6274, db, dbUser, dbPassword);
-            run_test(dba, user, tableName, runs);
+            HeavyDBTestClient user = HeavyDBTestClient.getClient(
+                    "localhost", 6274, db, dbUser, dbPassword);
 
             if (concurrentInserts) {
               for (int i = 0; i < num_rows / num_threads; i++) {
@@ -143,54 +155,49 @@ public class UpdateDeleteInsertConcurrencyTest {
               }
             }
 
-            long tid = Thread.currentThread().getId();
-
             Random rand = new Random(tid);
 
-            logger.info("[" + tid + "]"
-                    + "DELETE 1");
-            user.runSql("DELETE FROM " + tableName + " WHERE x = " + (tid * 2) + ";");
+            sql = "DELETE FROM " + tableName + " WHERE x = " + (tid * 2) + ";";
+            logger.info(logPrefix + " " + sql);
+            user.runSql(sql);
 
-            logger.info("[" + tid + "]"
-                    + "DELETE 2");
-            user.runSql("DELETE FROM " + tableName
-                    + " WHERE y = " + rand.nextInt(num_rows) + ";");
+            sql = "DELETE FROM " + tableName + " WHERE y = " + rand.nextInt(num_rows)
+                    + ";";
+            logger.info(logPrefix + " " + sql);
+            user.runSql(sql);
 
-            logger.info("[" + tid + "]"
-                    + "SELECT 1");
-            user.runSql("SELECT COUNT(*) FROM " + tableName + " WHERE x > " + (tid * 2)
-                    + ";");
+            sql = "SELECT COUNT(*) FROM " + tableName + " WHERE x > " + (tid * 2) + ";";
+            logger.info(logPrefix + " " + sql);
+            user.runSql(sql);
 
-            logger.info("[" + tid + "]"
-                    + "DELETE 3");
-            user.runSql("DELETE FROM " + tableName + " WHERE str = '"
-                    + text_values[rand.nextInt(text_values.length)] + "';");
+            sql = "DELETE FROM " + tableName + " WHERE str = '"
+                    + text_values[rand.nextInt(text_values.length)] + "';";
+            logger.info(logPrefix + " " + sql);
+            user.runSql(sql);
 
-            logger.info("[" + tid + "]"
-                    + "SELECT 2");
-            user.runSql("SELECT * FROM " + tableName + " WHERE str = '"
-                    + text_values[rand.nextInt(text_values.length)] + "';");
+            sql = "SELECT * FROM " + tableName + " WHERE str = '"
+                    + text_values[rand.nextInt(text_values.length)] + "';";
+            logger.info(logPrefix + " " + sql);
+            user.runSql(sql);
 
-            logger.info("[" + tid + "]"
-                    + "DELETE 4");
-            user.runSql("DELETE FROM " + tableName + " WHERE d <  "
-                    + rand.nextInt(num_rows / 4) + ";");
+            sql = "DELETE FROM " + tableName + " WHERE d <  " + rand.nextInt(num_rows / 4)
+                    + ";";
+            logger.info(logPrefix + " " + sql);
+            user.runSql(sql);
 
-            logger.info("[" + tid + "]"
-                    + "INSERT 1");
-            user.runSql("INSERT INTO " + tableName + " VALUES "
+            sql = "INSERT INTO " + tableName + " VALUES "
                     + "(" + tid + "," + tid + "," + tid + "," + tid + "," + tid + ","
-                    + tid + "," + tid + "," + (tid % 2 == 0 ? "'mapd'" : "'omnisci'")
-                    + ");");
+                    + tid + "," + tid + "," + (tid % 2 == 0 ? "'value_1'" : "'value_2'")
+                    + ");";
+            logger.info(logPrefix + " " + sql);
+            user.runSql(sql);
 
-            logger.info("[" + tid + "]"
-                    + "DELETE 5");
-            user.runSql("DELETE FROM " + tableName + " WHERE z = " + tid + ";");
+            sql = "DELETE FROM " + tableName + " WHERE z = " + tid + ";";
+            logger.info(logPrefix + " " + sql);
+            user.runSql(sql);
 
           } catch (Exception e) {
-            logger.error("[" + Thread.currentThread().getId() + "]"
-                            + " Caught Exception: " + e.getMessage(),
-                    e);
+            logger.error(logPrefix + " Caught Exception: " + e.getMessage(), e);
             exceptions[threadId] = e;
           }
         }
@@ -203,27 +210,32 @@ public class UpdateDeleteInsertConcurrencyTest {
       t.join();
     }
 
-    MapdTestClient dba =
-            MapdTestClient.getClient("localhost", 6274, db, dbaUser, dbaPassword);
+    HeavyDBTestClient dba =
+            HeavyDBTestClient.getClient("localhost", 6274, db, dbaUser, dbaPassword);
     dba.runSql("DROP TABLE " + tableName + ";");
 
     for (Exception e : exceptions) {
       if (null != e) {
         logger.error("Exception: " + e.getMessage(), e);
-        throw new Exception(e.getMessage(), e);
+        throw e;
       }
     }
   }
 
-  public void testUpdateDeleteInsertConcurrency() throws Exception {
+  public void testUpdateDeleteInsertConcurrency(Boolean useTemporaryTables)
+          throws Exception {
     logger.info("testUpdateDeleteInsertConcurrency()");
 
-    MapdTestClient su = MapdTestClient.getClient(
-            "localhost", 6274, "omnisci", "admin", "HyperInteractive");
+    useTemporaryTables_ = useTemporaryTables;
+    if (useTemporaryTables_) {
+      logger.info("Using temporary tables");
+    }
+    HeavyDBTestClient su = HeavyDBTestClient.getClient(
+            "localhost", 6274, "heavyai", "admin", "HyperInteractive");
     su.runSql("CREATE USER dba (password = 'password', is_super = 'true');");
     su.runSql("CREATE USER bob (password = 'password', is_super = 'false');");
 
-    su.runSql("GRANT CREATE on DATABASE omnisci TO bob;");
+    su.runSql("GRANT CREATE on DATABASE heavyai TO bob;");
 
     su.runSql("CREATE DATABASE db1;");
     su.runSql("GRANT CREATE on DATABASE db1 TO bob;");
@@ -248,5 +260,7 @@ public class UpdateDeleteInsertConcurrencyTest {
     su.runSql("DROP DATABASE db1;");
     su.runSql("DROP USER bob;");
     su.runSql("DROP USER dba;");
+
+    logger.info("testUpdateDeleteInsertConcurrency() done");
   }
 }

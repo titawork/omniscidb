@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,11 +23,14 @@
 #include <vector>
 
 class RelAlgNode;
+class RexSubQuery;
 
 std::unordered_map<const RelAlgNode*, std::unordered_set<const RelAlgNode*>> build_du_web(
     const std::vector<std::shared_ptr<RelAlgNode>>& nodes) noexcept;
 void eliminate_identical_copy(std::vector<std::shared_ptr<RelAlgNode>>& nodes) noexcept;
 void eliminate_dead_columns(std::vector<std::shared_ptr<RelAlgNode>>& nodes) noexcept;
+void eliminate_dead_subqueries(std::vector<std::shared_ptr<RexSubQuery>>& subqueries,
+                               RelAlgNode const* root);
 void fold_filters(std::vector<std::shared_ptr<RelAlgNode>>& nodes) noexcept;
 void hoist_filter_cond_to_cross_join(
     std::vector<std::shared_ptr<RelAlgNode>>& nodes) noexcept;

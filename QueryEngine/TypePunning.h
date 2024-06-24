@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,9 +22,16 @@
 // Mark ptr as safe for type-punning operations. We need it whenever we want to
 // interpret a sequence of bytes as float / double through a reinterpret_cast.
 
+#ifdef _MSC_VER
+template <class T>
+FORCE_INLINE T* may_alias_ptr(T* ptr) {
+  return ptr;
+}
+#else
 template <class T>
     FORCE_INLINE T __attribute__((__may_alias__)) * may_alias_ptr(T* ptr) {
   return ptr;
 }
+#endif
 
 #endif  // QUERYENGINE_TYPEPUNNING_H

@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@
 
 std::vector<llvm::Value*> CodeGenerator::codegen(const Analyzer::CaseExpr* case_expr,
                                                  const CompilationOptions& co) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   const auto case_ti = case_expr->get_type_info();
   llvm::Type* case_llvm_type = nullptr;
   bool is_real_str = false;
@@ -34,10 +35,18 @@ std::vector<llvm::Value*> CodeGenerator::codegen(const Analyzer::CaseExpr* case_
           get_int_type(8 * case_ti.get_logical_size(), cgen_state_->context_);
     } else {
       is_real_str = true;
-      case_llvm_type = get_int_type(64, cgen_state_->context_);
+      case_llvm_type = createStringViewStructType();
     }
   } else if (case_ti.is_boolean()) {
     case_llvm_type = get_int_type(8 * case_ti.get_logical_size(), cgen_state_->context_);
+  } else if (case_ti.is_geometry()) {
+    throw std::runtime_error(
+        "Geospatial column projections are currently not supported in conditional "
+        "expressions.");
+  } else if (case_ti.is_array()) {
+    throw std::runtime_error(
+        "Array column projections are currently not supported in conditional "
+        "expressions.");
   }
   CHECK(case_llvm_type);
   const auto& else_ti = case_expr->get_else_expr()->get_type_info();
@@ -45,8 +54,10 @@ std::vector<llvm::Value*> CodeGenerator::codegen(const Analyzer::CaseExpr* case_
   llvm::Value* case_val = codegenCase(case_expr, case_llvm_type, is_real_str, co);
   std::vector<llvm::Value*> ret_vals{case_val};
   if (is_real_str) {
-    ret_vals.push_back(cgen_state_->emitCall("extract_str_ptr", {case_val}));
-    ret_vals.push_back(cgen_state_->emitCall("extract_str_len", {case_val}));
+    ret_vals.push_back(cgen_state_->ir_builder_.CreateExtractValue(case_val, 0));
+    ret_vals.push_back(cgen_state_->ir_builder_.CreateExtractValue(case_val, 1));
+    ret_vals.back() = cgen_state_->ir_builder_.CreateTrunc(
+        ret_vals.back(), llvm::Type::getInt32Ty(cgen_state_->context_));
   }
   return ret_vals;
 }
@@ -55,6 +66,7 @@ llvm::Value* CodeGenerator::codegenCase(const Analyzer::CaseExpr* case_expr,
                                         llvm::Type* case_llvm_type,
                                         const bool is_real_str,
                                         const CompilationOptions& co) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   // Here the linear control flow will diverge and expressions cached during the
   // code branch code generation (currently just column decoding) are not going
   // to be available once we're done generating the case. Take a snapshot of
@@ -63,14 +75,16 @@ llvm::Value* CodeGenerator::codegenCase(const Analyzer::CaseExpr* case_expr,
   const auto& expr_pair_list = case_expr->get_expr_pair_list();
   std::vector<llvm::Value*> then_lvs;
   std::vector<llvm::BasicBlock*> then_bbs;
-  const auto end_bb =
-      llvm::BasicBlock::Create(cgen_state_->context_, "end_case", cgen_state_->row_func_);
+  const auto end_bb = llvm::BasicBlock::Create(
+      cgen_state_->context_, "end_case", cgen_state_->current_func_);
   for (const auto& expr_pair : expr_pair_list) {
     Executor::FetchCacheAnchor branch_anchor(cgen_state_);
     const auto when_lv = toBool(codegen(expr_pair.first.get(), true, co).front());
     const auto cmp_bb = cgen_state_->ir_builder_.GetInsertBlock();
-    const auto then_bb = llvm::BasicBlock::Create(
-        cgen_state_->context_, "then_case", cgen_state_->row_func_);
+    const auto then_bb = llvm::BasicBlock::Create(cgen_state_->context_,
+                                                  "then_case",
+                                                  cgen_state_->current_func_,
+                                                  /*insert_before=*/end_bb);
     cgen_state_->ir_builder_.SetInsertPoint(then_bb);
     auto then_bb_lvs = codegen(expr_pair.second.get(), true, co);
     if (is_real_str) {
@@ -87,7 +101,7 @@ llvm::Value* CodeGenerator::codegenCase(const Analyzer::CaseExpr* case_expr,
     then_bbs.push_back(cgen_state_->ir_builder_.GetInsertBlock());
     cgen_state_->ir_builder_.CreateBr(end_bb);
     const auto when_bb = llvm::BasicBlock::Create(
-        cgen_state_->context_, "when_case", cgen_state_->row_func_);
+        cgen_state_->context_, "when_case", cgen_state_->current_func_);
     cgen_state_->ir_builder_.SetInsertPoint(cmp_bb);
     cgen_state_->ir_builder_.CreateCondBr(when_lv, then_bb, when_bb);
     cgen_state_->ir_builder_.SetInsertPoint(when_bb);

@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -60,13 +60,11 @@ enum DateaddField {
   daINVALID
 };
 
-extern "C" NEVER_INLINE DEVICE int64_t DateAdd(DateaddField field,
-                                               int64_t number,
-                                               int64_t timeval);
-
-extern "C" NEVER_INLINE DEVICE int64_t DateAddHighPrecision(DateaddField field,
-                                                            const int64_t number,
-                                                            const int64_t timeval,
-                                                            const int64_t scale);
+extern "C" RUNTIME_EXPORT DEVICE int64_t
+DateAddHighPrecisionNullable(const DateaddField field,
+                             const int64_t number,
+                             const int64_t timeval,
+                             const int32_t dim,
+                             const int64_t null_val);
 
 #endif  // QUERYENGINE_DATEADD_H

@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,12 +16,13 @@
 
 #pragma once
 
-#include <glog/logging.h>
 #include <llvm/IR/BasicBlock.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Value.h>
+#include "Logger/Logger.h"
 
 #include "../../Shared/sqldefs.h"
+#include "../CgenState.h"
 #include "../IRCodegenUtils.h"
 
 #include <functional>
@@ -30,7 +31,8 @@
 enum class JoinLoopKind {
   UpperBound,  // loop join
   Set,         // one to many hash join
-  Singleton    // one to one hash join
+  Singleton,   // one to one hash join
+  MultiSet     // many to many hash join
 };
 
 // The domain of iteration for a join:
@@ -52,13 +54,23 @@ struct JoinLoopDomain {
 // we'll not generate IR for an actual loop.
 class JoinLoop {
  public:
+  using HoistedFiltersCallback = std::function<llvm::BasicBlock*(llvm::BasicBlock*,
+                                                                 llvm::BasicBlock*,
+                                                                 const std::string&,
+                                                                 llvm::Function*,
+                                                                 CgenState*)>;
+
   JoinLoop(const JoinLoopKind,
            const JoinType,
-           const std::function<JoinLoopDomain(const std::vector<llvm::Value*>&)>&,
-           const std::function<llvm::Value*(const std::vector<llvm::Value*>&)>&,
-           const std::function<void(llvm::Value*)>&,
+           const std::function<JoinLoopDomain(const std::vector<llvm::Value*>&)>&
+               iteration_domain_codegen,
+           const std::function<llvm::Value*(const std::vector<llvm::Value*>&)>&
+               outer_condition_match,
+           const std::function<void(llvm::Value*)>& found_outer_matches,
+           const HoistedFiltersCallback& hoisted_filters,
            const std::function<llvm::Value*(const std::vector<llvm::Value*>& prev_iters,
-                                            llvm::Value*)>&,
+                                            llvm::Value*)>& is_deleted,
+           const bool nested_loop_join = false,
            const std::string& name = "");
 
   static llvm::BasicBlock* codegen(
@@ -67,7 +79,11 @@ class JoinLoop {
           body_codegen,
       llvm::Value* outer_iter,
       llvm::BasicBlock* exit_bb,
-      llvm::IRBuilder<>& builder);
+      CgenState* cgen_state);
+
+  JoinLoopKind kind() const { return kind_; }
+
+  bool isNestedLoopJoin() const { return nested_loop_join_; }
 
  private:
   static std::pair<llvm::BasicBlock*, llvm::Value*> evaluateOuterJoinCondition(
@@ -77,7 +93,8 @@ class JoinLoop {
       llvm::Value* iteration_counter,
       llvm::Value* have_more_inner_rows,
       llvm::Value* found_an_outer_match_ptr,
-      llvm::IRBuilder<>& builder);
+      llvm::Value* current_condition_match_ptr,
+      CgenState* cgen_state);
 
   const JoinLoopKind kind_;
   // SQL type of the join.
@@ -93,6 +110,9 @@ class JoinLoop {
   // Callback provided from the executor which receives the IR boolean value which tracks
   // whether there are matches for the current iteration.
   const std::function<void(llvm::Value*)> found_outer_matches_;
+  // Callback to hoist left hand side filters through the join, evaluating the filters
+  // prior to evaluating the join (but within the same kernel)
+  const HoistedFiltersCallback hoisted_filters_;
   // Callback provided from the executor which returns if the current row (given by
   // position) is deleted. The second argument is true iff the iteration isn't done yet.
   // Useful for UpperBound and Set, which need to avoid fetching the deleted column from a
@@ -100,5 +120,7 @@ class JoinLoop {
   const std::function<llvm::Value*(const std::vector<llvm::Value*>& prev_iters,
                                    llvm::Value*)>
       is_deleted_;
+  // true if the join loop is for nested loop join
+  const bool nested_loop_join_;
   const std::string name_;
 };

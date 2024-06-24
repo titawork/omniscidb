@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,10 +16,9 @@
 
 #include "SpeculativeTopN.h"
 
+#include "Logger/Logger.h"
 #include "RelAlgExecutor.h"
 #include "ResultSet.h"
-
-#include <glog/logging.h>
 
 SpeculativeTopNMap::SpeculativeTopNMap() : unknown_(0) {}
 
@@ -113,6 +112,11 @@ std::shared_ptr<ResultSet> SpeculativeTopNMap::asRows(
     }
   }
   CHECK_EQ(size_t(2), ra_exe_unit.target_exprs.size());
+
+  // Top N key-value pairs are stored into a new ResultSet with a new
+  // QueryMemoryDescriptor to be passed over. We use row-wise GroupByBaselineHash, as it
+  // is the most flexible layout for dealing with key-value pairs in the storage (for
+  // iterations and reduction).
   auto query_mem_desc_rs = query_mem_desc;
   query_mem_desc_rs.setQueryDescriptionType(QueryDescriptionType::GroupByBaselineHash);
   query_mem_desc_rs.setOutputColumnar(false);
@@ -120,16 +124,23 @@ std::shared_ptr<ResultSet> SpeculativeTopNMap::asRows(
   query_mem_desc_rs.clearSlotInfo();
   query_mem_desc_rs.addColSlotInfo({std::make_tuple(8, 8)});
   query_mem_desc_rs.addColSlotInfo({std::make_tuple(8, 8)});
+  query_mem_desc_rs.setAllTargetGroupbyIndices({-1, -1});
+
   auto rs = std::make_shared<ResultSet>(
       target_exprs_to_infos(ra_exe_unit.target_exprs, query_mem_desc_rs),
       ExecutorDeviceType::CPU,
       query_mem_desc_rs,
       row_set_mem_owner,
-      executor);
+      executor->blockSize(),
+      executor->gridSize());
   auto rs_storage = rs->allocateStorage();
   auto rs_buff = reinterpret_cast<int64_t*>(rs_storage->getUnderlyingBuffer());
   const bool count_first =
       dynamic_cast<const Analyzer::AggExpr*>(ra_exe_unit.target_exprs[0]);
+
+  // going throug the TopN results, and properly storing them into the GroupByBaselineHash
+  // layout (including the group column (key) and two agg columns (key and value)) to
+  // imitate the regular Group By query's result.
   for (size_t i = 0; i < num_rows; ++i) {
     rs_buff[0] = vec[i].key;
     int64_t col0 = vec[i].key;
@@ -146,7 +157,8 @@ std::shared_ptr<ResultSet> SpeculativeTopNMap::asRows(
 
 void SpeculativeTopNBlacklist::add(const std::shared_ptr<Analyzer::Expr> expr,
                                    const bool desc) {
-  for (const auto e : blacklist_) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  for (const auto& e : blacklist_) {
     CHECK(!(*e.first == *expr) || e.second != desc);
   }
   blacklist_.emplace_back(expr, desc);
@@ -154,7 +166,8 @@ void SpeculativeTopNBlacklist::add(const std::shared_ptr<Analyzer::Expr> expr,
 
 bool SpeculativeTopNBlacklist::contains(const std::shared_ptr<Analyzer::Expr> expr,
                                         const bool desc) const {
-  for (const auto e : blacklist_) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  for (const auto& e : blacklist_) {
     if (*e.first == *expr && e.second == desc) {
       return true;
     }
@@ -162,6 +175,16 @@ bool SpeculativeTopNBlacklist::contains(const std::shared_ptr<Analyzer::Expr> ex
   return false;
 }
 
+/**
+ * SpeculativeTopN sort is used when there are multiple already sorted results
+ * (when GPU sort is used on multiple devices, refer to
+ * GroupByAndAggregate::gpuCanHandleOrderEntries), and we want to pick top n elements
+ * (LIMIT caluse exists), and we have already chosen this algorithm when creating the
+ * proper work unit (refer to RelAlgExecutor::createSortInputWorkUnit).
+ *
+ * Besides, we currently only support cases with 2 target expressions and only with COUNT
+ * aggregate (similar limitations exists in whether or not we support GPU sort).
+ */
 bool use_speculative_top_n(const RelAlgExecutionUnit& ra_exe_unit,
                            const QueryMemoryDescriptor& query_mem_desc) {
   if (g_cluster) {
@@ -172,7 +195,7 @@ bool use_speculative_top_n(const RelAlgExecutionUnit& ra_exe_unit,
   }
   for (const auto target_expr : ra_exe_unit.target_exprs) {
     const auto agg_expr = dynamic_cast<const Analyzer::AggExpr*>(target_expr);
-    if (agg_expr && agg_expr->get_aggtype() != kCOUNT) {
+    if (agg_expr && !shared::is_any<kCOUNT, kCOUNT_IF>(agg_expr->get_aggtype())) {
       return false;
     }
   }

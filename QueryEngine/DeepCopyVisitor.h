@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -50,10 +50,14 @@ class DeepCopyVisitor : public ScalarExprVisitor<std::shared_ptr<Analyzer::Expr>
                                        visit(bin_oper->get_right_operand()));
   }
 
+  RetType visitGeoExpr(const Analyzer::GeoExpr* geo_expr) const override {
+    return geo_expr->deep_copy();
+  }
+
   RetType visitInValues(const Analyzer::InValues* in_values) const override {
     const auto& value_list = in_values->get_value_list();
     std::list<RetType> new_list;
-    for (const auto in_value : value_list) {
+    for (const auto& in_value : value_list) {
       new_list.push_back(visit(in_value.get()));
     }
     return makeExpr<Analyzer::InValues>(visit(in_values->get_arg()), new_list);
@@ -75,6 +79,18 @@ class DeepCopyVisitor : public ScalarExprVisitor<std::shared_ptr<Analyzer::Expr>
     return makeExpr<Analyzer::KeyForStringExpr>(visit(expr->get_arg()));
   }
 
+  RetType visitSampleRatio(const Analyzer::SampleRatioExpr* expr) const override {
+    return makeExpr<Analyzer::SampleRatioExpr>(visit(expr->get_arg()));
+  }
+
+  RetType visitMLPredict(const Analyzer::MLPredictExpr* expr) const override {
+    return expr->deep_copy();
+  }
+
+  RetType visitPCAProject(const Analyzer::PCAProjectExpr* expr) const override {
+    return expr->deep_copy();
+  }
+
   RetType visitCardinality(const Analyzer::CardinalityExpr* cardinality) const override {
     return makeExpr<Analyzer::CardinalityExpr>(visit(cardinality->get_arg()));
   }
@@ -93,6 +109,15 @@ class DeepCopyVisitor : public ScalarExprVisitor<std::shared_ptr<Analyzer::Expr>
     return makeExpr<Analyzer::RegexpExpr>(visit(regexp->get_arg()),
                                           visit(regexp->get_pattern_expr()),
                                           escape_expr ? visit(escape_expr) : nullptr);
+  }
+
+  RetType visitWidthBucket(
+      const Analyzer::WidthBucketExpr* width_bucket_expr) const override {
+    return makeExpr<Analyzer::WidthBucketExpr>(
+        visit(width_bucket_expr->get_target_value()),
+        visit(width_bucket_expr->get_lower_bound()),
+        visit(width_bucket_expr->get_upper_bound()),
+        visit(width_bucket_expr->get_partition_count()));
   }
 
   RetType visitCaseExpr(const Analyzer::CaseExpr* case_expr) const override {
@@ -129,7 +154,33 @@ class DeepCopyVisitor : public ScalarExprVisitor<std::shared_ptr<Analyzer::Expr>
     }
     const auto& type_info = array_expr->get_type_info();
     return makeExpr<Analyzer::ArrayExpr>(
-        type_info, args_copy, array_expr->getExprIndex());
+        type_info, args_copy, array_expr->isNull(), array_expr->isLocalAlloc());
+  }
+
+  RetType visitGeoUOper(const Analyzer::GeoUOper* geo_expr) const override {
+    std::vector<std::shared_ptr<Analyzer::Expr>> args0_copy;
+    for (const auto& arg : geo_expr->getArgs0()) {
+      args0_copy.push_back(visit(arg.get()));
+    }
+    const auto& ti0 = geo_expr->getTypeInfo0();
+    const auto& type_info = geo_expr->get_type_info();
+    return makeExpr<Analyzer::GeoUOper>(geo_expr->getOp(), type_info, ti0, args0_copy);
+  }
+
+  RetType visitGeoBinOper(const Analyzer::GeoBinOper* geo_expr) const override {
+    std::vector<std::shared_ptr<Analyzer::Expr>> args0_copy;
+    for (const auto& arg : geo_expr->getArgs0()) {
+      args0_copy.push_back(visit(arg.get()));
+    }
+    std::vector<std::shared_ptr<Analyzer::Expr>> args1_copy;
+    for (const auto& arg : geo_expr->getArgs1()) {
+      args1_copy.push_back(visit(arg.get()));
+    }
+    const auto& ti0 = geo_expr->getTypeInfo0();
+    const auto& ti1 = geo_expr->getTypeInfo1();
+    const auto& type_info = geo_expr->get_type_info();
+    return makeExpr<Analyzer::GeoBinOper>(
+        geo_expr->getOp(), type_info, ti0, ti1, args0_copy, args1_copy);
   }
 
   RetType visitWindowFunction(
@@ -147,12 +198,20 @@ class DeepCopyVisitor : public ScalarExprVisitor<std::shared_ptr<Analyzer::Expr>
       order_keys_copy.push_back(visit(order_key.get()));
     }
     const auto& type_info = window_func->get_type_info();
-    return makeExpr<Analyzer::WindowFunction>(type_info,
-                                              window_func->getKind(),
-                                              args_copy,
-                                              partition_keys_copy,
-                                              order_keys_copy,
-                                              window_func->getCollation());
+    return makeExpr<Analyzer::WindowFunction>(
+        type_info,
+        window_func->getKind(),
+        args_copy,
+        partition_keys_copy,
+        order_keys_copy,
+        window_func->getFrameBoundType(),
+        window_func->getFrameStartBound()->deep_copy(),
+        window_func->getFrameEndBound()->deep_copy(),
+        window_func->getCollation());
+  }
+
+  RetType visitStringOper(const Analyzer::StringOper* string_oper) const override {
+    return string_oper->deep_copy();
   }
 
   RetType visitFunctionOper(const Analyzer::FunctionOper* func_oper) const override {
@@ -200,7 +259,7 @@ class DeepCopyVisitor : public ScalarExprVisitor<std::shared_ptr<Analyzer::Expr>
                                        agg->get_aggtype(),
                                        arg,
                                        agg->get_is_distinct(),
-                                       agg->get_error_rate());
+                                       agg->get_arg1());
   }
 
   RetType visitOffsetInFragment(const Analyzer::OffsetInFragment*) const override {

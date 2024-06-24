@@ -1,5 +1,28 @@
 #!/usr/bin/env bash
 
+# Copyright 2022 HEAVY.AI, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# NOTE: This will perform a full system update via the command yay -Suy.
+# See https://wiki.archlinux.org/title/System_maintenance#Partial_upgrades_are_unsupported
+# for more information.
+
+# Must be run from the scripts/ directory as the non-root user.
+# Since we use an older version of Apache Arrow, automatic updates to arrow can be avoided by
+# adding it to the uncommented IgnorePkg line in /etc/pacman.conf. Example:
+# IgnorePkg   = arrow
+
 set -e
 set -x
 
@@ -7,53 +30,57 @@ cd "$( dirname "${BASH_SOURCE[0]}" )"
 
 hash yay || { echo >&2 "yay is required but is not installed. Aborting."; exit 1; }
 
+unset CMAKE_GENERATOR
+
 # Install all normal dependencies
-yay -S \
+yay -Suy \
+    aws-sdk-cpp \
     blosc \
     boost \
-    clang \
+    c-ares \
+    clang14 \
     cmake \
+    compiler-rt14 \
     cuda \
     doxygen \
+    flex \
+    fmt \
     gcc \
     gdal \
+    geos \
     git \
-    glbinding \
+    glm \
     glslang \
     go \
-    google-glog \
+    intel-tbb \
     jdk-openjdk \
-    llvm \
+    libiodbc \
+    librdkafka \
+    llvm14 \
     lz4 \
     maven \
+    ninja \
+    pdal \
     python-numpy \
     snappy \
+    spirv-cross \
     thrift \
+    vulkan-headers \
     wget \
     zlib
 
 # Install Arrow
-# Package cannot be built in a path that incudes "internal" as a substring.
-ARROW_PKG_DIR=$HOME/omnisci_tmp_arrow
-mkdir -p $ARROW_PKG_DIR
-cp arch/arrow/PKGBUILD $ARROW_PKG_DIR
-pushd $ARROW_PKG_DIR
-makepkg -cis
-rm -f PKGBUILD
-popd
-mv $ARROW_PKG_DIR/{apache-arrow-*.tar.gz,arrow-*.pkg.tar.xz} arch/arrow/
-rmdir $ARROW_PKG_DIR
+( cd arch/arrow
+  patch -p4 < heavyai.patch
+  makepkg -cis
+)
 
-# Install SPIRV-Cross
-pushd arch/spirv-cross
-makepkg -cis
-popd
+# Install oneDAL
+( cd arch/onedal
+  makepkg -cis
+)
 
-# Install Bison++ from source
-wget --continue https://dependencies.mapd.com/thirdparty/bisonpp-1.21-45.tar.gz
-tar xvf bisonpp-1.21-45.tar.gz
-pushd bison++-1.21
-./configure
-make -j $(nproc)
-sudo make install
-popd
+# Install Bison++
+( cd arch/bison++
+  makepkg -cis
+)

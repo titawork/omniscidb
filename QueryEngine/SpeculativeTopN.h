@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,11 +16,9 @@
 
 /**
  * @file    SpeculativeTopN.h
- * @author  Alex Suhan <alex@mapd.com>
  * @brief   Speculative top N algorithm.
  *
- * Copyright (c) 2016 MapD Technologies, Inc.  All rights reserved.
- **/
+ */
 
 #ifndef QUERYENGINE_SPECULATIVETOPN_H
 #define QUERYENGINE_SPECULATIVETOPN_H
@@ -28,6 +26,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
@@ -79,7 +78,17 @@ class SpeculativeTopNMap {
 
 class SpeculativeTopNFailed : public std::runtime_error {
  public:
-  SpeculativeTopNFailed() : std::runtime_error("SpeculativeTopNFailed"){};
+  SpeculativeTopNFailed(const std::string& msg)
+      : std::runtime_error("SpeculativeTopNFailed: " + msg)
+      , failed_during_iteration_(false) {}
+
+  SpeculativeTopNFailed()
+      : std::runtime_error("SpeculativeTopNFailed"), failed_during_iteration_(true) {}
+
+  bool failedDuringIteration() const { return failed_during_iteration_; }
+
+ private:
+  bool failed_during_iteration_;
 };
 
 class SpeculativeTopNBlacklist {
@@ -88,6 +97,7 @@ class SpeculativeTopNBlacklist {
   bool contains(const std::shared_ptr<Analyzer::Expr> expr, const bool desc) const;
 
  private:
+  mutable std::mutex mutex_;
   std::vector<std::pair<std::shared_ptr<Analyzer::Expr>, bool>> blacklist_;
 };
 

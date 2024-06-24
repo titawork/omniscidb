@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,17 +14,20 @@
  * limitations under the License.
  */
 
-#include "ExpressionRewrite.h"
-#include "../Analyzer/Analyzer.h"
-#include "../Shared/sqldefs.h"
-#include "DeepCopyVisitor.h"
-#include "Execute.h"
-#include "RelAlgTranslator.h"
-#include "ScalarExprVisitor.h"
-#include "WindowExpressionRewrite.h"
+#include "QueryEngine/ExpressionRewrite.h"
 
-#include <glog/logging.h>
+#include <algorithm>
+#include <boost/locale/conversion.hpp>
 #include <unordered_set>
+
+#include "Logger/Logger.h"
+#include "Parser/ParserNode.h"
+#include "QueryEngine/DeepCopyVisitor.h"
+#include "QueryEngine/Execute.h"
+#include "QueryEngine/ScalarExprVisitor.h"
+#include "QueryEngine/WindowExpressionRewrite.h"
+#include "Shared/sqldefs.h"
+#include "StringOps/StringOps.h"
 
 namespace {
 
@@ -77,6 +80,21 @@ class OrToInVisitor : public ScalarExprVisitor<std::shared_ptr<Analyzer::InValue
 
   std::shared_ptr<Analyzer::InValues> visitKeyForString(
       const Analyzer::KeyForStringExpr*) const override {
+    return nullptr;
+  }
+
+  std::shared_ptr<Analyzer::InValues> visitSampleRatio(
+      const Analyzer::SampleRatioExpr*) const override {
+    return nullptr;
+  }
+
+  std::shared_ptr<Analyzer::InValues> visitMLPredict(
+      const Analyzer::MLPredictExpr*) const override {
+    return nullptr;
+  }
+
+  std::shared_ptr<Analyzer::InValues> visitPCAProject(
+      const Analyzer::PCAProjectExpr*) const override {
     return nullptr;
   }
 
@@ -136,13 +154,15 @@ class OrToInVisitor : public ScalarExprVisitor<std::shared_ptr<Analyzer::InValue
     if (!lhs || !rhs) {
       return nullptr;
     }
-    if (!(*lhs->get_arg() == *rhs->get_arg())) {
-      return nullptr;
+
+    if (lhs->get_arg()->get_type_info() == rhs->get_arg()->get_type_info() &&
+        (*lhs->get_arg() == *rhs->get_arg())) {
+      auto union_values = lhs->get_value_list();
+      const auto& rhs_values = rhs->get_value_list();
+      union_values.insert(union_values.end(), rhs_values.begin(), rhs_values.end());
+      return makeExpr<Analyzer::InValues>(lhs->get_own_arg(), union_values);
     }
-    auto union_values = lhs->get_value_list();
-    const auto& rhs_values = rhs->get_value_list();
-    union_values.insert(union_values.end(), rhs_values.begin(), rhs_values.end());
-    return makeExpr<Analyzer::InValues>(lhs->get_own_arg(), union_values);
+    return nullptr;
   }
 };
 
@@ -188,6 +208,8 @@ class ArrayElementStringLiteralEncodingVisitor : public DeepCopyVisitor {
 
         transient_dict_type_info.set_compression(kENCODING_DICT);
         transient_dict_type_info.set_comp_param(TRANSIENT_DICT_ID);
+        transient_dict_type_info.setStringDictKey(
+            shared::StringDictKey::kTransientDictKey);
         transient_dict_type_info.set_fixed_size();
         args_copy.push_back(element_expr_ptr->add_cast(transient_dict_type_info));
       }
@@ -195,7 +217,7 @@ class ArrayElementStringLiteralEncodingVisitor : public DeepCopyVisitor {
 
     const auto& type_info = array_expr->get_type_info();
     return makeExpr<Analyzer::ArrayExpr>(
-        type_info, args_copy, array_expr->getExprIndex());
+        type_info, args_copy, array_expr->isNull(), array_expr->isLocalAlloc());
   }
 };
 
@@ -425,6 +447,7 @@ class ConstantFoldingVisitor : public DeepCopyVisitor {
       casts_.insert({unvisited_operand, ti});
     }
     const auto operand = visit(unvisited_operand);
+
     const auto& operand_ti = operand->get_type_info();
     const auto operand_type =
         operand_ti.is_decimal() ? decimal_to_int_type(operand_ti) : operand_ti.get_type();
@@ -546,7 +569,7 @@ class ConstantFoldingVisitor : public DeepCopyVisitor {
     }
 
     if (optype == kAND && lhs_type == rhs_type && lhs_type == kBOOLEAN) {
-      if (const_rhs) {
+      if (const_rhs && !const_rhs->get_is_null()) {
         auto rhs_datum = const_rhs->get_constval();
         if (rhs_datum.boolval == false) {
           Datum d;
@@ -557,7 +580,7 @@ class ConstantFoldingVisitor : public DeepCopyVisitor {
         // lhs && true --> lhs
         return lhs;
       }
-      if (const_lhs) {
+      if (const_lhs && !const_lhs->get_is_null()) {
         auto lhs_datum = const_lhs->get_constval();
         if (lhs_datum.boolval == false) {
           Datum d;
@@ -570,7 +593,7 @@ class ConstantFoldingVisitor : public DeepCopyVisitor {
       }
     }
     if (optype == kOR && lhs_type == rhs_type && lhs_type == kBOOLEAN) {
-      if (const_rhs) {
+      if (const_rhs && !const_rhs->get_is_null()) {
         auto rhs_datum = const_rhs->get_constval();
         if (rhs_datum.boolval == true) {
           Datum d;
@@ -581,7 +604,7 @@ class ConstantFoldingVisitor : public DeepCopyVisitor {
         // lhs || false --> lhs
         return lhs;
       }
-      if (const_lhs) {
+      if (const_lhs && !const_lhs->get_is_null()) {
         auto lhs_datum = const_lhs->get_constval();
         if (lhs_datum.boolval == true) {
           Datum d;
@@ -594,6 +617,22 @@ class ConstantFoldingVisitor : public DeepCopyVisitor {
       }
     }
     if (*lhs == *rhs) {
+      if (!lhs_ti.get_notnull()) {
+        CHECK(!rhs_ti.get_notnull());
+        // We can't fold the ostensible tautaulogy
+        // for nullable lhs and rhs types, as
+        // lhs <> rhs when they are null
+
+        // We likely could turn this into a lhs is not null
+        // operatation, but is it worth it?
+        return makeExpr<Analyzer::BinOper>(ti,
+                                           bin_oper->get_contains_agg(),
+                                           bin_oper->get_optype(),
+                                           bin_oper->get_qualifier(),
+                                           lhs,
+                                           rhs);
+      }
+      CHECK(rhs_ti.get_notnull());
       // Tautologies: v=v; v<=v; v>=v
       if (optype == kEQ || optype == kLE || optype == kGE) {
         Datum d;
@@ -653,7 +692,67 @@ class ConstantFoldingVisitor : public DeepCopyVisitor {
                                        rhs);
   }
 
+  std::shared_ptr<Analyzer::Expr> visitStringOper(
+      const Analyzer::StringOper* string_oper) const override {
+    // Todo(todd): For clarity and modularity we should move string
+    // operator rewrites into their own visitor class.
+    // String operation rewrites were originally put here as they only
+    // handled string operators on rewrite, but now handle variable
+    // inputs as well.
+    const auto original_args = string_oper->getOwnArgs();
+    std::vector<std::shared_ptr<Analyzer::Expr>> rewritten_args;
+    const auto non_literal_arity = string_oper->getNonLiteralsArity();
+    const auto parent_in_string_op_chain = in_string_op_chain_;
+    const auto in_string_op_chain = non_literal_arity <= 1UL;
+    in_string_op_chain_ = in_string_op_chain;
+
+    size_t rewritten_arg_literal_arity = 0;
+    for (auto original_arg : original_args) {
+      rewritten_args.emplace_back(visit(original_arg.get()));
+      if (dynamic_cast<const Analyzer::Constant*>(rewritten_args.back().get())) {
+        rewritten_arg_literal_arity++;
+      }
+    }
+    in_string_op_chain_ = parent_in_string_op_chain;
+    const auto kind = string_oper->get_kind();
+    const auto& return_ti = string_oper->get_type_info();
+
+    if (string_oper->getArity() == rewritten_arg_literal_arity) {
+      Analyzer::StringOper literal_string_oper(
+          kind, string_oper->get_type_info(), rewritten_args);
+      const auto literal_args = literal_string_oper.getLiteralArgs();
+      const auto string_op_info =
+          StringOps_Namespace::StringOpInfo(kind, return_ti, literal_args);
+      if (return_ti.is_string()) {
+        const auto literal_result =
+            StringOps_Namespace::apply_string_op_to_literals(string_op_info);
+        return Parser::StringLiteral::analyzeValue(literal_result.first,
+                                                   literal_result.second);
+      }
+      const auto literal_datum =
+          StringOps_Namespace::apply_numeric_op_to_literals(string_op_info);
+      auto nullable_return_ti = return_ti;
+      nullable_return_ti.set_notnull(false);
+      return makeExpr<Analyzer::Constant>(nullable_return_ti,
+                                          IsNullDatum(literal_datum, nullable_return_ti),
+                                          literal_datum);
+    }
+    chained_string_op_exprs_.emplace_back(
+        makeExpr<Analyzer::StringOper>(kind, return_ti, rewritten_args));
+    if (parent_in_string_op_chain && in_string_op_chain) {
+      CHECK(rewritten_args[0]->get_type_info().is_string());
+      return rewritten_args[0]->deep_copy();
+    } else {
+      auto new_string_oper = makeExpr<Analyzer::StringOper>(
+          kind, return_ti, rewritten_args, chained_string_op_exprs_);
+      chained_string_op_exprs_.clear();
+      return new_string_oper;
+    }
+  }
+
  protected:
+  mutable bool in_string_op_chain_{false};
+  mutable std::vector<std::shared_ptr<Analyzer::Expr>> chained_string_op_exprs_;
   mutable std::unordered_map<const Analyzer::Expr*, const SQLTypeInfo> casts_;
   mutable int32_t num_overflows_;
 
@@ -704,54 +803,488 @@ Analyzer::ExpressionPtr rewrite_expr(const Analyzer::Expr* expr) {
 
 namespace {
 
-static const std::unordered_set<std::string> overlaps_supported_functions = {
-    "ST_Contains_MultiPolygon_Point",
-    "ST_Contains_Polygon_Point"};
+void update_input_to_nest_lv(
+    std::unordered_map<const RelAlgNode*, int>& input_to_nest_level,
+    shared::ColumnKey const& column_key,
+    int target_nest_lv) {
+  for (auto& kv : input_to_nest_level) {
+    auto ra = kv.first;
+    auto table_keys = get_physical_table_inputs(ra);
+    if (std::any_of(table_keys.begin(),
+                    table_keys.end(),
+                    [column_key](shared::TableKey const& key) {
+                      return key.table_id == column_key.table_id &&
+                             key.db_id == column_key.db_id;
+                    })) {
+      input_to_nest_level[ra] = target_nest_lv;
+      return;
+    }
+  }
+}
+
+int update_input_desc(std::vector<InputDescriptor>& input_descs,
+                      shared::ColumnKey const& column_key,
+                      int target_nest_lv) {
+  int num_input_descs = static_cast<int>(input_descs.size());
+  for (int i = 0; i < num_input_descs; i++) {
+    auto const tbl_key = input_descs[i].getTableKey();
+    if (tbl_key.db_id == column_key.db_id && tbl_key.table_id == column_key.table_id) {
+      input_descs[i] = InputDescriptor(tbl_key.db_id, tbl_key.table_id, target_nest_lv);
+      return i;
+    }
+  }
+  return -1;
+}
+
+auto update_input_col_desc(
+    std::list<std::shared_ptr<const InputColDescriptor>>& input_col_desc,
+    shared::ColumnKey const& column_key,
+    int target_nest_lv) {
+  for (auto it = input_col_desc.begin(); it != input_col_desc.end(); it++) {
+    auto const tbl_key = (*it)->getScanDesc().getTableKey();
+    if (tbl_key.db_id == column_key.db_id && tbl_key.table_id == column_key.table_id) {
+      (*it) = std::make_shared<InputColDescriptor>(
+          (*it)->getColId(), tbl_key.table_id, tbl_key.db_id, target_nest_lv);
+      return it;
+    }
+  }
+  return input_col_desc.end();
+}
 
 }  // namespace
 
-boost::optional<OverlapsJoinConjunction> rewrite_overlaps_conjunction(
-    const std::shared_ptr<Analyzer::Expr> expr) {
-  auto func_oper = dynamic_cast<Analyzer::FunctionOper*>(expr.get());
-  if (func_oper) {
-    // TODO(adb): consider converting unordered set to an unordered map, potentially
-    // storing the rewrite function we want to apply in the map
-    if (overlaps_supported_functions.find(func_oper->getName()) !=
-        overlaps_supported_functions.end()) {
-      CHECK_GE(func_oper->getArity(), size_t(3));
+BoundingBoxIntersectJoinTranslationResult
+translate_bounding_box_intersect_with_reordering(
+    const std::shared_ptr<Analyzer::Expr> expr,
+    std::vector<InputDescriptor>& input_descs,
+    std::unordered_map<const RelAlgNode*, int>& input_to_nest_level,
+    std::vector<size_t>& input_permutation,
+    std::list<std::shared_ptr<const InputColDescriptor>>& input_col_desc,
+    const BoundingBoxIntersectJoinRewriteType rewrite_type,
+    Executor const* executor) {
+  auto collect_table_cardinality = [&executor](const Analyzer::Expr* lhs,
+                                               const Analyzer::Expr* rhs) {
+    const auto lhs_cv = dynamic_cast<const Analyzer::ColumnVar*>(lhs);
+    const auto rhs_cv = dynamic_cast<const Analyzer::ColumnVar*>(rhs);
+    if (lhs_cv && rhs_cv) {
+      return std::make_pair<int64_t, int64_t>(
+          get_table_cardinality(lhs_cv->getTableKey(), executor),
+          get_table_cardinality(rhs_cv->getTableKey(), executor));
+    }
+    // otherwise, return an invalid table cardinality
+    return std::make_pair<int64_t, int64_t>(-1, -1);
+  };
 
-      DeepCopyVisitor deep_copy_visitor;
+  auto has_invalid_join_col_order = [](const Analyzer::Expr* lhs,
+                                       const Analyzer::Expr* rhs) {
+    // Check for compatible join ordering. If the join ordering does not match expected
+    // ordering for bounding box intersection, the join builder will fail.
+    std::set<int> lhs_rte_idx;
+    lhs->collect_rte_idx(lhs_rte_idx);
+    std::set<int> rhs_rte_idx;
+    rhs->collect_rte_idx(rhs_rte_idx);
+    auto has_invalid_num_join_cols = lhs_rte_idx.size() != 1 || rhs_rte_idx.size() != 1;
+    auto has_invalid_rte_idx = lhs_rte_idx > rhs_rte_idx;
+    return std::make_pair(has_invalid_num_join_cols || has_invalid_rte_idx,
+                          has_invalid_rte_idx);
+  };
+  bool swap_args = false;
+  auto convert_to_range_join_oper =
+      [&](std::string_view func_name,
+          const std::shared_ptr<Analyzer::Expr> expr,
+          const Analyzer::BinOper* range_join_expr,
+          const Analyzer::GeoOperator* lhs,
+          const Analyzer::Constant* rhs) -> std::shared_ptr<Analyzer::BinOper> {
+    if (BoundingBoxIntersectJoinSupportedFunction::is_range_join_rewrite_target_func(
+            func_name)) {
+      CHECK_EQ(lhs->size(), size_t(2));
+      auto l_arg = lhs->getOperand(0);
+      // we try to build a join hash table for bounding box intersection based on the rhs
+      auto r_arg = lhs->getOperand(1);
+      const bool is_geography = l_arg->get_type_info().get_subtype() == kGEOGRAPHY ||
+                                r_arg->get_type_info().get_subtype() == kGEOGRAPHY;
+      if (is_geography) {
+        VLOG(1) << "Range join not yet supported for geodesic distance "
+                << expr->toString();
+        return nullptr;
+      }
+      // Check for compatible join ordering. If the join ordering does not match expected
+      // ordering for bounding box intersection, the join builder will fail.
+      Analyzer::Expr* range_join_arg = r_arg;
+      Analyzer::Expr* bin_oper_arg = l_arg;
+      auto invalid_range_join_qual =
+          has_invalid_join_col_order(bin_oper_arg, range_join_arg);
+      if (invalid_range_join_qual.first) {
+        LOG(INFO) << "Unable to rewrite " << func_name
+                  << " to exploit bounding box intersection. Cannot build hash table "
+                     "over LHS type. "
+                     "Check join order.\n"
+                  << range_join_expr->toString();
+        return nullptr;
+      }
+      // swapping rule for range join argument
+      //    lhs    | rhs
+      // 1. pt     | pt     : swap if |lhs| < |rhs| or has invalid rte values
+      // 2. pt     | non-pt : return nullptr
+      // 3. non-pt | pt     : return nullptr
+      // 4. non-pt | non-pt : return nullptr
+      // todo (yoonmin) : improve logic for cases 2 and 3
+      bool lhs_is_point{l_arg->get_type_info().get_type() == kPOINT};
+      bool rhs_is_point{r_arg->get_type_info().get_type() == kPOINT};
+      if (!lhs_is_point || !rhs_is_point) {
+        // case 2 ~ 4
+        VLOG(1) << "Currently, we only support range hash join for Point-to-Point "
+                   "distance query: fallback to a loop join";
+        return nullptr;
+      }
+      auto const card_info = collect_table_cardinality(range_join_arg, bin_oper_arg);
+      if (invalid_range_join_qual.second && card_info.first > 0 && lhs_is_point) {
+        swap_args = true;
+      } else if (card_info.first >= 0 && card_info.first < card_info.second) {
+        swap_args = true;
+      }
+      if (swap_args) {
+        // todo (yoonmin) : find the best reordering scheme when a query has multiple
+        // range join candidates; it needs a (cost-based) plan enumeration logic
+        // in our optimizer
+        auto r_cv = dynamic_cast<Analyzer::ColumnVar*>(lhs->getOperand(1));
+        auto l_cv = dynamic_cast<Analyzer::ColumnVar*>(lhs->getOperand(0));
+        if (r_cv && l_cv && input_descs.size() == 2) {
+          // to exploit range hash join, we need to assign point geometry to rhs
+          // specifically, we need to propagate the changes made here via various
+          // query metadata such as `input_desc`, `input_col_desc` and so on
+          // otherwise, we do not try swapping join arguments for safety
+          // and we do not try argument swapping if the input query has more two
+          // input tables; but it is enough to cover most of immerse use-cases
+          auto const r_col_key = r_cv->getColumnKey();
+          auto const l_col_key = l_cv->getColumnKey();
+          int r_rte_idx = r_cv->get_rte_idx();
+          int l_rte_idx = l_cv->get_rte_idx();
+          r_cv->set_rte_idx(l_rte_idx);
+          l_cv->set_rte_idx(r_rte_idx);
+          update_input_to_nest_lv(input_to_nest_level, r_col_key, l_rte_idx);
+          update_input_to_nest_lv(input_to_nest_level, l_col_key, r_rte_idx);
+          auto const r_input_desc_idx =
+              update_input_desc(input_descs, r_col_key, l_rte_idx);
+          CHECK_GE(r_input_desc_idx, 0);
+          auto const l_input_desc_idx =
+              update_input_desc(input_descs, l_col_key, r_rte_idx);
+          CHECK_GE(l_input_desc_idx, 0);
+          auto r_input_col_desc_it =
+              update_input_col_desc(input_col_desc, r_col_key, l_rte_idx);
+          CHECK(r_input_col_desc_it != input_col_desc.end());
+          auto l_input_col_desc_it =
+              update_input_col_desc(input_col_desc, l_col_key, r_rte_idx);
+          CHECK(l_input_col_desc_it != input_col_desc.end());
+          if (!input_permutation.empty()) {
+            auto r_itr =
+                std::find(input_permutation.begin(), input_permutation.end(), r_rte_idx);
+            CHECK(r_itr != input_permutation.end());
+            auto l_itr =
+                std::find(input_permutation.begin(), input_permutation.end(), l_rte_idx);
+            CHECK(l_itr != input_permutation.end());
+            std::swap(*r_itr, *l_itr);
+          }
+          std::swap(input_descs[r_input_desc_idx], input_descs[l_input_desc_idx]);
+          std::swap(r_input_col_desc_it, l_input_col_desc_it);
+          r_arg = lhs->getOperand(0);
+          l_arg = lhs->getOperand(1);
+          VLOG(1) << "Swap range join qual's input arguments to exploit hash join "
+                     "framework for bounding box intersection";
+          invalid_range_join_qual.first = false;
+        }
+      }
+      const bool inclusive = range_join_expr->get_optype() == kLE;
+      auto range_expr = makeExpr<Analyzer::RangeOper>(
+          inclusive, inclusive, r_arg->deep_copy(), rhs->deep_copy());
+      VLOG(1) << "Successfully converted to range hash join";
+      return makeExpr<Analyzer::BinOper>(
+          kBOOLEAN, kBBOX_INTERSECT, kONE, l_arg->deep_copy(), range_expr);
+    }
+    return nullptr;
+  };
+
+  /*
+   * Currently, our hash join framework for bounding box intersection (bbox-intersect)
+   * supports limited set of join quals when 1) the FunctionOperator is listed in the
+   * function list, i.e., is_bbox_intersect_supported_func, 2) the argument order of the
+   * join qual must match the input argument order of the corresponding native function,
+   * and 3) input tables match rte index requirement (the column used to build a hash
+   * table has larger rte compared with that of probing column). Depending on the type
+   * of the function, we try to convert it to corresponding hash join qual if possible.
+   * After rewriting, we create a join operator w/ bbox-intersect which is converted from
+   * the original expression and return BoundingBoxIntersectJoinConjunction object which
+   * is a pair of 1) the original expr and 2) converted join expr w/ bbox-intersect. Here,
+   * returning the original expr means we additionally call its corresponding native
+   * function to compute the result accurately (i.e., bbox-intersect hash join operates a
+   * kind of filter expression which may include false-positive of the true resultset).
+   * Note that ST_IntersectsBox is the only function that does not return the original
+   * expr.
+   * */
+  std::shared_ptr<Analyzer::BinOper> bbox_intersect_oper{nullptr};
+  bool needs_to_return_original_expr = false;
+  std::string func_name{""};
+  if (rewrite_type == BoundingBoxIntersectJoinRewriteType::BBOX_INTERSECT_JOIN) {
+    auto func_oper = dynamic_cast<Analyzer::FunctionOper*>(expr.get());
+    CHECK(func_oper);
+    func_name = func_oper->getName();
+    if (!g_enable_hashjoin_many_to_many &&
+        BoundingBoxIntersectJoinSupportedFunction::is_many_to_many_func(func_name)) {
+      LOG(WARNING) << "Many-to-many hashjoin support is disabled, unable to rewrite "
+                   << func_oper->toString() << " to use accelerated geo join.";
+      return BoundingBoxIntersectJoinTranslationResult::createEmptyResult();
+    }
+    DeepCopyVisitor deep_copy_visitor;
+    if (func_name == BoundingBoxIntersectJoinSupportedFunction::ST_INTERSECTSBOX_sv) {
+      CHECK_GE(func_oper->getArity(), size_t(2));
+      // this case returns {empty quals, bbox_intersect join quals} b/c our join key
+      // matching logic for this case is the same as the implementation of
+      // ST_IntersectsBox function Note that we can build a join hash table for
+      // bbox_intersect regardless of table ordering and the argument order in this case
+      // b/c selecting lhs and rhs by arguments 0 and 1 always match the rte index
+      // requirement (rte_lhs < rte_rhs) so what table ordering we take, the rte index
+      // requirement satisfies
+      // TODO(adb): we will likely want to actually check for true bbox_intersect, but
+      // this works for now
+      auto lhs = func_oper->getOwnArg(0);
+      auto rewritten_lhs = deep_copy_visitor.visit(lhs.get());
+      CHECK(rewritten_lhs);
+
+      auto rhs = func_oper->getOwnArg(1);
+      auto rewritten_rhs = deep_copy_visitor.visit(rhs.get());
+      CHECK(rewritten_rhs);
+      bbox_intersect_oper = makeExpr<Analyzer::BinOper>(
+          kBOOLEAN, kBBOX_INTERSECT, kONE, rewritten_lhs, rewritten_rhs);
+    } else if (func_name ==
+               BoundingBoxIntersectJoinSupportedFunction::ST_DWITHIN_POINT_POINT_sv) {
+      CHECK_EQ(func_oper->getArity(), size_t(8));
+      const auto lhs = func_oper->getOwnArg(0);
+      const auto rhs = func_oper->getOwnArg(1);
+      // the correctness of geo args used in the ST_DWithin function is checked by
+      // geo translation logic, i.e., RelAlgTranslator::translateTernaryGeoFunction
+      const auto distance_const_val =
+          dynamic_cast<const Analyzer::Constant*>(func_oper->getArg(7));
+      if (lhs && rhs && distance_const_val) {
+        std::vector<std::shared_ptr<Analyzer::Expr>> args{lhs, rhs};
+        auto range_oper = makeExpr<Analyzer::GeoOperator>(
+            SQLTypeInfo(kDOUBLE, 0, 8, true),
+            BoundingBoxIntersectJoinSupportedFunction::ST_DISTANCE_sv.data(),
+            args,
+            std::nullopt);
+        auto distance_oper = makeExpr<Analyzer::BinOper>(
+            kBOOLEAN, kLE, kONE, range_oper, distance_const_val->deep_copy());
+        VLOG(1) << "Rewrite " << func_oper->getName() << " to ST_Distance_Point_Point";
+        bbox_intersect_oper = convert_to_range_join_oper(
+            BoundingBoxIntersectJoinSupportedFunction::ST_DISTANCE_sv,
+            distance_oper,
+            distance_oper.get(),
+            range_oper.get(),
+            distance_const_val);
+        needs_to_return_original_expr = true;
+      }
+    } else if (BoundingBoxIntersectJoinSupportedFunction::
+                   is_poly_mpoly_rewrite_target_func(func_name)) {
+      // in the five functions fall into this case,
+      // ST_Contains is for a pair of polygons, and for ST_Intersect cases they are
+      // combo of polygon and multipolygon so what table orders we choose, rte index
+      // requirement for bbox_intersect can be satisfied if we choose lhs and rhs
+      // from left-to-right order (i.e., get lhs from the arg-1 instead of arg-3)
+      // Note that we choose them from right-to-left argument order in the past
+      CHECK_GE(func_oper->getArity(), size_t(4));
+      auto lhs = func_oper->getOwnArg(1);
+      auto rewritten_lhs = deep_copy_visitor.visit(lhs.get());
+      CHECK(rewritten_lhs);
+      auto rhs = func_oper->getOwnArg(3);
+      auto rewritten_rhs = deep_copy_visitor.visit(rhs.get());
+      CHECK(rewritten_rhs);
+
+      bbox_intersect_oper = makeExpr<Analyzer::BinOper>(
+          kBOOLEAN, kBBOX_INTERSECT, kONE, rewritten_lhs, rewritten_rhs);
+      needs_to_return_original_expr = true;
+    } else if (BoundingBoxIntersectJoinSupportedFunction::
+                   is_point_poly_rewrite_target_func(func_name)) {
+      // now, we try to look at one more chance to exploit bbox_intersect by
+      // rewriting the qual as: ST_INTERSECT(POLY, POINT) -> ST_INTERSECT(POINT, POLY)
+      // to support efficient evaluation of 1) ST_Intersects_Point_Polygon and
+      // 2) ST_Intersects_Point_MultiPolygon based on our hash join framework w/
+      // bbox_intersect here, we have implementation of native functions for both 1)
+      // Point-Polygon pair and 2) Polygon-Point pair, but we currently do not support
+      // hash table generation on top of point column thus, the goal of this rewriting is
+      // to place a non-point geometry to the right-side of the bbox_intersect_oper (to
+      // build hash table based on it) iff the inner table is larger than that of
+      // non-point geometry (to reduce expensive hash join performance)
+      size_t point_arg_idx = 0;
+      size_t poly_arg_idx = 2;
+      if (func_oper->getOwnArg(point_arg_idx)->get_type_info().get_type() != kPOINT) {
+        point_arg_idx = 2;
+        poly_arg_idx = 1;
+      }
+      auto point_cv = func_oper->getOwnArg(point_arg_idx);
+      auto poly_cv = func_oper->getOwnArg(poly_arg_idx);
+      CHECK_EQ(point_cv->get_type_info().get_type(), kPOINT);
+      CHECK_EQ(poly_cv->get_type_info().get_type(), kARRAY);
+      auto rewritten_lhs = deep_copy_visitor.visit(point_cv.get());
+      CHECK(rewritten_lhs);
+      auto rewritten_rhs = deep_copy_visitor.visit(poly_cv.get());
+      CHECK(rewritten_rhs);
+      VLOG(1) << "Rewriting the " << func_name
+              << " to use bounding box intersection with lhs as "
+              << rewritten_lhs->toString() << " and rhs as " << rewritten_rhs->toString();
+      bbox_intersect_oper = makeExpr<Analyzer::BinOper>(
+          kBOOLEAN, kBBOX_INTERSECT, kONE, rewritten_lhs, rewritten_rhs);
+      needs_to_return_original_expr = true;
+    } else if (BoundingBoxIntersectJoinSupportedFunction::
+                   is_poly_point_rewrite_target_func(func_name)) {
+      // rest of functions reaching here is poly and point geo join query
+      // to use bbox_intersect in this case, poly column must have its rte == 1
+      // lhs is the point col_var
       auto lhs = func_oper->getOwnArg(2);
       auto rewritten_lhs = deep_copy_visitor.visit(lhs.get());
       CHECK(rewritten_lhs);
       const auto& lhs_ti = rewritten_lhs->get_type_info();
-      if (!lhs_ti.is_geometry()) {
-        // TODO(adb): If ST_Contains is passed geospatial literals instead of columns, the
-        // function will be expanded during translation rather than during code
-        // generation. While this scenario does not make sense for the overlaps join, we
-        // need to detect and abort the overlaps rewrite. Adding a GeospatialConstant
-        // dervied class to the Analyzer may prove to be a better way to handle geo
-        // literals, but for now we ensure the LHS type is a geospatial type, which would
-        // mean the function has not been expanded to the physical types, yet.
-        LOG(WARNING) << "Failed to rewrite " << func_oper->getName()
-                     << " to overlaps conjunction. LHS input type is not a geospatial "
-                        "type. Are both inputs geospatial columns?";
-        return boost::none;
+
+      if (!lhs_ti.is_geometry() && !is_constructed_point(rewritten_lhs.get())) {
+        // TODO(adb): If ST_Contains is passed geospatial literals instead of columns,
+        // the function will be expanded during translation rather than during code
+        // generation. While this scenario does not make sense for the bbox_intersect, we
+        // need to detect and abort the bbox_intersect rewrite. Adding a
+        // GeospatialConstant dervied class to the Analyzer may prove to be a better way
+        // to handle geo literals, but for now we ensure the LHS type is a geospatial
+        // type, which would mean the function has not been expanded to the physical
+        // types, yet.
+        LOG(INFO) << "Unable to rewrite " << func_name
+                  << " to bounding box intersection conjunction. LHS input type is "
+                     "neither a geospatial "
+                     "column nor a constructed point"
+                  << func_oper->toString();
+        return BoundingBoxIntersectJoinTranslationResult::createEmptyResult();
       }
 
-      // Read the bounds arg from the ST_Contains FuncOper (second argument)instead of the
-      // poly column (first argument)
+      // rhs is coordinates of the poly col
       auto rhs = func_oper->getOwnArg(1);
       auto rewritten_rhs = deep_copy_visitor.visit(rhs.get());
       CHECK(rewritten_rhs);
 
-      auto overlaps_oper = makeExpr<Analyzer::BinOper>(
-          kBOOLEAN, kOVERLAPS, kONE, rewritten_lhs, rewritten_rhs);
+      if (has_invalid_join_col_order(lhs.get(), rhs.get()).first) {
+        LOG(INFO) << "Unable to rewrite " << func_name
+                  << " to bounding box intersection conjunction. Cannot build hash table "
+                     "over LHS type. "
+                     "Check join order."
+                  << func_oper->toString();
+        return BoundingBoxIntersectJoinTranslationResult::createEmptyResult();
+      }
 
-      return OverlapsJoinConjunction{{expr}, {overlaps_oper}};
+      VLOG(1) << "Rewriting " << func_name
+              << " to use bounding box intersection with lhs as "
+              << rewritten_lhs->toString() << " and rhs as " << rewritten_rhs->toString();
+
+      bbox_intersect_oper = makeExpr<Analyzer::BinOper>(
+          kBOOLEAN, kBBOX_INTERSECT, kONE, rewritten_lhs, rewritten_rhs);
+      if (func_name != BoundingBoxIntersectJoinSupportedFunction::
+                           ST_APPROX_OVERLAPS_MULTIPOLYGON_POINT_sv) {
+        needs_to_return_original_expr = true;
+      }
     }
+  } else if (rewrite_type == BoundingBoxIntersectJoinRewriteType::RANGE_JOIN) {
+    auto bin_oper = dynamic_cast<Analyzer::BinOper*>(expr.get());
+    CHECK(bin_oper);
+    auto lhs = dynamic_cast<const Analyzer::GeoOperator*>(bin_oper->get_left_operand());
+    CHECK(lhs);
+    auto rhs = dynamic_cast<const Analyzer::Constant*>(bin_oper->get_right_operand());
+    CHECK(rhs);
+    func_name = lhs->getName();
+    bbox_intersect_oper = convert_to_range_join_oper(func_name, expr, bin_oper, lhs, rhs);
+    needs_to_return_original_expr = true;
   }
-  return boost::none;
+  const auto expr_str = !func_name.empty() ? func_name : expr->toString();
+  if (bbox_intersect_oper) {
+    BoundingBoxIntersectJoinTranslationResult res;
+    res.swap_arguments = swap_args;
+    BoundingBoxIntersectJoinConjunction bbox_intersect_join_qual;
+    bbox_intersect_join_qual.join_quals.push_back(bbox_intersect_oper);
+    if (needs_to_return_original_expr) {
+      bbox_intersect_join_qual.quals.push_back(expr);
+    }
+    res.converted_bbox_intersect_join_info = bbox_intersect_join_qual;
+    VLOG(1) << "Successfully converted " << expr_str
+            << " to use bounding box intersection";
+    return res;
+  }
+  VLOG(1) << "Bounding box intersection not enabled for " << expr_str;
+  return BoundingBoxIntersectJoinTranslationResult::createEmptyResult();
+}
+
+BoundingBoxIntersectJoinTranslationInfo convert_bbox_intersect_join(
+    JoinQualsPerNestingLevel const& join_quals,
+    std::vector<InputDescriptor>& input_descs,
+    std::unordered_map<const RelAlgNode*, int>& input_to_nest_level,
+    std::vector<size_t>& input_permutation,
+    std::list<std::shared_ptr<const InputColDescriptor>>& input_col_desc,
+    Executor const* executor) {
+  if (!g_enable_bbox_intersect_hashjoin || join_quals.empty()) {
+    return {join_quals, false, false};
+  }
+
+  JoinQualsPerNestingLevel join_condition_per_nesting_level;
+  bool is_reordered{false};
+  bool has_bbox_intersect{false};
+  for (const auto& join_condition_in : join_quals) {
+    JoinCondition join_condition{{}, join_condition_in.type};
+
+    for (const auto& join_qual_expr_in : join_condition_in.quals) {
+      bool try_to_rewrite_expr_to_bbox_intersect = false;
+      BoundingBoxIntersectJoinRewriteType rewrite_type{
+          BoundingBoxIntersectJoinRewriteType::UNKNOWN};
+      auto func_oper = dynamic_cast<Analyzer::FunctionOper*>(join_qual_expr_in.get());
+      if (func_oper) {
+        const auto func_name = func_oper->getName();
+        if (BoundingBoxIntersectJoinSupportedFunction::is_bbox_intersect_supported_func(
+                func_name)) {
+          try_to_rewrite_expr_to_bbox_intersect = true;
+          rewrite_type = BoundingBoxIntersectJoinRewriteType::BBOX_INTERSECT_JOIN;
+        }
+      }
+      auto bin_oper = dynamic_cast<Analyzer::BinOper*>(join_qual_expr_in.get());
+      if (bin_oper && (bin_oper->get_optype() == kLE || bin_oper->get_optype() == kLT)) {
+        auto lhs =
+            dynamic_cast<const Analyzer::GeoOperator*>(bin_oper->get_left_operand());
+        auto rhs = dynamic_cast<const Analyzer::Constant*>(bin_oper->get_right_operand());
+        if (g_enable_distance_rangejoin && lhs && rhs) {
+          try_to_rewrite_expr_to_bbox_intersect = true;
+          rewrite_type = BoundingBoxIntersectJoinRewriteType::RANGE_JOIN;
+        }
+      }
+      BoundingBoxIntersectJoinTranslationResult translation_res;
+      if (try_to_rewrite_expr_to_bbox_intersect) {
+        translation_res =
+            translate_bounding_box_intersect_with_reordering(join_qual_expr_in,
+                                                             input_descs,
+                                                             input_to_nest_level,
+                                                             input_permutation,
+                                                             input_col_desc,
+                                                             rewrite_type,
+                                                             executor);
+      }
+      if (translation_res.converted_bbox_intersect_join_info) {
+        const auto& bbox_intersect_quals =
+            *translation_res.converted_bbox_intersect_join_info;
+        has_bbox_intersect = true;
+        // Add qual for bounding box intersection
+        join_condition.quals.insert(join_condition.quals.end(),
+                                    bbox_intersect_quals.join_quals.begin(),
+                                    bbox_intersect_quals.join_quals.end());
+        // Add original quals
+        join_condition.quals.insert(join_condition.quals.end(),
+                                    bbox_intersect_quals.quals.begin(),
+                                    bbox_intersect_quals.quals.end());
+      } else {
+        join_condition.quals.push_back(join_qual_expr_in);
+      }
+      is_reordered |= translation_res.swap_arguments;
+    }
+    join_condition_per_nesting_level.push_back(join_condition);
+  }
+  return {join_condition_per_nesting_level, has_bbox_intersect, is_reordered};
 }
 
 /**
@@ -777,11 +1310,11 @@ class JoinCoveredQualVisitor : public ScalarExprVisitor<bool> {
   }
 
   bool visitFunctionOper(const Analyzer::FunctionOper* func_oper) const override {
-    if (overlaps_supported_functions.find(func_oper->getName()) !=
-        overlaps_supported_functions.end()) {
+    if (BoundingBoxIntersectJoinSupportedFunction::is_bbox_intersect_supported_func(
+            func_oper->getName())) {
       const auto lhs = func_oper->getArg(2);
       const auto rhs = func_oper->getArg(1);
-      for (const auto qual_pair : join_qual_pairs) {
+      for (const auto& qual_pair : join_qual_pairs) {
         if (*lhs == *qual_pair.first && *rhs == *qual_pair.second) {
           return true;
         }
@@ -852,4 +1385,38 @@ std::shared_ptr<Analyzer::Expr> fold_expr(const Analyzer::Expr* expr) {
         rewritten_expr, expr_with_likelihood->get_likelihood());
   }
   return rewritten_expr;
+}
+
+bool self_join_not_covered_by_left_deep_tree(const Analyzer::ColumnVar* key_side,
+                                             const Analyzer::ColumnVar* val_side,
+                                             const int max_rte_covered) {
+  if (key_side->getTableKey() == val_side->getTableKey() &&
+      key_side->get_rte_idx() == val_side->get_rte_idx() &&
+      key_side->get_rte_idx() > max_rte_covered) {
+    return true;
+  }
+  return false;
+}
+
+const int get_max_rte_scan_table(
+    std::unordered_map<int, llvm::Value*>& scan_idx_to_hash_pos) {
+  int ret = INT32_MIN;
+  for (auto& kv : scan_idx_to_hash_pos) {
+    if (kv.first > ret) {
+      ret = kv.first;
+    }
+  }
+  return ret;
+}
+
+size_t get_table_cardinality(shared::TableKey const& table_key,
+                             Executor const* executor) {
+  if (table_key.table_id > 0) {
+    auto const td = Catalog_Namespace::get_metadata_for_table(table_key);
+    CHECK(td);
+    CHECK(td->fragmenter);
+    return td->fragmenter->getNumRows();
+  }
+  auto temp_tbl = get_temporary_table(executor->getTemporaryTables(), table_key.table_id);
+  return temp_tbl->rowCount();
 }

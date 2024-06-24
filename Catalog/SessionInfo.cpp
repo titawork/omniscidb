@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -43,17 +43,20 @@ bool SessionInfo::checkDBAccessPrivileges(const DBObjectType& permissionType,
 std::string SessionInfo::public_session_id() const {
   const time_t start_time = get_start_time();
   struct tm st;
+#ifdef __linux__
   localtime_r(&start_time, &st);
+#else
+  localtime_s(&st, &start_time);
+#endif
   std::ostringstream ss;
   ss << (st.tm_min % 10) << std::setfill('0') << std::setw(2) << st.tm_sec << '-'
-     << session_id.substr(0, 4);
+     << session_id_.substr(0, 4);
   return ss.str();
 }
 
-}  // namespace Catalog_Namespace
-
-std::ostream& operator<<(std::ostream& os,
-                         const Catalog_Namespace::SessionInfo& session_info) {
+std::ostream& operator<<(std::ostream& os, const SessionInfo& session_info) {
   os << session_info.get_public_session_id();
   return os;
 }
+
+}  // namespace Catalog_Namespace

@@ -1,5 +1,5 @@
 /*
- * Copyright 2018, OmniSci, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,18 +14,45 @@
  * limitations under the License.
  */
 
-#include "ThriftClient.h"
-#include <thrift/transport/THttpClient.h>
-#include <thrift/transport/TSSLSocket.h>
-#include <thrift/transport/TSocket.h>
-#include <boost/algorithm/string.hpp>
-#include <boost/core/ignore_unused.hpp>
-#include <boost/filesystem.hpp>
+#include "Shared/ThriftClient.h"
+#ifdef HAVE_THRIFT_MESSAGE_LIMIT
+#include "Shared/ThriftConfig.h"
+#endif
+
 #include <iostream>
 #include <sstream>
 
+#include <boost/algorithm/string.hpp>
+#include <boost/core/ignore_unused.hpp>
+#include <boost/filesystem.hpp>
+
+#include <thrift/protocol/TBinaryProtocol.h>
+#include <thrift/transport/THttpClient.h>
+#include <thrift/transport/TSocket.h>
+#include "Shared/ThriftJSONProtocolInclude.h"
+
 using namespace ::apache::thrift::transport;
+using namespace ::apache::thrift::protocol;
 using Decision = AccessManager::Decision;
+
+void check_standard_ca(std::string& ca_cert_file) {
+  if (ca_cert_file.empty()) {
+    static std::list<std::string> v_known_ca_paths({
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+        "/usr/share/ssl/certs/ca-bundle.crt",
+        "/usr/local/share/certs/ca-root.crt",
+        "/etc/ssl/cert.pem",
+        "/etc/ssl/ca-bundle.pem",
+    });
+    for (const auto& known_ca_path : v_known_ca_paths) {
+      if (boost::filesystem::exists(known_ca_path)) {
+        ca_cert_file = known_ca_path;
+        break;
+      }
+    }
+  }
+}
 
 class InsecureAccessManager : public AccessManager {
  public:
@@ -49,31 +76,6 @@ class InsecureAccessManager : public AccessManager {
   };
 };
 
-mapd::shared_ptr<TTransport> openBufferedClientTransport(
-    const std::string& server_host,
-    const int port,
-    const std::string& ca_cert_name) {
-  mapd::shared_ptr<TTransport> transport;
-  if (ca_cert_name.empty()) {
-    transport = mapd::shared_ptr<TTransport>(new TBufferedTransport(
-        mapd::shared_ptr<TTransport>(new TSocket(server_host, port))));
-  } else {
-    // Thrift issue 4164 https://jira.apache.org/jira/browse/THRIFT-4164 reports
-    // a problem if TSSLSocketFactory is destroyed before any sockets it creates
-    // are destroyed.  Making the factory static should ensure a safe
-    // destruction order.
-    static mapd::shared_ptr<TSSLSocketFactory> factory =
-        mapd::shared_ptr<TSSLSocketFactory>(new TSSLSocketFactory(SSLProtocol::SSLTLS));
-    factory->ciphers("ALL:!ADH:!LOW:!EXP:!MD5:@STRENGTH");
-    factory->loadTrustedCertificates(ca_cert_name.c_str());
-    factory->authenticate(false);
-    factory->access(mapd::shared_ptr<InsecureAccessManager>(new InsecureAccessManager()));
-    mapd::shared_ptr<TSocket> secure_socket = factory->createSocket(server_host, port);
-    transport = mapd::shared_ptr<TTransport>(new TBufferedTransport(secure_socket));
-  }
-  return transport;
-}
-
 /*
  * The Http client that comes with Thrift constructs a very simple set of HTTP
  * headers, ignoring cookies.  This class simply inherits from THttpClient to
@@ -87,15 +89,26 @@ mapd::shared_ptr<TTransport> openBufferedClientTransport(
 class ProxyTHttpClient : public THttpClient {
  public:
   // mimic and call the super constructors.
-  ProxyTHttpClient(mapd::shared_ptr<TTransport> transport,
+  ProxyTHttpClient(std::shared_ptr<TTransport> transport,
                    std::string host,
                    std::string path)
-      : THttpClient(transport, host, path) {}
+#ifdef HAVE_THRIFT_MESSAGE_LIMIT
+      : THttpClient(transport, host, path, shared::default_tconfig()){}
+#else
+      : THttpClient(transport, host, path) {
+  }
+#endif
 
-  ProxyTHttpClient(std::string host, int port, std::string path)
-      : THttpClient(host, port, path) {}
+      ProxyTHttpClient(std::string host, int port, std::string path)
+#ifdef HAVE_THRIFT_MESSAGE_LIMIT
+      : THttpClient(host, port, path, shared::default_tconfig()){}
+#else
+      : THttpClient(host, port, path) {
+  }
+#endif
 
-  ~ProxyTHttpClient() override {}
+      ~ProxyTHttpClient() override {
+  }
   // thrift parseHeader d and call the super constructor.
   void parseHeader(char* header) override {
     //  note boost::istarts_with is case insensitive
@@ -119,18 +132,19 @@ class ProxyTHttpClient : public THttpClient {
     uint32_t len;
     writeBuffer_.getBuffer(&buf, &len);
 
+    constexpr static const char* CRLF = "\r\n";
+
     std::ostringstream h;
-    h << "POST " << path_ << " HTTP/1.1" << THttpClient::CRLF << "Host: " << host_
-      << THttpClient::CRLF << "Content-Type: application/x-thrift" << THttpClient::CRLF
-      << "Content-Length: " << len << THttpClient::CRLF << "Accept: application/x-thrift"
-      << THttpClient::CRLF << "User-Agent: Thrift/" << THRIFT_PACKAGE_VERSION
-      << " (C++/THttpClient)" << THttpClient::CRLF << "Connection: keep-alive"
-      << THttpClient::CRLF;
+    h << "POST " << path_ << " HTTP/1.1" << CRLF << "Host: " << host_ << CRLF
+      << "Content-Type: application/x-thrift" << CRLF << "Content-Length: " << len << CRLF
+      << "Accept: application/x-thrift" << CRLF << "User-Agent: Thrift/"
+      << THRIFT_PACKAGE_VERSION << " (C++/THttpClient)" << CRLF
+      << "Connection: keep-alive" << CRLF;
     if (!cookies_.empty()) {
       std::string cookie = "Cookie:" + boost::algorithm::join(cookies_, ";");
-      h << cookie << THttpClient::CRLF;
+      h << cookie << CRLF;
     }
-    h << THttpClient::CRLF;
+    h << CRLF;
 
     cookies_.clear();
     std::string header = h.str();
@@ -152,54 +166,152 @@ class ProxyTHttpClient : public THttpClient {
 
   std::vector<std::string> cookies_;
 };
-
-mapd::shared_ptr<TTransport> openHttpClientTransport(const std::string& server_host,
-                                                     const int port,
-                                                     const std::string& trust_cert_file_,
-                                                     bool use_https,
-                                                     bool skip_verify) {
-  std::string trust_cert_file{trust_cert_file_};
-  if (trust_cert_file_.empty()) {
-    static std::list<std::string> v_known_ca_paths({
-        "/etc/ssl/certs/ca-certificates.crt",
-        "/etc/pki/tls/certs/ca-bundle.crt",
-        "/usr/share/ssl/certs/ca-bundle.crt",
-        "/usr/local/share/certs/ca-root.crt",
-        "/etc/ssl/cert.pem",
-        "/etc/ssl/ca-bundle.pem",
-    });
-    for (const auto& known_ca_path : v_known_ca_paths) {
-      if (boost::filesystem::exists(known_ca_path)) {
-        trust_cert_file = known_ca_path;
-        break;
-      }
+ThriftClientConnection::~ThriftClientConnection() {}
+ThriftClientConnection::ThriftClientConnection(const std::string& server_host,
+                                               const int port,
+                                               const ThriftConnectionType conn_type,
+                                               bool skip_host_verify,
+                                               std::shared_ptr<TSSLSocketFactory> factory)
+    : server_host_(server_host)
+    , port_(port)
+    , conn_type_(conn_type)
+    , skip_host_verify_(skip_host_verify)
+    , trust_cert_file_("") {
+  if (factory && (conn_type_ == ThriftConnectionType::BINARY_SSL ||
+                  conn_type_ == ThriftConnectionType::HTTPS)) {
+    using_X509_store_ = true;
+    factory_ = factory;
+    factory_->ciphers("ALL:!ADH:!LOW:!EXP:!MD5:@STRENGTH");
+    if (skip_host_verify_) {
+      factory_->access(
+          std::shared_ptr<InsecureAccessManager>(new InsecureAccessManager()));
     }
   }
+}
 
-  mapd::shared_ptr<TTransport> transport;
-  mapd::shared_ptr<TTransport> socket;
-  if (use_https) {
-    // Thrift issue 4164 https://jira.apache.org/jira/browse/THRIFT-4164
-    // reports a problem if TSSLSocketFactory is destroyed before any
-    // sockets it creates are destroyed. Making the factory static should
-    // ensure a safe destruction order.
-    static mapd::shared_ptr<TSSLSocketFactory> sslSocketFactory =
-        mapd::shared_ptr<TSSLSocketFactory>(new TSSLSocketFactory());
-    if (skip_verify) {
-      sslSocketFactory->authenticate(false);
-      sslSocketFactory->access(
-          mapd::shared_ptr<InsecureAccessManager>(new InsecureAccessManager()));
+std::shared_ptr<TProtocol> ThriftClientConnection::get_protocol() {
+  std::shared_ptr<apache::thrift::transport::TTransport> mytransport;
+  if (conn_type_ == ThriftConnectionType::HTTP ||
+      conn_type_ == ThriftConnectionType::HTTPS) {
+    mytransport = open_http_client_transport(server_host_,
+                                             port_,
+                                             ca_cert_name_,
+                                             conn_type_ == ThriftConnectionType::HTTPS,
+                                             skip_host_verify_);
+
+  } else {
+    mytransport = open_buffered_client_transport(server_host_, port_, ca_cert_name_);
+  }
+
+  try {
+    mytransport->open();
+  } catch (const apache::thrift::TException& e) {
+    throw apache::thrift::TException(std::string(e.what()) + ": host " + server_host_ +
+                                     ", port " + std::to_string(port_));
+  }
+  if (conn_type_ == ThriftConnectionType::HTTP ||
+      conn_type_ == ThriftConnectionType::HTTPS) {
+    return std::shared_ptr<TProtocol>(new TJSONProtocol(mytransport));
+  } else {
+    return std::shared_ptr<TProtocol>(new TBinaryProtocol(mytransport));
+  }
+}
+
+std::shared_ptr<TTransport> ThriftClientConnection::open_buffered_client_transport(
+    const std::string& server_host,
+    const int port,
+    const std::string& ca_cert_name,
+    bool with_timeout,
+    bool with_keepalive,
+    unsigned connect_timeout,
+    unsigned recv_timeout,
+    unsigned send_timeout) {
+  std::shared_ptr<TTransport> transport;
+
+  if (!factory_ && !ca_cert_name.empty()) {
+    // need to build a factory once for ssl conection
+    factory_ =
+        std::shared_ptr<TSSLSocketFactory>(new TSSLSocketFactory(SSLProtocol::SSLTLS));
+    factory_->ciphers("ALL:!ADH:!LOW:!EXP:!MD5:@STRENGTH");
+    factory_->loadTrustedCertificates(ca_cert_name.c_str());
+    factory_->authenticate(false);
+    factory_->access(std::shared_ptr<InsecureAccessManager>(new InsecureAccessManager()));
+  }
+  if (!using_X509_store_ && ca_cert_name.empty()) {
+#ifdef HAVE_THRIFT_MESSAGE_LIMIT
+    const auto socket =
+        std::make_shared<TSocket>(server_host, port, shared::default_tconfig());
+#else
+    const auto socket = std::make_shared<TSocket>(server_host, port);
+#endif
+    if (with_timeout) {
+      socket->setKeepAlive(with_keepalive);
+      socket->setConnTimeout(connect_timeout);
+      socket->setRecvTimeout(recv_timeout);
+      socket->setSendTimeout(send_timeout);
+#ifdef __APPLE__
+      socket->setLinger(false, 0);
+#endif
     }
-    sslSocketFactory->loadTrustedCertificates(trust_cert_file.c_str());
-    socket = sslSocketFactory->createSocket(server_host, port);
-    // transport = mapd::shared_ptr<TTransport>(new THttpClient(socket,
+#ifdef HAVE_THRIFT_MESSAGE_LIMIT
+    transport = std::make_shared<TBufferedTransport>(socket, shared::default_tconfig());
+#else
+    transport = std::make_shared<TBufferedTransport>(socket);
+#endif
+  } else {
+    std::shared_ptr<TSocket> secure_socket = factory_->createSocket(server_host, port);
+    if (with_timeout) {
+      secure_socket->setKeepAlive(with_keepalive);
+      secure_socket->setConnTimeout(connect_timeout);
+      secure_socket->setRecvTimeout(recv_timeout);
+      secure_socket->setSendTimeout(send_timeout);
+#ifdef __APPLE__
+      secure_socket->setLinger(false, 0);
+#endif
+    }
+#ifdef HAVE_THRIFT_MESSAGE_LIMIT
+    transport = std::shared_ptr<TTransport>(
+        new TBufferedTransport(secure_socket, shared::default_tconfig()));
+#else
+    transport = std::shared_ptr<TTransport>(new TBufferedTransport(secure_socket));
+#endif
+  }
+
+  return transport;
+}
+
+std::shared_ptr<TTransport> ThriftClientConnection::open_http_client_transport(
+    const std::string& server_host,
+    const int port,
+    const std::string& trust_cert_fileX,
+    bool use_https,
+    bool skip_verify) {
+  trust_cert_file_ = trust_cert_fileX;
+  check_standard_ca(trust_cert_file_);
+
+  if (!factory_) {
+    factory_ =
+        std::shared_ptr<TSSLSocketFactory>(new TSSLSocketFactory(SSLProtocol::SSLTLS));
+  }
+  std::shared_ptr<TTransport> transport;
+  std::shared_ptr<TTransport> socket;
+  if (use_https) {
+    if (skip_verify) {
+      factory_->authenticate(false);
+      factory_->access(
+          std::shared_ptr<InsecureAccessManager>(new InsecureAccessManager()));
+    }
+    if (!using_X509_store_) {
+      factory_->loadTrustedCertificates(trust_cert_file_.c_str());
+    }
+    socket = factory_->createSocket(server_host, port);
+    // transport = std::shared_ptr<TTransport>(new THttpClient(socket,
     // server_host,
     // "/"));
     transport =
-        mapd::shared_ptr<TTransport>(new ProxyTHttpClient(socket, server_host, "/"));
+        std::shared_ptr<TTransport>(new ProxyTHttpClient(socket, server_host, "/"));
   } else {
-    transport =
-        mapd::shared_ptr<TTransport>(new ProxyTHttpClient(server_host, port, "/"));
+    transport = std::shared_ptr<TTransport>(new ProxyTHttpClient(server_host, port, "/"));
   }
   return transport;
 }

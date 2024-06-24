@@ -1,5 +1,5 @@
 /*
- * Copyright 2018, OmniSci, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,14 +19,17 @@
 
 #include "TargetValueConverters.h"
 
+#include <map>
+
 struct ConverterCreateParameter {
   size_t num_rows;
-  const Catalog_Namespace::Catalog& cat;
   const TargetMetaInfo source;
   const ColumnDescriptor* target;
+  const Catalog_Namespace::Catalog& target_cat;
   const SQLTypeInfo& type;
   bool can_be_null;
   StringDictionaryProxy* literals_dictionary;
+  StringDictionaryProxy* source_dictionary_proxy;
 };
 
 struct TargetValueConverterFactory {

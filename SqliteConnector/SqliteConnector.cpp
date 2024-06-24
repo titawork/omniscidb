@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,12 +16,15 @@
 
 /**
  * @file SqliteConnector.cpp
- * @author Todd Mostak <todd@mapd.com>
+ * @brief
  *
  */
 
 #include "SqliteConnector.h"
+
 #include <iostream>
+
+#include "Logger/Logger.h"
 
 using std::cout;
 using std::endl;
@@ -41,8 +44,12 @@ SqliteConnector::SqliteConnector(const string& dbName, const string& dir)
   }
 }
 
+SqliteConnector::SqliteConnector(sqlite3* db) : db_(db) {}
+
 SqliteConnector::~SqliteConnector() {
-  sqlite3_close(db_);
+  if (!dbName_.empty()) {
+    sqlite3_close(db_);
+  }
 }
 
 void SqliteConnector::throwError() {
@@ -50,9 +57,24 @@ void SqliteConnector::throwError() {
   throw runtime_error("Sqlite3 Error: " + errorMsg);
 }
 
-void SqliteConnector::query_with_text_params(
-    const std::string& queryString,
-    const std::vector<std::string>& text_params) {
+std::string get_column_datum(int column_type, sqlite3_stmt* stmt, size_t column_index) {
+  const char* datum_ptr;
+  if (column_type == SQLITE_BLOB) {
+    datum_ptr = static_cast<const char*>(sqlite3_column_blob(stmt, column_index));
+  } else {
+    datum_ptr = reinterpret_cast<const char*>(sqlite3_column_text(stmt, column_index));
+  }
+  size_t datum_size = sqlite3_column_bytes(stmt, column_index);
+  return {datum_ptr, datum_size};
+}
+
+void SqliteConnector::query_with_text_params(const std::string& queryString,
+                                             const std::vector<std::string>& text_params,
+                                             const std::vector<BindType>& bind_types) {
+  if (!bind_types.empty()) {
+    CHECK_EQ(text_params.size(), bind_types.size());
+  }
+
   atFirstResult_ = true;
   numRows_ = 0;
   numCols_ = 0;
@@ -65,10 +87,17 @@ void SqliteConnector::query_with_text_params(
     throwError();
   }
 
-  int numParams_ = 1;
+  int num_params = 1;
   for (auto text_param : text_params) {
-    returnCode = sqlite3_bind_text(
-        stmt, numParams_++, text_param.c_str(), text_param.size(), SQLITE_TRANSIENT);
+    if (!bind_types.empty() && bind_types[num_params - 1] == BindType::BLOB) {
+      returnCode = sqlite3_bind_blob(
+          stmt, num_params++, text_param.c_str(), text_param.size(), SQLITE_TRANSIENT);
+    } else if (!bind_types.empty() && bind_types[num_params - 1] == BindType::NULL_TYPE) {
+      returnCode = sqlite3_bind_null(stmt, num_params++);
+    } else {
+      returnCode = sqlite3_bind_text(
+          stmt, num_params++, text_param.c_str(), text_param.size(), SQLITE_TRANSIENT);
+    }
     if (returnCode != SQLITE_OK) {
       throwError();
     }
@@ -93,14 +122,23 @@ void SqliteConnector::query_with_text_params(
     }
     numRows_++;
     for (size_t c = 0; c < numCols_; ++c) {
-      auto col_text = reinterpret_cast<const char*>(sqlite3_column_text(stmt, c));
-      bool is_null = sqlite3_column_type(stmt, c) == SQLITE_NULL;
-      assert(is_null == !col_text);
-      results_[c].push_back(NullableResult{is_null ? "" : col_text, is_null});
+      auto column_type = sqlite3_column_type(stmt, c);
+      bool is_null = (column_type == SQLITE_NULL);
+      auto col_text = get_column_datum(column_type, stmt, c);
+      if (is_null) {
+        CHECK(col_text.empty());
+      }
+      results_[c].emplace_back(NullableResult{col_text, is_null});
     }
   } while (1 == 1);  // Loop control in break statement above
 
   sqlite3_finalize(stmt);
+}
+
+void SqliteConnector::query_with_text_params(
+    const std::string& queryString,
+    const std::vector<std::string>& text_params) {
+  query_with_text_params(queryString, text_params, {});
 }
 
 void SqliteConnector::query_with_text_param(const std::string& queryString,
@@ -110,4 +148,52 @@ void SqliteConnector::query_with_text_param(const std::string& queryString,
 
 void SqliteConnector::query(const std::string& queryString) {
   query_with_text_params(queryString, std::vector<std::string>{});
+}
+
+void SqliteConnector::batch_insert(const std::string& table_name,
+                                   std::vector<std::vector<std::string>>& insert_vals) {
+  const size_t num_rows = insert_vals.size();
+  if (!num_rows) {
+    return;
+  }
+  const size_t num_cols(insert_vals[0].size());
+  if (!num_cols) {
+    return;
+  }
+  std::string paramertized_query = "INSERT INTO " + table_name + " VALUES(";
+  for (size_t col_idx = 0; col_idx < num_cols - 1; ++col_idx) {
+    paramertized_query += "?, ";
+  }
+  paramertized_query += "?)";
+
+  query("BEGIN TRANSACTION");
+
+  sqlite3_stmt* stmt;
+  int returnCode =
+      sqlite3_prepare_v2(db_, paramertized_query.c_str(), -1, &stmt, nullptr);
+  if (returnCode != SQLITE_OK) {
+    throwError();
+  }
+
+  for (size_t r = 0; r < num_rows; ++r) {
+    const auto& row_insert_vals = insert_vals[r];
+    int num_params = 1;
+    for (const auto& insert_field : row_insert_vals) {
+      returnCode = sqlite3_bind_text(stmt,
+                                     num_params++,
+                                     insert_field.c_str(),
+                                     insert_field.size(),
+                                     SQLITE_TRANSIENT);
+      if (returnCode != SQLITE_OK) {
+        throwError();
+      }
+    }
+    returnCode = sqlite3_step(stmt);
+    if (returnCode != SQLITE_DONE) {
+      throwError();
+    }
+    sqlite3_reset(stmt);
+  }
+  sqlite3_finalize(stmt);
+  query("END TRANSACTION");
 }

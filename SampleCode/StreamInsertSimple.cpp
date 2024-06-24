@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,12 +16,14 @@
 
 /**
  * @file    StreamInsert.cpp
- * @author  Wei Hong <wei@mapd.com>
  * @brief   Sample MapD Client code for inserting a stream of rows from stdin
  * to a MapD table.
  *
- * Copyright (c) 2014 MapD Technologies, Inc.  All rights reserved.
- **/
+ */
+
+#ifdef HAVE_THRIFT_MESSAGE_LIMIT
+#include "Shared/ThriftConfig.h"
+#endif
 
 #include <boost/tokenizer.hpp>
 #include <cstring>
@@ -32,25 +34,11 @@
 #include <thrift/protocol/TBinaryProtocol.h>
 #include <thrift/transport/TBufferTransports.h>
 #include <thrift/transport/TSocket.h>
-#include "gen-cpp/MapD.h"
+#include "gen-cpp/Heavy.h"
 
 using namespace ::apache::thrift;
 using namespace ::apache::thrift::protocol;
 using namespace ::apache::thrift::transport;
-
-#ifdef HAVE_THRIFT_STD_SHAREDPTR
-#include <memory>
-namespace mapd {
-using std::make_shared;
-using std::shared_ptr;
-}  // namespace mapd
-#else
-#include <boost/make_shared.hpp>
-namespace mapd {
-using boost::make_shared;
-using boost::shared_ptr;
-}  // namespace mapd
-#endif  // HAVE_THRIFT_STD_SHAREDPTR
 
 namespace {
 // anonymous namespace for private functions
@@ -58,7 +46,7 @@ const size_t INSERT_BATCH_SIZE = 10000;
 
 // reads tab-delimited rows from std::cin and load them to
 // table_name in batches of size INSERT_BATCH_SIZE until done
-void stream_insert(MapDClient& client,
+void stream_insert(HeavyClient& client,
                    const TSessionId session,
                    const std::string& table_name,
                    const TRowDescriptor& row_desc,
@@ -84,8 +72,8 @@ void stream_insert(MapDClient& client,
     input_rows.push_back(row);
     if (input_rows.size() >= INSERT_BATCH_SIZE) {
       try {
-        client.load_table(session, table_name, input_rows);
-      } catch (TMapDException& e) {
+        client.load_table(session, table_name, input_rows, {});
+      } catch (TDBException& e) {
         std::cerr << e.error_msg << std::endl;
       }
       input_rows.clear();
@@ -93,7 +81,7 @@ void stream_insert(MapDClient& client,
   }
   // load remaining rowset if any
   if (input_rows.size() > 0) {
-    client.load_table(session, table_name, input_rows);
+    client.load_table(session, table_name, input_rows, {});
   }
 }
 }  // namespace
@@ -122,20 +110,27 @@ int main(int argc, char** argv) {
     }
   }
 
-  mapd::shared_ptr<TTransport> socket(new TSocket(server_host, port));
-  mapd::shared_ptr<TTransport> transport(new TBufferedTransport(socket));
-  mapd::shared_ptr<TProtocol> protocol(new TBinaryProtocol(transport));
-  MapDClient client(protocol);
+#ifdef HAVE_THRIFT_MESSAGE_LIMIT
+  std::shared_ptr<TTransport> socket(
+      new TSocket(server_host, port, shared::default_tconfig()));
+  std::shared_ptr<TTransport> transport(
+      new TBufferedTransport(socket, shared::default_tconfig()));
+#else
+  std::shared_ptr<TTransport> socket(new TSocket(server_host, port));
+  std::shared_ptr<TTransport> transport(new TBufferedTransport(socket));
+#endif
+  std::shared_ptr<TProtocol> protocol(new TBinaryProtocol(transport));
+  HeavyClient client(protocol);
   TSessionId session;
   try {
     transport->open();                                    // open transport
-    client.connect(session, user_name, passwd, db_name);  // connect to omnisci_server
+    client.connect(session, user_name, passwd, db_name);  // connect to heavydb
     TTableDetails table_details;
     client.get_table_details(table_details, session, table_name);
     stream_insert(client, session, table_name, table_details.row_desc, delimiter);
-    client.disconnect(session);  // disconnect from omnisci_server
+    client.disconnect(session);  // disconnect from heavydb
     transport->close();          // close transport
-  } catch (TMapDException& e) {
+  } catch (TDBException& e) {
     std::cerr << e.error_msg << std::endl;
     return 1;
   } catch (TException& te) {

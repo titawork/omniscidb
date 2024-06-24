@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 OmniSci, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,9 +15,11 @@
  */
 
 #include "PlanState.h"
-#include "Execute.h"
 
-bool PlanState::isLazyFetchColumn(const Analyzer::Expr* target_expr) {
+#include "Execute.h"
+#include "Shared/misc.h"
+
+bool PlanState::isLazyFetchColumn(const Analyzer::Expr* target_expr) const {
   if (!allow_lazy_fetch_) {
     return false;
   }
@@ -25,26 +27,14 @@ bool PlanState::isLazyFetchColumn(const Analyzer::Expr* target_expr) {
   if (!do_not_fetch_column || dynamic_cast<const Analyzer::Var*>(do_not_fetch_column)) {
     return false;
   }
-  if (do_not_fetch_column->get_table_id() > 0) {
-    auto cd = get_column_descriptor(do_not_fetch_column->get_column_id(),
-                                    do_not_fetch_column->get_table_id(),
-                                    *executor_->getCatalog());
+  const auto& column_key = do_not_fetch_column->getColumnKey();
+  if (column_key.table_id > 0) {
+    const auto cd = get_column_descriptor(column_key);
     if (cd->isVirtualCol) {
       return false;
     }
   }
-  std::set<std::pair<int, int>> intersect;
-  std::set_intersection(columns_to_fetch_.begin(),
-                        columns_to_fetch_.end(),
-                        columns_to_not_fetch_.begin(),
-                        columns_to_not_fetch_.end(),
-                        std::inserter(intersect, intersect.begin()));
-  if (!intersect.empty()) {
-    throw CompilationRetryNoLazyFetch();
-  }
-  return columns_to_fetch_.find(std::make_pair(do_not_fetch_column->get_table_id(),
-                                               do_not_fetch_column->get_column_id())) ==
-         columns_to_fetch_.end();
+  return columns_to_fetch_.find(column_key) == columns_to_fetch_.end();
 }
 
 void PlanState::allocateLocalColumnIds(
@@ -61,15 +51,122 @@ void PlanState::allocateLocalColumnIds(
 
 int PlanState::getLocalColumnId(const Analyzer::ColumnVar* col_var,
                                 const bool fetch_column) {
+  // Previously, we consider `rte_idx` of `col_var` w/ its column key together
+  // to specify columns in the `global_to_local_col_ids_`.
+  // But there is a case when the same col has multiple 'rte_idx's
+  // For instance, the same geometry col is used not only as input col of the geo join op,
+  // but also included as input col of filter predicate
+  // In such a case, the same geometry col has two rte_idxs (the one defined by the filter
+  // predicate and the other determined by the geo join operator)
+  // The previous logic cannot cover this case b/c it allows only one `rte_idx` per col
+  // But it is safe to share `rte_idx` of among all use cases of the same col
   CHECK(col_var);
-  const int table_id = col_var->get_table_id();
-  int global_col_id = col_var->get_column_id();
-  const int scan_idx = col_var->get_rte_idx();
-  InputColDescriptor scan_col_desc(global_col_id, table_id, scan_idx);
+  const auto& global_col_key = col_var->getColumnKey();
+  InputColDescriptor scan_col_desc(global_col_key.column_id,
+                                   global_col_key.table_id,
+                                   global_col_key.db_id,
+                                   col_var->get_rte_idx());
+  std::optional<int> col_id{std::nullopt};
+  // let's try to find col_id w/ considering `rte_idx`
   const auto it = global_to_local_col_ids_.find(scan_col_desc);
-  CHECK(it != global_to_local_col_ids_.end());
-  if (fetch_column) {
-    columns_to_fetch_.insert(std::make_pair(table_id, global_col_id));
+  if (it != global_to_local_col_ids_.end()) {
+    // we have a valid col_id
+    col_id = it->second;
+  } else {
+    // otherwise, let's try to find col_id for the same col
+    // (but have different 'rte_idx') to share it w/ `col_var`
+    for (auto const& kv : global_to_local_col_ids_) {
+      if (kv.first.getColumnKey() == global_col_key) {
+        col_id = kv.second;
+        break;
+      }
+    }
   }
-  return it->second;
+  if (col_id && *col_id >= 0) {
+    if (fetch_column) {
+      addColumnToFetch(global_col_key);
+    }
+    return *col_id;
+  }
+  CHECK(false) << "Expected to find " << global_col_key;
+  return {};
+}
+
+void PlanState::addNonHashtableQualForLeftJoin(size_t idx,
+                                               std::shared_ptr<Analyzer::Expr> expr) {
+  auto it = left_join_non_hashtable_quals_.find(idx);
+  if (it == left_join_non_hashtable_quals_.end()) {
+    std::vector<std::shared_ptr<Analyzer::Expr>> expr_vec{expr};
+    left_join_non_hashtable_quals_.emplace(idx, std::move(expr_vec));
+  } else {
+    it->second.emplace_back(expr);
+  }
+}
+
+const std::unordered_set<shared::ColumnKey>& PlanState::getColumnsToFetch() const {
+  return columns_to_fetch_;
+}
+
+const std::unordered_set<shared::ColumnKey>& PlanState::getColumnsToNotFetch() const {
+  return columns_to_not_fetch_;
+}
+
+bool PlanState::isColumnToFetch(const shared::ColumnKey& column_key) const {
+  return shared::contains(columns_to_fetch_, column_key);
+}
+
+bool PlanState::isColumnToNotFetch(const shared::ColumnKey& column_key) const {
+  return shared::contains(columns_to_not_fetch_, column_key);
+}
+
+// todo (yoonmin): determine non-lazy fetch compilation in a high-level; to avoid
+// recompilation which may incur noticeable overhead
+void PlanState::addColumnToFetch(const shared::ColumnKey& column_key,
+                                 bool unmark_lazy_fetch) {
+  if (unmark_lazy_fetch) {
+    // This column was previously marked for lazy fetch but we now intentionally
+    // mark it as non-lazy fetch column
+    auto it = columns_to_not_fetch_.find(column_key);
+    if (it != columns_to_not_fetch_.end()) {
+      columns_to_not_fetch_.erase(it);
+    }
+  } else {
+    if (columns_to_not_fetch_.count(column_key)) {
+      // this case represents a query w/ fetching expressions with the order of
+      // cv and an expression on it, i.e., SELECT col1, ST_NPoints(col1) FROM ...
+      // since we first touch the cv itself and we forcely mark it as lazy-fetch
+      // but to evaluate the expression, we must fetch the same cv;
+      // so let's fetch the cv to allow evaluating the expression using the same cv
+      throw CompilationRetryNoLazyFetch();
+    }
+  }
+  CHECK(!isColumnToNotFetch(column_key)) << column_key;
+  columns_to_fetch_.emplace(column_key);
+}
+
+void PlanState::addColumnToNotFetch(const shared::ColumnKey& column_key) {
+  CHECK(!isColumnToFetch(column_key)) << column_key;
+  columns_to_not_fetch_.emplace(column_key);
+}
+
+bool PlanState::hasExpressionNeedsLazyFetch(
+    const std::vector<TargetExprCodegen>& target_exprs_to_codegen) const {
+  return std::any_of(target_exprs_to_codegen.begin(),
+                     target_exprs_to_codegen.end(),
+                     [](const TargetExprCodegen& target_expr) {
+                       return target_expr.target_info.sql_type.usesFlatBuffer();
+                     });
+}
+
+void PlanState::registerNonLazyFetchExpression(
+    const std::vector<TargetExprCodegen>& target_exprs_to_codegen) {
+  auto const needs_lazy_fetch = hasExpressionNeedsLazyFetch(target_exprs_to_codegen);
+  for (const auto& expr : target_exprs_to_codegen) {
+    if (needs_lazy_fetch && !expr.target_info.sql_type.usesFlatBuffer()) {
+      if (auto col_var = dynamic_cast<const Analyzer::ColumnVar*>(expr.target_expr)) {
+        // force non-lazy fetch on all other columns that don't support flatbuffer
+        addColumnToFetch(col_var->getColumnKey(), /*unmark_lazy_fetch=*/true);
+      }
+    }
+  }
 }

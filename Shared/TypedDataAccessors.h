@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,19 +13,16 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 #ifndef H_TypedDataAccessors__
 #define H_TypedDataAccessors__
 
 #include <cmath>
 #include <cstring>
+#include "Logger/Logger.h"
 #include "Shared/DateConverters.h"
 #include "Shared/InlineNullValues.h"
 #include "Shared/sqltypes.h"
-#include "Shared/unreachable.h"
-
-#ifndef CHECK  // if not collide with the one in glog/logging.h
-#include "always_assert.h"
-#endif
 
 namespace {
 
@@ -272,6 +269,7 @@ inline void put_null(void* ndptr, const SQLTypeInfo& ntype, const std::string co
     case kINTERVAL_YEAR_MONTH:
     case kNUMERIC:
     case kDECIMAL:
+    case kTEXT:
       switch (ntype.get_size()) {
         case 1:
           *(int8_t*)ndptr = inline_int_null_value<int8_t>();
@@ -294,6 +292,57 @@ inline void put_null(void* ndptr, const SQLTypeInfo& ntype, const std::string co
       break;
     case kDOUBLE:
       *(double*)ndptr = inline_fp_null_value<double>();
+      break;
+    default:
+      //! this f is currently only for putting fixed-size data in place
+      //! this f is not yet for putting var-size or dict-encoded data
+      CHECK(false);
+  }
+}
+
+inline void put_null_array(void* ndptr,
+                           const SQLTypeInfo& ntype,
+                           const std::string col_name) {
+  if (ntype.get_notnull()) {
+    throw std::runtime_error("NULL value on NOT NULL column '" + col_name + "'");
+  }
+
+  switch (ntype.get_type()) {
+    case kBOOLEAN:
+    case kTINYINT:
+    case kSMALLINT:
+    case kINT:
+    case kBIGINT:
+    case kTIME:
+    case kTIMESTAMP:
+    case kDATE:
+    case kINTERVAL_DAY_TIME:
+    case kINTERVAL_YEAR_MONTH:
+    case kNUMERIC:
+    case kDECIMAL:
+    case kTEXT:
+      switch (ntype.get_size()) {
+        case 1:
+          *(int8_t*)ndptr = inline_int_null_array_value<int8_t>();
+          break;
+        case 2:
+          *(int16_t*)ndptr = inline_int_null_array_value<int16_t>();
+          break;
+        case 4:
+          *(int32_t*)ndptr = inline_int_null_array_value<int32_t>();
+          break;
+        case 8:
+          *(int64_t*)ndptr = inline_int_null_array_value<int64_t>();
+          break;
+        default:
+          abort();
+      }
+      break;
+    case kFLOAT:
+      *(float*)ndptr = inline_fp_null_array_value<float>();
+      break;
+    case kDOUBLE:
+      *(double*)ndptr = inline_fp_null_array_value<double>();
       break;
     default:
       //! this f is currently only for putting fixed-size data in place
@@ -380,9 +429,9 @@ inline void set_minmax(T& min, T& max, T const val) {
 }
 
 template <typename T>
-inline void set_minmax(T& min, T& max, int8_t& null_flag, T const val, T null_sentinel) {
+inline void set_minmax(T& min, T& max, bool& null_flag, T const val, T null_sentinel) {
   if (val == null_sentinel) {
-    null_flag |= true;
+    null_flag = true;
   } else {
     if (val < min) {
       min = val;
@@ -390,22 +439,6 @@ inline void set_minmax(T& min, T& max, int8_t& null_flag, T const val, T null_se
     if (val > max) {
       max = val;
     }
-  }
-}
-
-template <typename TYPE_INFO,
-          typename T,
-          typename SENTINEL_SUPPLIER = NullSentinelSupplier>
-inline void tabulate_metadata(TYPE_INFO const& ti,
-                              T& min,
-                              T& max,
-                              int8_t& null_flag,
-                              T const val,
-                              SENTINEL_SUPPLIER s = SENTINEL_SUPPLIER()) {
-  if (ti.get_notnull()) {
-    set_minmax(min, max, val);
-  } else {
-    set_minmax(min, max, null_flag, val, s(ti, val));
   }
 }
 

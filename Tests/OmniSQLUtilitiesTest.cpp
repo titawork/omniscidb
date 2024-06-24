@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 OmniSci, Inc.
+ * Copyright 2022 HEAVY.AI, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,7 +25,9 @@
 // Mocks
 
 using GetEnvRetType = decltype(DefaultEnvResolver().getenv(""));
+#ifndef _WIN32
 using GetPWUIDRetType = decltype(DefaultEnvResolver().getpwuid(0));
+#endif
 
 class DefaultUnitTestResolver {
  public:
@@ -33,20 +35,28 @@ class DefaultUnitTestResolver {
   GetEnvRetType getenv(ARGS&&...) const {
     return nullptr;
   }
+#ifndef _WIN32
   template <typename... ARGS>
   GetPWUIDRetType getpwuid(ARGS&&...) const {
     return nullptr;
   }
-  auto getuid() const { return ::getuid(); }
+#endif
+  template <typename... ARGS>
+  const char* getpwdir(ARGS&&...) const {
+    return nullptr;
+  }
+  auto getuid() const {
+    return ::getuid();
+  }
 };
 
 class NoHomeNoPWEntResolver : public DefaultUnitTestResolver {};
 
-class NoHomePWEntResolver : public DefaultUnitTestResolver {
+class NoHomePWEntResolver : public DefaultEnvResolver {
  public:
   template <typename... ARGS>
-  GetPWUIDRetType getpwuid(ARGS&&... args) const {
-    return ::getpwuid(std::forward<ARGS>(args)...);
+  GetEnvRetType getenv(ARGS&&...) const {
+    return nullptr;
   }
 };
 
@@ -56,9 +66,15 @@ class HomeResolver : public DefaultEnvResolver {
   GetEnvRetType getenv(ARGS&&... args) const {
     return DefaultEnvResolver::getenv(std::forward<ARGS>(args)...);
   }
+#ifndef _WIN32
   template <typename... ARGS>
   GetPWUIDRetType getpwuid(ARGS&&...) const {
     throw std::runtime_error("Unexpected getpwuid() invocation.");
+  }
+#endif
+  template <typename... ARGS>
+  const char* getpwdir(ARGS&&...) const {
+    throw std::runtime_error("Unexpected getpwdir() invocation.");
   }
 };
 
@@ -73,22 +89,19 @@ TEST(CommandHistoryFile, NoHomeEnv) {
   ASSERT_EQ(std::string(getDefaultHistoryFilename()), std::string(cmd_file));
 
   CommandHistoryFile_NoHomePWEnt cmd_file2;
-  ASSERT_EQ(std::string(getpwuid(getuid())->pw_dir) + '/' +
-                std::string(getDefaultHistoryFilename()),
+  ASSERT_EQ(getHomeDirectory() + '/' + std::string(getDefaultHistoryFilename()),
             std::string(cmd_file2));
 }
 
 TEST(CommandHistoryFile, HomeEnv) {
   CommandHistoryFile_Home cmd_file;
-  ASSERT_EQ(std::string(getpwuid(getuid())->pw_dir) + '/' +
-                std::string(getDefaultHistoryFilename()),
+  ASSERT_EQ(getHomeDirectory() + '/' + std::string(getDefaultHistoryFilename()),
             std::string(cmd_file));
 }
 
 TEST(CommandHistoryFile, Basic) {
   CommandHistoryFile cmd_file;
-  ASSERT_EQ(std::string(getpwuid(getuid())->pw_dir) + '/' +
-                std::string(getDefaultHistoryFilename()),
+  ASSERT_EQ(getHomeDirectory() + '/' + std::string(getDefaultHistoryFilename()),
             std::string(cmd_file));
 }
 
@@ -111,8 +124,7 @@ TEST(CommandHistoryFile, BoostProgramOptionsCompatibility_DefaultOption) {
   po::store(po::command_line_parser(fake_argc, fake_argv).options(desc).run(), vm);
   po::notify(vm);
 
-  ASSERT_EQ(std::string(getpwuid(getuid())->pw_dir) + '/' +
-                std::string(getDefaultHistoryFilename()),
+  ASSERT_EQ(getHomeDirectory() + '/' + std::string(getDefaultHistoryFilename()),
             std::string(cmd_file));
 }
 

@@ -1,4 +1,5 @@
-namespace java com.mapd.thrift.calciteserver
+namespace java ai.heavy.thrift.calciteserver
+namespace py heavydb.completion_hints
 
 enum TCompletionHintType {
   COLUMN,
